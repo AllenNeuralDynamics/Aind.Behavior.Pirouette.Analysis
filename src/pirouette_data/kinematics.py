@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
+from scipy.ndimage import gaussian_filter1d
 
 from pirouette_data.ingestion import (
     _parse_s3_uri,
@@ -136,20 +137,20 @@ def _ears_valid(
     left_ear: str,
     right_ear: str,
     likelihood_threshold: float,
+    coord_suffix: str = "",
 ) -> np.ndarray:
     """Boolean mask of frames where both ears are usable.
 
-    A frame is valid when both ears' ``x``/``y`` are non-null and both
-    ``likelihood`` values exceed *likelihood_threshold*.
+    A frame is valid when both ears' ``x``/``y`` (with *coord_suffix*) are
+    non-null and both ``likelihood`` values exceed *likelihood_threshold*.
     """
-    required = [
-        f"{left_ear}_x",
-        f"{left_ear}_y",
-        f"{left_ear}_likelihood",
-        f"{right_ear}_x",
-        f"{right_ear}_y",
-        f"{right_ear}_likelihood",
+    coord_cols = [
+        f"{left_ear}_x{coord_suffix}",
+        f"{left_ear}_y{coord_suffix}",
+        f"{right_ear}_x{coord_suffix}",
+        f"{right_ear}_y{coord_suffix}",
     ]
+    required = coord_cols + [f"{left_ear}_likelihood", f"{right_ear}_likelihood"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"Missing expected ear columns: {missing}")
@@ -157,10 +158,7 @@ def _ears_valid(
     valid = (df[f"{left_ear}_likelihood"].to_numpy() > likelihood_threshold) & (
         df[f"{right_ear}_likelihood"].to_numpy() > likelihood_threshold
     )
-    coords = df[
-        [f"{left_ear}_x", f"{left_ear}_y", f"{right_ear}_x", f"{right_ear}_y"]
-    ].to_numpy()
-    valid &= ~np.isnan(coords).any(axis=1)
+    valid &= ~np.isnan(df[coord_cols].to_numpy()).any(axis=1)
     return valid
 
 
@@ -200,6 +198,39 @@ def _interpolate_circular(
     cos = np.interp(x, x[valid], np.cos(rad))
     sin = np.interp(x, x[valid], np.sin(rad))
     return np.degrees(np.arctan2(sin, cos)) % 360.0
+
+
+def _interpolate_linear(values: np.ndarray, x: np.ndarray | None = None) -> np.ndarray:
+    """Fill NaN gaps in a 1-D signal by linear interpolation.
+
+    Leading/trailing NaNs are filled with the nearest valid value
+    (``numpy.interp`` endpoint clamping). If no (or all) values are valid, the
+    input is returned unchanged.
+
+    Parameters
+    ----------
+    values:
+        Signal with ``NaN`` at samples to fill.
+    x:
+        Optional monotonically increasing sample positions (e.g. Harp time).
+        Defaults to the sample index.
+
+    Returns
+    -------
+    numpy.ndarray
+        Signal with gaps filled.
+    """
+    values = np.asarray(values, dtype="float64")
+    valid = ~np.isnan(values)
+    if not valid.any() or valid.all():
+        return values
+    if x is None:
+        x = np.arange(values.size, dtype="float64")
+    else:
+        x = np.asarray(x, dtype="float64")
+    out = values.copy()
+    out[~valid] = np.interp(x[~valid], x[valid], values[valid])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +445,276 @@ def append_ear_heading(
         interpolate=interpolate,
         time_column=time_column,
     )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Ear-midpoint velocity
+# ---------------------------------------------------------------------------
+def ear_midpoint(
+    df: pd.DataFrame,
+    left_ear: str = "left_ear",
+    right_ear: str = "right_ear",
+    coord_suffix: str = "_mm",
+    likelihood_threshold: float = 0.0,
+    interpolate: bool = True,
+    time_column: str | None = "harp_time",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-frame midpoint between the left and right ears.
+
+    When both ears are present the midpoint is their average. When only one ear is
+    present that ear's position is used. When neither is present the frame is
+    ``NaN`` and (if *interpolate*) filled by linear interpolation between the
+    surrounding frames.
+
+    Parameters
+    ----------
+    df:
+        Flattened pose DataFrame containing ``<ear>_x<coord_suffix>`` /
+        ``<ear>_y<coord_suffix>`` columns (and optionally ``<ear>_likelihood``).
+    left_ear, right_ear:
+        Body-part names of the two ears.
+    coord_suffix:
+        Suffix of the coordinate columns to use (default ``"_mm"``); the returned
+        midpoint is in those units.
+    likelihood_threshold:
+        Minimum DLC likelihood for an ear to count as present.
+    interpolate:
+        When ``True`` (default), fill frames where both ears are missing by linear
+        interpolation.
+    time_column:
+        Column used as the interpolation abscissa (default ``"harp_time"``); the
+        sample index is used if the column is absent or ``None``.
+
+    Returns
+    -------
+    (numpy.ndarray, numpy.ndarray)
+        The midpoint ``x`` and ``y`` arrays.
+    """
+    xL = f"{left_ear}_x{coord_suffix}"
+    yL = f"{left_ear}_y{coord_suffix}"
+    xR = f"{right_ear}_x{coord_suffix}"
+    yR = f"{right_ear}_y{coord_suffix}"
+    missing = [c for c in (xL, yL, xR, yR) if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"Missing expected ear coordinate columns: {missing} "
+            "(did you run processing.append_mm_columns first?)"
+        )
+
+    lx = df[xL].to_numpy(dtype="float64")
+    ly = df[yL].to_numpy(dtype="float64")
+    rx = df[xR].to_numpy(dtype="float64")
+    ry = df[yR].to_numpy(dtype="float64")
+
+    def _present(ear: str, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        ok = ~np.isnan(x) & ~np.isnan(y)
+        like_col = f"{ear}_likelihood"
+        if like_col in df.columns:
+            ok &= df[like_col].to_numpy(dtype="float64") > likelihood_threshold
+        return ok
+
+    left_ok = _present(left_ear, lx, ly)
+    right_ok = _present(right_ear, rx, ry)
+
+    mx = np.full(len(df), np.nan)
+    my = np.full(len(df), np.nan)
+
+    both = left_ok & right_ok
+    mx[both] = (lx[both] + rx[both]) / 2.0
+    my[both] = (ly[both] + ry[both]) / 2.0
+    only_left = left_ok & ~right_ok
+    mx[only_left] = lx[only_left]
+    my[only_left] = ly[only_left]
+    only_right = right_ok & ~left_ok
+    mx[only_right] = rx[only_right]
+    my[only_right] = ry[only_right]
+
+    if interpolate:
+        x = (
+            df[time_column].to_numpy(dtype="float64")
+            if time_column is not None and time_column in df.columns
+            else None
+        )
+        mx = _interpolate_linear(mx, x=x)
+        my = _interpolate_linear(my, x=x)
+
+    return mx, my
+
+
+def ear_velocity_estimate(
+    df: pd.DataFrame,
+    left_ear: str = "left_ear",
+    right_ear: str = "right_ear",
+    coord_suffix: str = "_mm",
+    time_column: str = "harp_time",
+    likelihood_threshold: float = 0.0,
+    forward_sign: int = 1,
+    smoothing_sigma_s: float = 0.1,
+    method: str = "signed_speed",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Signed instantaneous and Gaussian-smoothed ear-midpoint velocity (mm/s).
+
+    The velocity is computed from the ear-midpoint position (see
+    :func:`ear_midpoint`) differentiated against *time_column*. It is signed by
+    the animal's facing direction — the vector orthogonal to the inter-aural axis
+    (the same construction as the heading estimate) — so positive is forward and
+    negative is backward. Missing-ear frames are handled by :func:`ear_midpoint`
+    (use the present ear, else interpolate) and the facing direction is
+    circularly interpolated across frames where both ears are missing.
+
+    Two sign conventions are available via *method*:
+
+    * ``"signed_speed"`` (default) — magnitude is the full 2-D speed of the
+      midpoint, signed by the forward/backward direction of travel.
+    * ``"projection"`` — the component of velocity along the facing direction
+      (pure forward velocity; lateral motion contributes zero).
+
+    Parameters
+    ----------
+    df:
+        Flattened pose DataFrame with ear coordinate columns (in *coord_suffix*
+        units) and a *time_column*.
+    left_ear, right_ear:
+        Body-part names of the two ears.
+    coord_suffix:
+        Coordinate-column suffix (default ``"_mm"``) — determines the velocity
+        units (``_mm`` -> mm/s).
+    time_column:
+        Column of timestamps in seconds used to differentiate (default
+        ``"harp_time"``).
+    likelihood_threshold:
+        Minimum DLC likelihood for an ear to count as present.
+    forward_sign:
+        ``+1`` or ``-1``; selects the nose-ward orthogonal (see
+        :func:`heading_offset_from_ears`). If forward/backward is inverted, flip.
+    smoothing_sigma_s:
+        Standard deviation (seconds) of the 1-D Gaussian applied to the
+        instantaneous velocity. Converted to samples using the median sampling
+        interval. Tune to taste; ``0.1`` s is a reasonable start at ~60 fps.
+    method:
+        ``"signed_speed"`` or ``"projection"`` (see above).
+
+    Returns
+    -------
+    (numpy.ndarray, numpy.ndarray)
+        The instantaneous and smoothed signed velocity, both in
+        ``coord_suffix``-units per second.
+
+    Raises
+    ------
+    KeyError
+        If *time_column* or the ear coordinate columns are missing.
+    ValueError
+        If *method* is not recognised.
+    """
+    if method not in ("signed_speed", "projection"):
+        raise ValueError("method must be 'signed_speed' or 'projection'.")
+    if time_column not in df.columns:
+        raise KeyError(f"df must contain the time column {time_column!r}.")
+
+    t = df[time_column].to_numpy(dtype="float64")
+
+    # Midpoint position (units of coord_suffix).
+    mx, my = ear_midpoint(
+        df,
+        left_ear=left_ear,
+        right_ear=right_ear,
+        coord_suffix=coord_suffix,
+        likelihood_threshold=likelihood_threshold,
+        interpolate=True,
+        time_column=time_column,
+    )
+
+    # Facing direction (deg, standard quadrant) from the ear orthogonal vector,
+    # computed in the same coordinate space as the midpoint; interpolated where
+    # both ears are missing.
+    lx = df[f"{left_ear}_x{coord_suffix}"].to_numpy(dtype="float64")
+    ly = df[f"{left_ear}_y{coord_suffix}"].to_numpy(dtype="float64")
+    rx = df[f"{right_ear}_x{coord_suffix}"].to_numpy(dtype="float64")
+    ry = df[f"{right_ear}_y{coord_suffix}"].to_numpy(dtype="float64")
+    facing = _facing_angle_deg(lx, ly, rx, ry, forward_sign=forward_sign)
+    facing = np.where(
+        _ears_valid(df, left_ear, right_ear, likelihood_threshold, coord_suffix),
+        facing,
+        np.nan,
+    )
+    facing = _interpolate_circular(facing, x=t)
+    facing_rad = np.deg2rad(facing)
+
+    # Velocity components (central differences w.r.t. time), image convention.
+    vx = np.gradient(mx, t)
+    vy = np.gradient(my, t)
+    speed = np.hypot(vx, vy)
+
+    # Forward unit vector is in the standard (y-up) quadrant; convert the
+    # displacement's y to y-up before projecting.
+    projection = vx * np.cos(facing_rad) + (-vy) * np.sin(facing_rad)
+
+    if method == "projection":
+        instantaneous = projection
+    else:  # signed_speed
+        # Sign from the forward/backward direction of travel; motion exactly
+        # perpendicular to the heading (projection == 0) is treated as forward so
+        # the speed magnitude is preserved.
+        sign = np.where(projection >= 0, 1.0, -1.0)
+        instantaneous = sign * speed
+
+    # Smooth: convert sigma from seconds to samples via the median interval.
+    dt = np.median(np.diff(t))
+    sigma_samples = smoothing_sigma_s / dt if dt > 0 else 0.0
+    if sigma_samples > 0:
+        smoothed = gaussian_filter1d(instantaneous, sigma_samples, mode="nearest")
+    else:
+        smoothed = instantaneous.copy()
+
+    return instantaneous, smoothed
+
+
+def append_ear_velocity(
+    df: pd.DataFrame,
+    left_ear: str = "left_ear",
+    right_ear: str = "right_ear",
+    coord_suffix: str = "_mm",
+    time_column: str = "harp_time",
+    likelihood_threshold: float = 0.0,
+    forward_sign: int = 1,
+    smoothing_sigma_s: float = 0.1,
+    method: str = "signed_speed",
+    instantaneous_column: str = "ear_velocity_mm_s",
+    smoothed_column: str = "ear_velocity_smooth_mm_s",
+) -> pd.DataFrame:
+    """Append signed instantaneous and smoothed ear-midpoint velocity columns.
+
+    Thin wrapper around :func:`ear_velocity_estimate`; see it for the estimation
+    details and parameters.
+
+    Parameters
+    ----------
+    df:
+        Flattened pose DataFrame (with mm coordinate columns and a time column).
+    instantaneous_column, smoothed_column:
+        Names of the appended velocity columns (default mm/s names).
+
+    Returns
+    -------
+    pandas.DataFrame
+        A copy of *df* with the two velocity columns added (signed, mm/s).
+    """
+    instantaneous, smoothed = ear_velocity_estimate(
+        df,
+        left_ear=left_ear,
+        right_ear=right_ear,
+        coord_suffix=coord_suffix,
+        time_column=time_column,
+        likelihood_threshold=likelihood_threshold,
+        forward_sign=forward_sign,
+        smoothing_sigma_s=smoothing_sigma_s,
+        method=method,
+    )
+    out = df.copy()
+    out[instantaneous_column] = instantaneous
+    out[smoothed_column] = smoothed
     return out
 
 

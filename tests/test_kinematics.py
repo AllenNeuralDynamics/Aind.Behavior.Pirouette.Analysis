@@ -225,3 +225,120 @@ def test_interpolate_circular_edge_fill():
     heading = np.array([np.nan, 45.0, np.nan])
     filled = kinematics._interpolate_circular(heading)
     np.testing.assert_allclose(filled, [45.0, 45.0, 45.0])
+
+
+# ---------------------------------------------------------------------------
+# ear_midpoint
+# ---------------------------------------------------------------------------
+def _moving_ears_df(n=11, dt=0.1, step_x=1.0, like=1.0):
+    """Rigid ears translating in +x. Facing = +x (right): left above right in y.
+
+    Ears at left=(x_t, 0), right=(x_t, 10) (image coords, mm) -> orthogonal points
+    +x, so the animal faces right and moves forward when x increases.
+    """
+    x = np.arange(n, dtype="float64") * step_x
+    return pd.DataFrame(
+        {
+            "harp_time": np.arange(n, dtype="float64") * dt,
+            "left_ear_x_mm": x.copy(),
+            "left_ear_y_mm": np.zeros(n),
+            "left_ear_likelihood": np.full(n, like),
+            "right_ear_x_mm": x.copy(),
+            "right_ear_y_mm": np.full(n, 10.0),
+            "right_ear_likelihood": np.full(n, like),
+        }
+    )
+
+
+def test_ear_midpoint_both_present():
+    df = _moving_ears_df(n=3, step_x=2.0)
+    mx, my = kinematics.ear_midpoint(df)
+    np.testing.assert_allclose(mx, [0.0, 2.0, 4.0])
+    np.testing.assert_allclose(my, [5.0, 5.0, 5.0])  # midpoint of y=0 and y=10
+
+
+def test_ear_midpoint_uses_present_ear():
+    df = _moving_ears_df(n=3, step_x=2.0)
+    df.loc[1, "right_ear_likelihood"] = 0.0  # right missing at frame 1
+    mx, my = kinematics.ear_midpoint(df, likelihood_threshold=0.5)
+    # frame 1 falls back to the left ear position (y = 0), not the midpoint (y=5)
+    np.testing.assert_allclose(my, [5.0, 0.0, 5.0])
+    np.testing.assert_allclose(mx, [0.0, 2.0, 4.0])
+
+
+def test_ear_midpoint_interpolates_when_both_missing():
+    df = _moving_ears_df(n=3, step_x=2.0)
+    df.loc[1, ["left_ear_likelihood", "right_ear_likelihood"]] = 0.0
+    mx, my = kinematics.ear_midpoint(df, likelihood_threshold=0.5)
+    assert not np.isnan(mx).any() and not np.isnan(my).any()
+    assert mx[1] == pytest.approx(2.0)  # linear between 0 and 4
+    assert my[1] == pytest.approx(5.0)
+
+
+# ---------------------------------------------------------------------------
+# ear_velocity_estimate / append_ear_velocity
+# ---------------------------------------------------------------------------
+def test_velocity_forward_positive():
+    # Facing +x and moving +x at 1 mm / 0.1 s = 10 mm/s -> +10.
+    df = _moving_ears_df(n=11, dt=0.1, step_x=1.0)
+    inst, smooth = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.0)
+    np.testing.assert_allclose(inst, 10.0)
+    np.testing.assert_allclose(smooth, 10.0)
+
+
+def test_velocity_backward_negative():
+    # Facing +x but moving -x -> negative (backward).
+    df = _moving_ears_df(n=11, dt=0.1, step_x=-1.0)
+    inst, _ = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.0)
+    np.testing.assert_allclose(inst, -10.0)
+
+
+def test_velocity_projection_ignores_lateral():
+    # Facing +x, moving purely in +y (lateral). projection -> ~0; signed_speed -> full.
+    df = _moving_ears_df(n=11, dt=0.1, step_x=0.0)
+    # move both ears in +y over time
+    df["left_ear_y_mm"] = df["left_ear_y_mm"] + np.arange(11) * 1.0
+    df["right_ear_y_mm"] = df["right_ear_y_mm"] + np.arange(11) * 1.0
+    proj, _ = kinematics.ear_velocity_estimate(
+        df, method="projection", smoothing_sigma_s=0.0
+    )
+    np.testing.assert_allclose(proj, 0.0, atol=1e-9)
+    speed, _ = kinematics.ear_velocity_estimate(
+        df, method="signed_speed", smoothing_sigma_s=0.0
+    )
+    np.testing.assert_allclose(np.abs(speed), 10.0)
+
+
+def test_velocity_units_scale_with_dt():
+    df = _moving_ears_df(n=11, dt=0.05, step_x=1.0)  # 1 mm / 0.05 s = 20 mm/s
+    inst, _ = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.0)
+    np.testing.assert_allclose(inst, 20.0)
+
+
+def test_velocity_smoothing_preserves_constant():
+    df = _moving_ears_df(n=51, dt=0.1, step_x=1.0)
+    inst, smooth = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.1)
+    # A constant velocity is unchanged by Gaussian smoothing (interior).
+    np.testing.assert_allclose(smooth[10:-10], 10.0, atol=1e-6)
+
+
+def test_append_ear_velocity_columns():
+    df = _moving_ears_df(n=11, dt=0.1, step_x=1.0)
+    out = kinematics.append_ear_velocity(df, smoothing_sigma_s=0.05)
+    assert "ear_velocity_mm_s" in out.columns
+    assert "ear_velocity_smooth_mm_s" in out.columns
+    assert "ear_velocity_mm_s" not in df.columns  # input untouched
+    np.testing.assert_allclose(out["ear_velocity_mm_s"], 10.0)
+
+
+def test_velocity_missing_time_column_raises():
+    df = _moving_ears_df(n=5)
+    df = df.drop(columns=["harp_time"])
+    with pytest.raises(KeyError):
+        kinematics.ear_velocity_estimate(df)
+
+
+def test_velocity_bad_method_raises():
+    df = _moving_ears_df(n=5)
+    with pytest.raises(ValueError):
+        kinematics.ear_velocity_estimate(df, method="nope")
