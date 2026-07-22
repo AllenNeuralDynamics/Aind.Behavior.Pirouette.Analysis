@@ -1,6 +1,16 @@
 """Pirouette data: processing and analysis toolkit for chronic ephys and behavior data."""
 
-from pirouette_data import ingestion, kinematics, processing
+from pirouette_data import (
+    behavior_classification,
+    ingestion,
+    kinematics,
+    processing,
+)
+from pirouette_data.behavior_classification import (
+    append_behavior_labels,
+    classify_rest_movement,
+    estimate_velocity_threshold,
+)
 from pirouette_data.ingestion import (
     build_dataset,
     flatten_pose_columns,
@@ -30,6 +40,7 @@ from pirouette_data.processing import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "behavior_classification",
     "ingestion",
     "kinematics",
     "processing",
@@ -52,4 +63,7 @@ __all__ = [
     "ChamberScale",
     "append_mm_columns",
     "estimate_chamber_scale",
+    "append_behavior_labels",
+    "classify_rest_movement",
+    "estimate_velocity_threshold",
 ]
