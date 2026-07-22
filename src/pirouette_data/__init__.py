@@ -12,7 +12,9 @@ from pirouette_data.ingestion import (
 )
 from pirouette_data.kinematics import (
     append_commutator_heading,
+    append_ear_heading,
     commutator_heading_estimate,
+    ear_heading_estimate,
     heading_offset_from_ears,
     load_commutator_turns,
 )
@@ -30,7 +32,9 @@ __all__ = [
     "load_pose_h5",
     "parse_camera_and_timestamp",
     "append_commutator_heading",
+    "append_ear_heading",
     "commutator_heading_estimate",
+    "ear_heading_estimate",
     "heading_offset_from_ears",
     "load_commutator_turns",
 ]

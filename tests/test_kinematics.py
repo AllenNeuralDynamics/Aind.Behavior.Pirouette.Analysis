@@ -134,3 +134,94 @@ def test_first_valid_ear_frame_missing_columns():
     df = pd.DataFrame({"left_ear_x": [0.0]})
     with pytest.raises(KeyError):
         kinematics.first_valid_ear_frame(df)
+
+
+# ---------------------------------------------------------------------------
+# ear_heading_estimate (per-frame)
+# ---------------------------------------------------------------------------
+def _ear_series(lx, ly, rx, ry, like):
+    return pd.DataFrame(
+        {
+            "left_ear_x": lx,
+            "left_ear_y": ly,
+            "left_ear_likelihood": like,
+            "right_ear_x": rx,
+            "right_ear_y": ry,
+            "right_ear_likelihood": like,
+        }
+    )
+
+
+def test_ear_heading_per_frame_values():
+    # Frame 0: ears horizontal -> facing up (90). Frame 1: right ear below left
+    # (image y down) -> facing right (0).
+    df = _ear_series(
+        lx=[0.0, 0.0], ly=[0.0, 0.0], rx=[10.0, 0.0], ry=[0.0, 10.0], like=[1.0, 1.0]
+    )
+    out = kinematics.ear_heading_estimate(df)
+    np.testing.assert_allclose(out, [90.0, 0.0])
+
+
+def test_ear_heading_output_in_range():
+    rng = np.random.default_rng(0)
+    n = 200
+    df = _ear_series(
+        lx=rng.normal(size=n),
+        ly=rng.normal(size=n),
+        rx=rng.normal(size=n) + 5,
+        ry=rng.normal(size=n),
+        like=np.ones(n),
+    )
+    out = kinematics.ear_heading_estimate(df)
+    assert np.all(out >= 0.0) and np.all(out < 360.0)
+
+
+def test_ear_heading_interpolates_missing():
+    # Middle frame has a low-likelihood ear -> should be filled by interpolation
+    # between the two valid neighbours (both at 90 deg -> stays 90).
+    df = _ear_series(
+        lx=[0.0, 0.0, 0.0],
+        ly=[0.0, 0.0, 0.0],
+        rx=[10.0, 10.0, 10.0],
+        ry=[0.0, 0.0, 0.0],
+        like=[1.0, 0.0, 1.0],
+    )
+    out = kinematics.ear_heading_estimate(df, likelihood_threshold=0.5)
+    assert not np.isnan(out).any()
+    np.testing.assert_allclose(out, [90.0, 90.0, 90.0])
+
+
+def test_ear_heading_circular_interpolation_shortest_path():
+    # Neighbours at 350 and 10 deg -> shortest-path midpoint is 0, not 180.
+    heading = np.array([350.0, np.nan, 10.0])
+    filled = kinematics._interpolate_circular(heading)
+    # 0 deg and 360 deg are the same angle; compare circularly.
+    d = filled[1] % 360.0
+    assert min(d, 360.0 - d) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_ear_heading_no_interpolation_keeps_nan():
+    df = _ear_series(
+        lx=[0.0, 0.0], ly=[0.0, 0.0], rx=[10.0, 10.0], ry=[0.0, 0.0], like=[1.0, 0.0]
+    )
+    out = kinematics.ear_heading_estimate(
+        df, likelihood_threshold=0.5, interpolate=False
+    )
+    assert not np.isnan(out[0]) and np.isnan(out[1])
+
+
+def test_append_ear_heading_adds_column():
+    df = _ear_series(
+        lx=[0.0, 0.0], ly=[0.0, 0.0], rx=[10.0, 10.0], ry=[0.0, 0.0], like=[1.0, 1.0]
+    )
+    out = kinematics.append_ear_heading(df)
+    assert "ear_heading_deg" in out.columns
+    assert "ear_heading_deg" not in df.columns  # original untouched
+    np.testing.assert_allclose(out["ear_heading_deg"], [90.0, 90.0])
+
+
+def test_interpolate_circular_edge_fill():
+    # Leading/trailing NaNs -> filled with nearest valid value.
+    heading = np.array([np.nan, 45.0, np.nan])
+    filled = kinematics._interpolate_circular(heading)
+    np.testing.assert_allclose(filled, [45.0, 45.0, 45.0])
