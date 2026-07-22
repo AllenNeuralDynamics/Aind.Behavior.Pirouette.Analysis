@@ -550,7 +550,7 @@ def ear_velocity_estimate(
     time_column: str = "harp_time",
     likelihood_threshold: float = 0.0,
     forward_sign: int = 1,
-    smoothing_sigma_s: float = 0.1,
+    smoothing_sigma: float = 1.5,
     method: str = "signed_speed",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Signed instantaneous and Gaussian-smoothed ear-midpoint velocity (mm/s).
@@ -588,10 +588,11 @@ def ear_velocity_estimate(
     forward_sign:
         ``+1`` or ``-1``; selects the nose-ward orthogonal (see
         :func:`heading_offset_from_ears`). If forward/backward is inverted, flip.
-    smoothing_sigma_s:
-        Standard deviation (seconds) of the 1-D Gaussian applied to the
-        instantaneous velocity. Converted to samples using the median sampling
-        interval. Tune to taste; ``0.1`` s is a reasonable start at ~60 fps.
+    smoothing_sigma:
+        Standard deviation, in **samples/frames**, of the 1-D Gaussian applied to
+        the instantaneous velocity (the native ``scipy.ndimage.gaussian_filter1d``
+        unit). ``1.5`` removes frame-to-frame spikiness while preserving the
+        global velocity structure at ~60 fps; pass ``0`` to disable smoothing.
     method:
         ``"signed_speed"`` or ``"projection"`` (see above).
 
@@ -660,11 +661,9 @@ def ear_velocity_estimate(
         sign = np.where(projection >= 0, 1.0, -1.0)
         instantaneous = sign * speed
 
-    # Smooth: convert sigma from seconds to samples via the median interval.
-    dt = np.median(np.diff(t))
-    sigma_samples = smoothing_sigma_s / dt if dt > 0 else 0.0
-    if sigma_samples > 0:
-        smoothed = gaussian_filter1d(instantaneous, sigma_samples, mode="nearest")
+    # Smooth the instantaneous velocity (sigma in samples/frames).
+    if smoothing_sigma > 0:
+        smoothed = gaussian_filter1d(instantaneous, smoothing_sigma, mode="nearest")
     else:
         smoothed = instantaneous.copy()
 
@@ -679,7 +678,7 @@ def append_ear_velocity(
     time_column: str = "harp_time",
     likelihood_threshold: float = 0.0,
     forward_sign: int = 1,
-    smoothing_sigma_s: float = 0.1,
+    smoothing_sigma: float = 1.5,
     method: str = "signed_speed",
     instantaneous_column: str = "ear_velocity_mm_s",
     smoothed_column: str = "ear_velocity_smooth_mm_s",
@@ -709,7 +708,7 @@ def append_ear_velocity(
         time_column=time_column,
         likelihood_threshold=likelihood_threshold,
         forward_sign=forward_sign,
-        smoothing_sigma_s=smoothing_sigma_s,
+        smoothing_sigma=smoothing_sigma,
         method=method,
     )
     out = df.copy()

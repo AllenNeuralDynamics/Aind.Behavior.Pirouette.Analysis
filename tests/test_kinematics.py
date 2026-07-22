@@ -281,7 +281,7 @@ def test_ear_midpoint_interpolates_when_both_missing():
 def test_velocity_forward_positive():
     # Facing +x and moving +x at 1 mm / 0.1 s = 10 mm/s -> +10.
     df = _moving_ears_df(n=11, dt=0.1, step_x=1.0)
-    inst, smooth = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.0)
+    inst, smooth = kinematics.ear_velocity_estimate(df, smoothing_sigma=0.0)
     np.testing.assert_allclose(inst, 10.0)
     np.testing.assert_allclose(smooth, 10.0)
 
@@ -289,7 +289,7 @@ def test_velocity_forward_positive():
 def test_velocity_backward_negative():
     # Facing +x but moving -x -> negative (backward).
     df = _moving_ears_df(n=11, dt=0.1, step_x=-1.0)
-    inst, _ = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.0)
+    inst, _ = kinematics.ear_velocity_estimate(df, smoothing_sigma=0.0)
     np.testing.assert_allclose(inst, -10.0)
 
 
@@ -300,31 +300,31 @@ def test_velocity_projection_ignores_lateral():
     df["left_ear_y_mm"] = df["left_ear_y_mm"] + np.arange(11) * 1.0
     df["right_ear_y_mm"] = df["right_ear_y_mm"] + np.arange(11) * 1.0
     proj, _ = kinematics.ear_velocity_estimate(
-        df, method="projection", smoothing_sigma_s=0.0
+        df, method="projection", smoothing_sigma=0.0
     )
     np.testing.assert_allclose(proj, 0.0, atol=1e-9)
     speed, _ = kinematics.ear_velocity_estimate(
-        df, method="signed_speed", smoothing_sigma_s=0.0
+        df, method="signed_speed", smoothing_sigma=0.0
     )
     np.testing.assert_allclose(np.abs(speed), 10.0)
 
 
 def test_velocity_units_scale_with_dt():
     df = _moving_ears_df(n=11, dt=0.05, step_x=1.0)  # 1 mm / 0.05 s = 20 mm/s
-    inst, _ = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.0)
+    inst, _ = kinematics.ear_velocity_estimate(df, smoothing_sigma=0.0)
     np.testing.assert_allclose(inst, 20.0)
 
 
 def test_velocity_smoothing_preserves_constant():
     df = _moving_ears_df(n=51, dt=0.1, step_x=1.0)
-    inst, smooth = kinematics.ear_velocity_estimate(df, smoothing_sigma_s=0.1)
+    inst, smooth = kinematics.ear_velocity_estimate(df, smoothing_sigma=1.5)
     # A constant velocity is unchanged by Gaussian smoothing (interior).
     np.testing.assert_allclose(smooth[10:-10], 10.0, atol=1e-6)
 
 
 def test_append_ear_velocity_columns():
     df = _moving_ears_df(n=11, dt=0.1, step_x=1.0)
-    out = kinematics.append_ear_velocity(df, smoothing_sigma_s=0.05)
+    out = kinematics.append_ear_velocity(df, smoothing_sigma=0.05)
     assert "ear_velocity_mm_s" in out.columns
     assert "ear_velocity_smooth_mm_s" in out.columns
     assert "ear_velocity_mm_s" not in df.columns  # input untouched
