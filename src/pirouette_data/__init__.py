@@ -1,6 +1,6 @@
 """Pirouette data: processing and analysis toolkit for chronic ephys and behavior data."""
 
-from pirouette_data import ingestion, kinematics
+from pirouette_data import ingestion, kinematics, processing
 from pirouette_data.ingestion import (
     build_dataset,
     flatten_pose_columns,
@@ -18,12 +18,18 @@ from pirouette_data.kinematics import (
     heading_offset_from_ears,
     load_commutator_turns,
 )
+from pirouette_data.processing import (
+    ChamberScale,
+    append_mm_columns,
+    estimate_chamber_scale,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
     "ingestion",
     "kinematics",
+    "processing",
     "build_dataset",
     "flatten_pose_columns",
     "get_experiment_start_harp",
@@ -37,4 +43,7 @@ __all__ = [
     "ear_heading_estimate",
     "heading_offset_from_ears",
     "load_commutator_turns",
+    "ChamberScale",
+    "append_mm_columns",
+    "estimate_chamber_scale",
 ]
