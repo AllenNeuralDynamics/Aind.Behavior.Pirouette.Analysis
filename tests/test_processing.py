@@ -9,29 +9,30 @@ import pytest
 from pirouette_data import processing
 
 
-def _chamber_df(length_px, width_px, n=5, like=1.0, jitter=0.0, rng=None):
-    """Axis-aligned chamber with corners at (0,0)-(length,width), plus a keypoint.
+def _chamber_df(
+    length_px, width_px, n=5, like=1.0, jitter=0.0, rng=None, ox=0.0, oy=0.0
+):
+    """Axis-aligned chamber with upper-left at (ox, oy), plus a centre keypoint.
 
-    Image coordinates (y down): upper edge at y=0, lower edge at y=width_px.
+    Image coordinates (y down): upper edge at y=oy, lower edge at y=oy+width_px.
     """
-    zeros = np.zeros(n)
     df = pd.DataFrame(
         {
-            "ul_champber_x": zeros.copy(),
-            "ul_champber_y": zeros.copy(),
+            "ul_champber_x": np.full(n, ox),
+            "ul_champber_y": np.full(n, oy),
             "ul_champber_likelihood": np.full(n, like),
-            "ur_champber_x": np.full(n, length_px),
-            "ur_champber_y": zeros.copy(),
+            "ur_champber_x": np.full(n, ox + length_px),
+            "ur_champber_y": np.full(n, oy),
             "ur_champber_likelihood": np.full(n, like),
-            "lr_chamber_x": np.full(n, length_px),
-            "lr_chamber_y": np.full(n, width_px),
+            "lr_chamber_x": np.full(n, ox + length_px),
+            "lr_chamber_y": np.full(n, oy + width_px),
             "lr_chamber_likelihood": np.full(n, like),
-            "ll_chamber_x": zeros.copy(),
-            "ll_chamber_y": np.full(n, width_px),
+            "ll_chamber_x": np.full(n, ox),
+            "ll_chamber_y": np.full(n, oy + width_px),
             "ll_chamber_likelihood": np.full(n, like),
             # a tracked keypoint at the chamber centre
-            "nose_x": np.full(n, length_px / 2),
-            "nose_y": np.full(n, width_px / 2),
+            "nose_x": np.full(n, ox + length_px / 2),
+            "nose_y": np.full(n, oy + width_px / 2),
             "nose_likelihood": np.full(n, like),
         }
     )
@@ -108,18 +109,26 @@ def test_keypoint_columns():
 # append_mm_columns
 # ---------------------------------------------------------------------------
 def test_append_mm_columns_values():
-    df = _chamber_df(length_px=746.0, width_px=388.0, n=3)  # 0.5 mm/px both axes
+    # Chamber offset from image origin to exercise origin subtraction.
+    df = _chamber_df(length_px=746.0, width_px=388.0, n=3, ox=100.0, oy=50.0)
     out = processing.append_mm_columns(df)
-    # nose at chamber centre (373, 194) px * 0.5 mm/px -> (186.5, 97.0) mm
+    # Upper-left corner is the origin -> (0, 0) mm.
+    assert out["ul_champber_x_mm"].iloc[0] == pytest.approx(0.0)
+    assert out["ul_champber_y_mm"].iloc[0] == pytest.approx(0.0)
+    # ur -> (length_mm, 0); ll -> (0, width_mm).
+    assert out["ur_champber_x_mm"].iloc[0] == pytest.approx(processing.CHAMBER_LENGTH_MM)
+    assert out["ur_champber_y_mm"].iloc[0] == pytest.approx(0.0)
+    assert out["ll_chamber_y_mm"].iloc[0] == pytest.approx(processing.CHAMBER_WIDTH_MM)
+    # nose at chamber centre -> (length_mm/2, width_mm/2).
     assert out["nose_x_mm"].iloc[0] == pytest.approx(processing.CHAMBER_LENGTH_MM / 2)
     assert out["nose_y_mm"].iloc[0] == pytest.approx(processing.CHAMBER_WIDTH_MM / 2)
-    # chamber spans exactly the known dimensions in mm
-    assert (out["ur_champber_x_mm"] - out["ul_champber_x_mm"]).iloc[
-        0
-    ] == pytest.approx(processing.CHAMBER_LENGTH_MM)
-    assert (out["ll_chamber_y_mm"] - out["ul_champber_y_mm"]).iloc[
-        0
-    ] == pytest.approx(processing.CHAMBER_WIDTH_MM)
+
+
+def test_scale_reports_origin():
+    df = _chamber_df(length_px=746.0, width_px=388.0, n=4, ox=100.0, oy=50.0)
+    scale = processing.estimate_chamber_scale(df)
+    assert scale.origin_px_x == pytest.approx(100.0)
+    assert scale.origin_px_y == pytest.approx(50.0)
 
 
 def test_append_mm_columns_does_not_mutate_input():
@@ -131,7 +140,12 @@ def test_append_mm_columns_does_not_mutate_input():
 def test_append_mm_columns_accepts_precomputed_scale():
     df = _chamber_df(length_px=746.0, width_px=388.0, n=2)
     scale = processing.ChamberScale(
-        length_px=746.0, width_px=388.0, mm_per_px_x=2.0, mm_per_px_y=3.0
+        length_px=746.0,
+        width_px=388.0,
+        mm_per_px_x=2.0,
+        mm_per_px_y=3.0,
+        origin_px_x=0.0,
+        origin_px_y=0.0,
     )
     out = processing.append_mm_columns(df, scale=scale)
     assert out["nose_x_mm"].iloc[0] == pytest.approx((746.0 / 2) * 2.0)

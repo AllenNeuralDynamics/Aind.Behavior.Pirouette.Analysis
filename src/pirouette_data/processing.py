@@ -14,9 +14,15 @@ labelling typo) has fixed physical dimensions:
 For each frame the four edge lengths are measured in pixels; the pooled median of
 the two horizontal edges gives the length in pixels and the pooled median of the
 two vertical edges gives the width in pixels. Combined with the known mm
-dimensions these yield per-axis scale factors (mm/pixel) that are applied to
-every tracked keypoint to produce ``<bodypart>_x_mm`` / ``<bodypart>_y_mm``
-columns.
+dimensions these yield per-axis scale factors (mm/pixel).
+
+Coordinates are expressed relative to the chamber origin — the upper-left (``ul``)
+corner — so the millimetre columns give position *inside* the chamber:
+``ul`` -> (0, 0), ``ur`` -> (~373, 0), ``ll`` -> (0, ~194). The origin is the
+median ``ul`` pixel position across frames (robust to per-frame tracking noise),
+and the image convention is kept (x increases to the right, y increases downward
+toward ``ll``). Every tracked keypoint gets ``<bodypart>_x_mm`` /
+``<bodypart>_y_mm`` columns.
 """
 
 from __future__ import annotations
@@ -54,12 +60,20 @@ class ChamberScale:
         Millimetres-per-pixel scale for the x-axis (``length_mm / length_px``).
     mm_per_px_y:
         Millimetres-per-pixel scale for the y-axis (``width_mm / width_px``).
+    origin_px_x:
+        Pixel x of the chamber origin (median upper-left corner) subtracted before
+        scaling.
+    origin_px_y:
+        Pixel y of the chamber origin (median upper-left corner) subtracted before
+        scaling.
     """
 
     length_px: float
     width_px: float
     mm_per_px_x: float
     mm_per_px_y: float
+    origin_px_x: float
+    origin_px_y: float
 
 
 def _edge_length_px(
@@ -163,11 +177,22 @@ def estimate_chamber_scale(
     length_px = float(np.nanmedian(length_edges))
     width_px = float(np.nanmedian(width_edges))
 
+    # Chamber origin = median upper-left corner position (robust to jitter).
+    ul = corners["ul"]
+    ul_x = df[f"{ul}_x"].to_numpy(dtype="float64")
+    ul_y = df[f"{ul}_y"].to_numpy(dtype="float64")
+    if likelihood_threshold > 0.0 and f"{ul}_likelihood" in df.columns:
+        ul_mask = df[f"{ul}_likelihood"].to_numpy(dtype="float64") > likelihood_threshold
+        ul_x = np.where(ul_mask, ul_x, np.nan)
+        ul_y = np.where(ul_mask, ul_y, np.nan)
+
     return ChamberScale(
         length_px=length_px,
         width_px=width_px,
         mm_per_px_x=length_mm / length_px,
         mm_per_px_y=width_mm / width_px,
+        origin_px_x=float(np.nanmedian(ul_x)),
+        origin_px_y=float(np.nanmedian(ul_y)),
     )
 
 
@@ -204,9 +229,10 @@ def append_mm_columns(
     """Append millimetre coordinate columns for every tracked keypoint.
 
     For each body part with ``<name>_x`` / ``<name>_y`` pixel columns, adds
-    ``<name>_x<suffix>`` and ``<name>_y<suffix>`` obtained by scaling the pixel
-    coordinates with the chamber-derived mm/pixel factors (x uses the length
-    scale, y uses the width scale).
+    ``<name>_x<suffix>`` and ``<name>_y<suffix>`` obtained by subtracting the
+    chamber origin (upper-left corner) and scaling the result with the
+    chamber-derived mm/pixel factors (x uses the length scale, y uses the width
+    scale). The upper-left corner is therefore (0, 0) mm.
 
     Parameters
     ----------
@@ -237,6 +263,10 @@ def append_mm_columns(
 
     out = df.copy()
     for base in keypoint_columns(df):
-        out[f"{base}_x{suffix}"] = df[f"{base}_x"].to_numpy() * scale.mm_per_px_x
-        out[f"{base}_y{suffix}"] = df[f"{base}_y"].to_numpy() * scale.mm_per_px_y
+        out[f"{base}_x{suffix}"] = (
+            df[f"{base}_x"].to_numpy() - scale.origin_px_x
+        ) * scale.mm_per_px_x
+        out[f"{base}_y{suffix}"] = (
+            df[f"{base}_y"].to_numpy() - scale.origin_px_y
+        ) * scale.mm_per_px_y
     return out
