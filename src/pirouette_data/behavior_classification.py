@@ -8,9 +8,19 @@ The threshold can be supplied explicitly or estimated **unsupervised** from the
 speed distribution with Otsu's method (the speed histogram is bimodal: a large
 low-speed rest peak and a spread-out movement mode).
 
-A median filter is then applied to the binary label sequence so that very short
-bouts — e.g. a brief flicker of "movement" while the mouse is merely
-repositioning during rest — are replaced by the longer sandwiching label.
+Two mechanisms clean up the binary label sequence:
+
+* a **median filter** (window in frames) that removes very short flickers, and
+* a **minimum bout duration** (in seconds): movement bouts shorter than
+  ``min_bout_s`` are relabelled rest, and brief sub-``bridge_gap_s`` dips within
+  movement are bridged. This is what captures *slow but sustained* movement — set
+  a sensitive (low) threshold so slow motion clears it, then keep only bouts that
+  persist for at least ``min_bout_s`` (e.g. 0.5 s).
+
+Because the slow-movement mode sits close to the rest peak, a plain Otsu split of
+the raw speed lands far out on the tail (missing slow movement). Passing
+``log=True`` runs Otsu on ``log1p(speed)``, which places the threshold just above
+the rest floor and is the recommended setting for capturing slow movement.
 """
 
 from __future__ import annotations
@@ -121,22 +131,56 @@ def _as_odd(size: int) -> int:
     return size if size % 2 == 1 else size + 1
 
 
+def _remove_short_runs(binary: np.ndarray, min_len: int, value: int) -> np.ndarray:
+    """Flip runs equal to *value* shorter than *min_len* to the other value.
+
+    Used to enforce minimum bout durations: e.g. ``value=1, min_len=30`` relabels
+    movement bouts shorter than 30 frames as rest; ``value=0`` bridges short rest
+    gaps into movement.
+    """
+    out = np.asarray(binary).copy()
+    n = out.size
+    if min_len <= 1 or n == 0:
+        return out
+    change = np.flatnonzero(np.diff(out)) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [n]))
+    for s, e in zip(starts, ends):
+        if out[s] == value and (e - s) < min_len:
+            out[s:e] = 1 - value
+    return out
+
+
 def classify_rest_movement(
     velocity: np.ndarray,
     threshold: float | None = None,
     method: str = "otsu",
-    median_filter_size: int = 15,
+    fps: float | None = None,
+    min_bout_s: float | None = 0.5,
+    bridge_gap_s: float | None = 0.2,
+    median_filter_size: int = 1,
     use_abs: bool = True,
     rest_label: str = REST_LABEL,
     movement_label: str = MOVEMENT_LABEL,
     nbins: int = 256,
-    log: bool = False,
+    log: bool = True,
 ) -> np.ndarray:
     """Classify each frame as rest or movement from a velocity signal.
 
-    Speed (``abs(velocity)`` by default) is thresholded, then the binary sequence
-    is median-filtered to remove bouts shorter than ~``median_filter_size / 2``
-    frames — replacing them with the surrounding label.
+    Speed (``abs(velocity)`` by default) is thresholded into a binary sequence,
+    which is then cleaned up in this order:
+
+    1. optional **median filter** (``median_filter_size`` frames);
+    2. **bridge** rest gaps shorter than ``bridge_gap_s`` (relabel to movement),
+       so a slow movement briefly dipping below threshold stays continuous;
+    3. **remove** movement bouts shorter than ``min_bout_s`` (relabel to rest),
+       keeping only sustained movement.
+
+    Steps 2-3 require *fps*; they are skipped if *fps* is ``None``.
+
+    To capture slow-but-sustained movement, use a sensitive threshold (the default
+    ``log=True`` Otsu, which sits just above the rest floor) together with
+    ``min_bout_s`` (e.g. 0.5 s).
 
     Parameters
     ----------
@@ -147,17 +191,26 @@ def classify_rest_movement(
         estimated via :func:`estimate_velocity_threshold` using *method*.
     method:
         Unsupervised threshold method used when *threshold* is ``None``.
+    fps:
+        Sampling rate (frames/second), required for the ``min_bout_s`` /
+        ``bridge_gap_s`` steps. When ``None`` those steps are skipped.
+    min_bout_s:
+        Minimum movement-bout duration (seconds); shorter movement bouts are
+        relabelled rest. ``None`` or ``0`` disables.
+    bridge_gap_s:
+        Rest gaps shorter than this (seconds) inside movement are bridged to
+        movement. ``None`` or ``0`` disables.
     median_filter_size:
-        Window (frames) of the median filter applied to the binary labels; forced
-        to the nearest odd integer. Larger removes longer spurious bouts. Pass
-        ``<= 1`` to disable filtering.
+        Window (frames) of an optional median filter on the binary labels; forced
+        to the nearest odd integer. ``<= 1`` disables (the default).
     use_abs:
         When ``True`` (default), classify on ``abs(velocity)`` so the sign
         (forward/backward) does not matter.
     rest_label, movement_label:
         Output label strings.
     nbins, log:
-        Passed to the threshold estimator.
+        Passed to the threshold estimator (``log=True`` recommended for slow
+        movement).
 
     Returns
     -------
@@ -181,6 +234,12 @@ def classify_rest_movement(
     if size > 1:
         binary = median_filter(binary, size=size, mode="nearest")
 
+    if fps is not None and fps > 0:
+        if bridge_gap_s:
+            binary = _remove_short_runs(binary, int(round(bridge_gap_s * fps)), value=0)
+        if min_bout_s:
+            binary = _remove_short_runs(binary, int(round(min_bout_s * fps)), value=1)
+
     labels = np.where(binary == 1, movement_label, rest_label).astype(object)
     return labels
 
@@ -190,18 +249,27 @@ def append_behavior_labels(
     velocity_column: str = DEFAULT_VELOCITY_COLUMN,
     threshold: float | None = None,
     method: str = "otsu",
-    median_filter_size: int = 15,
+    fps: float | None = None,
+    min_bout_s: float | None = 0.5,
+    bridge_gap_s: float | None = 0.2,
+    median_filter_size: int = 1,
     use_abs: bool = True,
     rest_label: str = REST_LABEL,
     movement_label: str = MOVEMENT_LABEL,
     column: str = "behavior",
+    time_column: str = "harp_time",
     nbins: int = 256,
-    log: bool = False,
+    log: bool = True,
 ) -> pd.DataFrame:
     """Append a rest/movement behavior label column to the DataFrame.
 
-    Thin wrapper around :func:`classify_rest_movement`. The speed threshold that
-    was used is recorded in ``df.attrs["behavior_velocity_threshold"]``.
+    Wrapper around :func:`classify_rest_movement`. When *fps* is ``None`` it is
+    derived from *time_column* (median frame interval), enabling the
+    ``min_bout_s`` / ``bridge_gap_s`` steps. The speed threshold used is recorded
+    in ``df.attrs["behavior_velocity_threshold"]``.
+
+    The defaults (``log=True`` Otsu + ``min_bout_s=0.5``) are tuned to capture
+    slow but sustained movement.
 
     Parameters
     ----------
@@ -211,7 +279,12 @@ def append_behavior_labels(
     velocity_column:
         Column holding the velocity/speed to classify (default the smoothed
         ear-midpoint velocity).
-    threshold, method, median_filter_size, use_abs, rest_label, movement_label, nbins, log:
+    fps:
+        Sampling rate; when ``None`` it is computed from *time_column*.
+    time_column:
+        Column of timestamps (seconds) used to derive *fps* (default
+        ``"harp_time"``).
+    threshold, method, min_bout_s, bridge_gap_s, median_filter_size, use_abs, rest_label, movement_label, nbins, log:
         Passed to :func:`classify_rest_movement`.
     column:
         Name of the appended label column (default ``"behavior"``).
@@ -229,6 +302,11 @@ def append_behavior_labels(
     if velocity_column not in df.columns:
         raise KeyError(f"df must contain the velocity column {velocity_column!r}.")
 
+    if fps is None and time_column in df.columns:
+        dt = float(np.median(np.diff(df[time_column].to_numpy(dtype="float64"))))
+        if dt > 0:
+            fps = 1.0 / dt
+
     velocity = df[velocity_column].to_numpy(dtype="float64")
     speed = np.abs(velocity) if use_abs else velocity
     used_threshold = (
@@ -243,6 +321,9 @@ def append_behavior_labels(
         velocity,
         threshold=used_threshold,
         method=method,
+        fps=fps,
+        min_bout_s=min_bout_s,
+        bridge_gap_s=bridge_gap_s,
         median_filter_size=median_filter_size,
         use_abs=use_abs,
         rest_label=rest_label,

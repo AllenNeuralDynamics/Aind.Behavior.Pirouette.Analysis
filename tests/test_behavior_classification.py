@@ -96,6 +96,64 @@ def test_median_filter_size_coerced_to_odd():
 
 
 # ---------------------------------------------------------------------------
+# minimum bout duration (seconds)
+# ---------------------------------------------------------------------------
+def test_min_bout_removes_short_movement():
+    # fps=60: a 0.3 s (18-frame) movement bout is shorter than min_bout_s=0.5 s.
+    speed = np.zeros(200)
+    speed[100:118] = 100.0
+    labels = bc.classify_rest_movement(
+        speed, threshold=50.0, fps=60.0, min_bout_s=0.5, bridge_gap_s=None
+    )
+    assert set(labels) == {"rest"}
+
+
+def test_min_bout_keeps_long_movement():
+    # A 1 s (60-frame) bout survives min_bout_s=0.5 s.
+    speed = np.zeros(200)
+    speed[100:160] = 100.0
+    labels = bc.classify_rest_movement(
+        speed, threshold=50.0, fps=60.0, min_bout_s=0.5, bridge_gap_s=None
+    )
+    assert (labels == "movement").sum() == pytest.approx(60, abs=1)
+
+
+def test_bridge_gap_keeps_slow_movement_continuous():
+    # Two 0.4 s movement bouts separated by a 0.1 s (6-frame) dip. Bridging the
+    # gap makes one 0.9 s bout that survives the 0.5 s min-bout filter.
+    speed = np.zeros(200)
+    speed[100:124] = 100.0  # 0.4 s
+    speed[130:154] = 100.0  # 0.4 s, gap of 6 frames (0.1 s) between
+    labels = bc.classify_rest_movement(
+        speed, threshold=50.0, fps=60.0, min_bout_s=0.5, bridge_gap_s=0.2
+    )
+    # Without bridging each 0.4 s bout would be dropped; with bridging they merge.
+    assert (labels == "movement").sum() > 50
+
+
+def test_min_bout_skipped_without_fps():
+    speed = np.zeros(50)
+    speed[25] = 100.0  # single-frame spike
+    labels = bc.classify_rest_movement(
+        speed, threshold=50.0, fps=None, min_bout_s=0.5, median_filter_size=1
+    )
+    assert (labels == "movement").sum() == 1  # no filtering applied
+
+
+def test_slow_sustained_movement_captured():
+    # Slow (30 mm/s) but sustained (1 s) movement is captured with a low threshold,
+    # while a fast 1-frame spike during rest is rejected as too short.
+    speed = np.full(300, 5.0)  # rest floor
+    speed[100:160] = 30.0  # slow, sustained 1 s
+    speed[250] = 500.0  # brief spike
+    labels = bc.classify_rest_movement(
+        speed, threshold=17.6, fps=60.0, min_bout_s=0.5, bridge_gap_s=0.2
+    )
+    assert labels[130] == "movement"  # slow sustained -> movement
+    assert labels[250] == "rest"  # brief spike -> rest
+
+
+# ---------------------------------------------------------------------------
 # NaN handling
 # ---------------------------------------------------------------------------
 def test_nonfinite_labelled_rest():
