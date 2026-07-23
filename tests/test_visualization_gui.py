@@ -142,6 +142,20 @@ def test_stride():
     assert viz._stride(10, 50) == 1
 
 
+def test_segments_and_segment_info():
+    n = 120
+    src = np.where(np.arange(n) < 60, "TopCamera_A", "TopCamera_B")
+    df = pd.DataFrame({
+        "source_file": src,
+        "frame": np.concatenate([np.arange(60), np.arange(60)]),
+        "time_since_start": np.arange(n) / 60.0,
+    })
+    assert viz.segments(df) == ["TopCamera_A", "TopCamera_B"]
+    base, count, fps = viz.segment_info(df, "TopCamera_B")
+    assert base == 60 and count == 60
+    assert fps == pytest.approx(60.0, rel=0.05)
+
+
 # ---------------------------------------------------------------------------
 # figure builders (need plotly) + frame encoding
 # ---------------------------------------------------------------------------

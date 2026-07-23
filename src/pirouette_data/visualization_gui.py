@@ -253,6 +253,28 @@ def frame_index_for_row(df: pd.DataFrame, row: int) -> int:
     return int(df[COL_FRAME].iloc[row])
 
 
+def segments(df: pd.DataFrame) -> list[str]:
+    """Ordered unique ``source_file`` values (one per video segment)."""
+    return list(dict.fromkeys(df[COL_SOURCE].tolist()))
+
+
+def segment_info(df: pd.DataFrame, source_file: str) -> tuple[int, int, float]:
+    """Return ``(base_row, n_frames, fps)`` for a video segment.
+
+    ``base_row`` is the dataset row index of the segment's first frame, so a
+    within-video time ``t`` maps to global row ``base_row + round(t * fps)``.
+    """
+    idx = np.flatnonzero(df[COL_SOURCE].to_numpy() == source_file)
+    base = int(idx[0])
+    n = int(idx.size)
+    if n > 1:
+        dt = float(np.median(np.diff(df[COL_TIME].to_numpy()[idx])))
+        fps = 1.0 / dt if dt > 0 else 60.0
+    else:
+        fps = 60.0
+    return base, n, fps
+
+
 # ---------------------------------------------------------------------------
 # Video frame extraction
 # ---------------------------------------------------------------------------
@@ -580,6 +602,7 @@ def create_app(
         The configured app. Call ``app.run(...)`` (or :func:`run`) to serve it.
     """
     from dash import Dash, Input, Output, Patch, State, dcc, html, no_update
+    from flask import abort, send_file
 
     state = AppState(
         dataset_dir=Path(dataset_dir),
@@ -592,6 +615,17 @@ def create_app(
     unit_files = _list_files(state.units_dir, (".pkl",))
 
     app = Dash(__name__, title="Pirouette explorer")
+
+    # Serve the mp4 files to the browser's native <video> player (range requests
+    # supported), so playback is decoded/buffered client-side and stays smooth
+    # even over a tunnel.
+    @app.server.route("/pirouette-video/<path:name>")
+    def _serve_video(name):
+        base = state.video_dir.resolve()
+        path = (base / name).resolve()
+        if path.parent != base or path.suffix.lower() != ".mp4" or not path.exists():
+            abort(404)
+        return send_file(str(path), mimetype="video/mp4", conditional=True)
 
     controls = html.Div(
         [
@@ -630,27 +664,23 @@ def create_app(
     # are stacked taller for a bigger view.
     left = html.Div(
         [
-            html.Img(
-                id="video",
-                style={"width": "100%", "border": "1px solid #ccc",
-                       "background": "#000"},
+            # Native HTML5 player: smooth, browser-buffered playback + scrubbing.
+            html.Video(
+                id="video", controls=True, autoPlay=False,
+                style={"width": "100%", "border": "1px solid #ccc", "background": "#000"},
             ),
             html.Div(id="frame-info", style={"fontFamily": "monospace", "padding": "6px 0"}),
-            dcc.Slider(id="frame", min=0, max=1, step=1, value=0,
-                       marks=None, tooltip={"placement": "bottom"},
-                       updatemode="mouseup"),
             html.Div([
-                html.Button("▶ Play", id="play", n_clicks=0,
-                            style={"marginRight": "10px", "minWidth": "90px"}),
-                html.Label("Speed", style={"marginRight": "6px"}),
+                html.Label("Segment (hour)"),
+                dcc.Dropdown(id="segment", options=[], clearable=False,
+                             style={"flex": "1"}),
+                html.Label("Speed", style={"marginLeft": "10px"}),
                 dcc.Dropdown(
                     id="speed",
                     options=[{"label": f"{s}x", "value": s}
                              for s in (0.25, 0.5, 1, 2, 4, 10)],
-                    value=1, clearable=False,
-                    style={"width": "90px"},
+                    value=1, clearable=False, style={"width": "90px"},
                 ),
-                dcc.Interval(id="player", interval=120, n_intervals=0, disabled=True),
             ], style={"display": "flex", "alignItems": "center", "gap": "8px",
                       "paddingTop": "8px"}),
             html.Div([
@@ -658,6 +688,11 @@ def create_app(
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
+            # Poll the video's playback time to drive the plot cursor.
+            dcc.Interval(id="sync", interval=150, n_intervals=0),
+            dcc.Store(id="seg"),
+            dcc.Store(id="vrow"),
+            html.Div(id="_dummy", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -697,10 +732,10 @@ def create_app(
     @app.callback(
         Output("ts-top", "figure"),
         Output("ts-bottom", "figure"),
-        Output("frame", "max"),
-        Output("frame", "value"),
         Output("unit", "options"),
         Output("unit", "value"),
+        Output("segment", "options"),
+        Output("segment", "value"),
         Input("load", "n_clicks"),
         State("dataset", "value"),
         State("unitsfile", "value"),
@@ -709,17 +744,64 @@ def create_app(
     )
     def _load(_clicks, dataset_path, units_path, offset):
         if not dataset_path or not units_path:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+            return (no_update,) * 6
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
+        segs = segments(state.df)
         return (
             build_timeseries_top(state.df),
             _bottom_figure(),
-            len(state.df) - 1,
-            0,
             options,
             state.unit_id,
+            [{"label": s, "value": s} for s in segs],
+            segs[0],
         )
+
+    @app.callback(
+        Output("video", "src"),
+        Output("seg", "data"),
+        Input("segment", "value"),
+        prevent_initial_call=True,
+    )
+    def _load_segment(seg):
+        # Point the <video> at the chosen hour and store its row/fps mapping.
+        if state.df is None or not seg:
+            return no_update, no_update
+        base, n, fps = segment_info(state.df, seg)
+        return f"/pirouette-video/{seg}.mp4", {"base": base, "n": n, "fps": fps}
+
+    # Read the video's currentTime each tick -> global row (client-side, cheap).
+    app.clientside_callback(
+        """
+        function(_n, seg) {
+            if (!seg) { return window.dash_clientside.no_update; }
+            var v = document.getElementById('video');
+            if (!v) { return window.dash_clientside.no_update; }
+            var row = seg.base + Math.round((v.currentTime || 0) * seg.fps);
+            var maxr = seg.base + seg.n - 1;
+            if (row > maxr) { row = maxr; }
+            if (window.__pirRow === row) { return window.dash_clientside.no_update; }
+            window.__pirRow = row;
+            return row;
+        }
+        """,
+        Output("vrow", "data"),
+        Input("sync", "n_intervals"),
+        State("seg", "data"),
+    )
+
+    # Apply the playback speed to the native player (client-side).
+    app.clientside_callback(
+        """
+        function(s) {
+            var v = document.getElementById('video');
+            if (v && s) { v.playbackRate = s; }
+            return '';
+        }
+        """,
+        Output("_dummy", "children"),
+        Input("speed", "value"),
+    )
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
@@ -745,24 +827,21 @@ def create_app(
         return _bottom_figure()
 
     @app.callback(
-        Output("video", "src"),
         Output("frame-info", "children"),
         Output("head", "figure"),
         Output("ts-top", "figure", allow_duplicate=True),
         Output("ts-bottom", "figure", allow_duplicate=True),
-        Input("frame", "value"),
+        Input("vrow", "data"),
         Input("window", "value"),
         prevent_initial_call=True,
     )
-    def _scrub(row, window_s):
-        if state.df is None:
-            return no_update, no_update, no_update, no_update, no_update
+    def _sync(row, window_s):
+        # Driven by the video playhead (vrow): move the cursor + update info/head.
+        if state.df is None or row is None:
+            return no_update, no_update, no_update, no_update
         row = int(min(max(0, row), len(state.df) - 1))
         src = state.df[COL_SOURCE].iloc[row]
         fidx = frame_index_for_row(state.df, row)
-        rgb = state.reader.frame(src, fidx)
-        uri = frame_to_data_uri(rgb, placeholder_text=f"no video: {src}")
-
         t_s = float(state.df[COL_TIME].iloc[row])
         dt = state.df[COL_DATETIME].iloc[row]
         info = html.Div([
@@ -772,52 +851,17 @@ def create_app(
             html.Br(),
             html.Span(f"PST: {pd.Timestamp(dt).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"),
         ])
-
         head_fig = build_head_position(
             state.head_x, state.head_y, state.head_t, row, float(window_s),
             chamber=state.chamber,
         )
-
-        # Move the red cursor on both timeseries figures via a partial update.
         cursor = pd.Timestamp(dt).isoformat()
         patch_top, patch_bottom = Patch(), Patch()
         patch_top["layout"]["shapes"][0]["x0"] = cursor
         patch_top["layout"]["shapes"][0]["x1"] = cursor
         patch_bottom["layout"]["shapes"][0]["x0"] = cursor
         patch_bottom["layout"]["shapes"][0]["x1"] = cursor
-        return uri, info, head_fig, patch_top, patch_bottom
-
-    @app.callback(
-        Output("player", "disabled"),
-        Output("play", "children"),
-        Input("play", "n_clicks"),
-        State("player", "disabled"),
-        prevent_initial_call=True,
-    )
-    def _toggle_play(_clicks, disabled):
-        now_disabled = not disabled
-        return now_disabled, ("▶ Play" if now_disabled else "⏸ Pause")
-
-    @app.callback(
-        Output("frame", "value", allow_duplicate=True),
-        Output("player", "disabled", allow_duplicate=True),
-        Output("play", "children", allow_duplicate=True),
-        Input("player", "n_intervals"),
-        State("frame", "value"),
-        State("frame", "max"),
-        State("speed", "value"),
-        prevent_initial_call=True,
-    )
-    def _advance(_n, current, maximum, speed):
-        # Advance the frame by (fps * tick_seconds * speed) each interval tick;
-        # stop at the end. tick = 0.12 s, assumed 60 fps.
-        if state.df is None or current is None:
-            return no_update, no_update, no_update
-        step = max(1, int(round(60 * 0.12 * float(speed))))
-        nxt = current + step
-        if nxt >= maximum:
-            return maximum, True, "▶ Play"  # reached the end -> pause
-        return nxt, no_update, no_update
+        return info, head_fig, patch_top, patch_bottom
 
     return app
 
