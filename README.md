@@ -143,16 +143,26 @@ ear‑vector solid), head position (inferno‑coloured by time, windowed), the
 selected unit's spike raster, and its instantaneous firing rate — each with a red
 cursor at the current frame.
 
+The video can be scrubbed with the slider or **played** (▶ Play, with a speed
+selector).
+
 ```bash
-uv sync --extra gui                       # install dash/plotly
-uv run python scripts/run_gui.py          # serve on 127.0.0.1:8050 (from .env)
-uv run python scripts/run_gui.py --host 0.0.0.0 --port 8050   # share on the LAN
-uv run python scripts/run_gui.py --spike-offset-s 113097.0    # align spikes
+uv sync --extra gui                       # install dash/plotly/pyngrok
+uv run python scripts/run_gui.py          # serve (host/port from .env)
+uv run python scripts/run_gui.py --share  # also open a public link (ngrok)
+uv run python scripts/run_gui.py --spike-offset-s 113097.0   # align spikes
 ```
 
 The server runs on the machine that holds the data, so **viewers only need a
-browser** — no local files. For remote sharing, put a tunnel (e.g. ngrok,
-Cloudflare Tunnel) in front of the port.
+browser** — no local files. On start it prints the links to share:
+
+- **Same network (LAN):** with `GUI_HOST=0.0.0.0` (the default), send viewers on
+  your Wi‑Fi/LAN the printed `http://<your-ip>:8050` link. Allow Python through
+  the Windows Firewall when prompted.
+- **Anywhere (internet):** `127.0.0.1`/LAN links do **not** work off your network
+  (NAT/firewall). Use `--share` to open an [ngrok](https://ngrok.com) tunnel and
+  share the printed `https://…` public URL. This needs a free ngrok auth token —
+  set `NGROK_AUTHTOKEN` in `.env` (or run `ngrok config add-authtoken <token>`).
 
 Spike times are shifted by `--spike-offset-s` (env `SPIKE_OFFSET_S`, also editable
 live in the app) so they are referenced to the **experiment start**, matching the

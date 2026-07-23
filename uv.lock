@@ -60,6 +60,7 @@ all = [
     { name = "pre-commit" },
     { name = "pygments" },
     { name = "pymdown-extensions" },
+    { name = "pyngrok" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "ruff" },
@@ -84,6 +85,7 @@ docs = [
 gui = [
     { name = "dash" },
     { name = "plotly" },
+    { name = "pyngrok" },
 ]
 notebook = [
     { name = "ipykernel" },
@@ -115,6 +117,7 @@ docs = [
 gui = [
     { name = "dash" },
     { name = "plotly" },
+    { name = "pyngrok" },
 ]
 notebook = [
     { name = "ipykernel" },
@@ -155,6 +158,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pygments", marker = "extra == 'docs'", specifier = ">=2.16" },
     { name = "pymdown-extensions", marker = "extra == 'docs'", specifier = ">=10.0" },
+    { name = "pyngrok", marker = "extra == 'gui'", specifier = ">=7.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.4" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "python-dotenv", specifier = ">=0.21" },
@@ -189,6 +193,7 @@ docs = [
 gui = [
     { name = "dash", specifier = ">=2.16" },
     { name = "plotly", specifier = ">=5.18" },
+    { name = "pyngrok", specifier = ">=7.0" },
 ]
 notebook = [
     { name = "ipykernel", specifier = ">=6.29" },
@@ -3811,6 +3816,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/21/a9/5f0c535ba3b08fe09270c16808e053a968868242ecbd5676d4e3a488bf28/pymdown_extensions-11.0.1.tar.gz", hash = "sha256:dd2905ae6fc5b75582fafb139a1266ffc754705efa902aa50067fa7ff4f94ec0", size = 857113, upload-time = "2026-07-02T17:59:22.955Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d6/54/da572c98c0b77626a91b5d3b89f0231d8bff5125c225420908632f8b342d/pymdown_extensions-11.0.1-py3-none-any.whl", hash = "sha256:db3943a62bab7e03af1364f0c4083e64b91fb097675a4b6cceccfbe9a77e5eb2", size = 269455, upload-time = "2026-07-02T17:59:21.271Z" },
+]
+
+[[package]]
+name = "pyngrok"
+version = "8.1.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/8d/ae/6664934258773db4666e65730c43b4b06730f78d49861a9a04ebcf4742ff/pyngrok-8.1.2.tar.gz", hash = "sha256:3b5383ec7dc4646ac0d046435eb58c6cd1cbc9acad70e6dee012b05dc25b070a", size = 45078, upload-time = "2026-04-29T15:16:53.969Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/5c/7733776a6a9704bffee19d203f9be80f25f78a5011a9863971be60fe2763/pyngrok-8.1.2-py3-none-any.whl", hash = "sha256:849e9f55706288b00eb28f4ae8ea16b05e52c609f80ef4a88ca23b385f2f9178", size = 25935, upload-time = "2026-04-29T15:16:52.088Z" },
 ]
 
 [[package]]

@@ -34,8 +34,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--spike-offset-s", type=float,
                    default=float(os.getenv("SPIKE_OFFSET_S", "0") or 0),
                    help="Offset (s) added to spike times -> experiment reference.")
-    p.add_argument("--host", default=os.getenv("GUI_HOST", "127.0.0.1"))
+    p.add_argument("--host", default=os.getenv("GUI_HOST", "0.0.0.0"),
+                   help="Bind address; 0.0.0.0 (default) allows LAN access.")
     p.add_argument("--port", type=int, default=int(os.getenv("GUI_PORT", "8050")))
+    p.add_argument("--share", action="store_true",
+                   default=os.getenv("SHARE", "").lower() in ("1", "true", "yes"),
+                   help="Open a public ngrok tunnel (needs pyngrok + NGROK_AUTHTOKEN).")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
 
@@ -43,7 +47,6 @@ def main(argv: list[str] | None = None) -> None:
     if missing:
         raise SystemExit(f"Missing required paths (set via CLI or .env): {', '.join(missing)}")
 
-    print(f"Serving Pirouette explorer on http://{args.host}:{args.port}")
     run(
         dataset_dir=args.dataset_dir,
         units_dir=args.units_dir,
@@ -52,6 +55,7 @@ def main(argv: list[str] | None = None) -> None:
         host=args.host,
         port=args.port,
         debug=args.debug,
+        share=args.share,
     )
 
 

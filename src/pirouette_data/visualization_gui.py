@@ -631,6 +631,19 @@ def create_app(
                        marks=None, tooltip={"placement": "bottom"},
                        updatemode="mouseup"),
             html.Div([
+                html.Button("▶ Play", id="play", n_clicks=0,
+                            style={"marginRight": "10px", "minWidth": "90px"}),
+                html.Label("Speed", style={"marginRight": "6px"}),
+                dcc.Dropdown(
+                    id="speed",
+                    options=[{"label": f"{s}x", "value": s} for s in (0.25, 0.5, 1, 2, 4)],
+                    value=1, clearable=False,
+                    style={"width": "90px"},
+                ),
+                dcc.Interval(id="player", interval=120, n_intervals=0, disabled=True),
+            ], style={"display": "flex", "alignItems": "center", "gap": "8px",
+                      "paddingTop": "8px"}),
+            html.Div([
                 html.Label("Head-trail window (s)"),
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
@@ -764,7 +777,53 @@ def create_app(
         patch_bottom["layout"]["shapes"][0]["x1"] = cursor
         return uri, info, head_fig, patch_top, patch_bottom
 
+    @app.callback(
+        Output("player", "disabled"),
+        Output("play", "children"),
+        Input("play", "n_clicks"),
+        State("player", "disabled"),
+        prevent_initial_call=True,
+    )
+    def _toggle_play(_clicks, disabled):
+        now_disabled = not disabled
+        return now_disabled, ("▶ Play" if now_disabled else "⏸ Pause")
+
+    @app.callback(
+        Output("frame", "value", allow_duplicate=True),
+        Output("player", "disabled", allow_duplicate=True),
+        Output("play", "children", allow_duplicate=True),
+        Input("player", "n_intervals"),
+        State("frame", "value"),
+        State("frame", "max"),
+        State("speed", "value"),
+        prevent_initial_call=True,
+    )
+    def _advance(_n, current, maximum, speed):
+        # Advance the frame by (fps * tick_seconds * speed) each interval tick;
+        # stop at the end. tick = 0.12 s, assumed 60 fps.
+        if state.df is None or current is None:
+            return no_update, no_update, no_update
+        step = max(1, int(round(60 * 0.12 * float(speed))))
+        nxt = current + step
+        if nxt >= maximum:
+            return maximum, True, "▶ Play"  # reached the end -> pause
+        return nxt, no_update, no_update
+
     return app
+
+
+def _lan_ip() -> str:
+    """Best-effort primary LAN IP of this machine."""
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def run(
@@ -772,14 +831,48 @@ def run(
     units_dir: str | Path,
     video_dir: str | Path,
     spike_offset_s: float = 0.0,
-    host: str = "127.0.0.1",
+    host: str = "0.0.0.0",
     port: int = 8050,
     debug: bool = False,
+    share: bool = False,
 ) -> None:
-    """Create and serve the app.
+    """Create and serve the app, printing the URLs to share.
 
-    Use ``host="0.0.0.0"`` to share on the local network; for remote viewers put
-    a tunnel (e.g. ngrok) in front of the port.
+    Parameters
+    ----------
+    host:
+        Bind address. ``"0.0.0.0"`` (default) exposes the app on the local
+        network so viewers on the same Wi-Fi/LAN can open the printed LAN URL.
+        ``"127.0.0.1"`` restricts it to this machine only.
+    share:
+        When ``True``, open an ngrok tunnel and print a public ``https`` URL that
+        works for viewers **anywhere** (data stays on this machine). Requires
+        ``pyngrok`` and a free ngrok auth token (``NGROK_AUTHTOKEN`` env var or
+        ``ngrok config add-authtoken ...``).
     """
+    import os
+
     app = create_app(dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s)
+
+    print("\nPirouette explorer — share one of these links:")
+    print(f"  this machine : http://127.0.0.1:{port}")
+    if host == "0.0.0.0":
+        print(f"  same network : http://{_lan_ip()}:{port}")
+    if share:
+        try:
+            from pyngrok import ngrok
+
+            token = os.getenv("NGROK_AUTHTOKEN")
+            if token:
+                ngrok.set_auth_token(token)
+            public = ngrok.connect(port, "http").public_url
+            print(f"  public       : {public}   <-- send this to anyone")
+        except Exception as exc:  # noqa: BLE001 - report and continue serving
+            print(f"  [share] ngrok tunnel failed: {exc}")
+            print("  [share] `uv sync --extra gui` and set NGROK_AUTHTOKEN "
+                  "(free at ngrok.com).")
+    print(
+        "\nNote: for the LAN link, allow Python through the Windows Firewall when "
+        "prompted.\n"
+    )
     app.run(host=host, port=port, debug=debug)
