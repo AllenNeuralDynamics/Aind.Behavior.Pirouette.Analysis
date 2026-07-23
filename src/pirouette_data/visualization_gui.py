@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import pickle
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -256,11 +257,17 @@ def frame_index_for_row(df: pd.DataFrame, row: int) -> int:
 # Video frame extraction
 # ---------------------------------------------------------------------------
 class FrameReader:
-    """Caches ``cv2.VideoCapture`` objects and reads frames by index."""
+    """Caches ``cv2.VideoCapture`` objects and reads frames by index.
+
+    ``cv2.VideoCapture`` is not thread-safe: concurrent ``set``/``read`` from the
+    threaded web server (which happens during playback) crashes FFmpeg. All
+    access is therefore serialised with a lock.
+    """
 
     def __init__(self, video_dir: str | Path):
         self.video_dir = Path(video_dir)
         self._caps: dict[str, object] = {}
+        self._lock = threading.Lock()
 
     def _capture(self, source_file: str):
         import cv2
@@ -271,23 +278,25 @@ class FrameReader:
         return self._caps[source_file]
 
     def frame(self, source_file: str, frame_index: int) -> "np.ndarray | None":
-        """Return an RGB frame array, or ``None`` if unavailable."""
+        """Return an RGB frame array, or ``None`` if unavailable (thread-safe)."""
         import cv2
 
-        cap = self._capture(source_file)
-        if cap is None or not cap.isOpened():
-            return None
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
-        ok, frame = cap.read()
+        with self._lock:
+            cap = self._capture(source_file)
+            if cap is None or not cap.isOpened():
+                return None
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+            ok, frame = cap.read()
         if not ok:
             return None
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
     def release(self) -> None:
-        for cap in self._caps.values():
-            if cap is not None:
-                cap.release()
-        self._caps.clear()
+        with self._lock:
+            for cap in self._caps.values():
+                if cap is not None:
+                    cap.release()
+            self._caps.clear()
 
 
 def frame_to_data_uri(rgb: "np.ndarray | None", placeholder_text: str = "") -> str:
