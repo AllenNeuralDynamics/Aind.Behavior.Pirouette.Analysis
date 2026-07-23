@@ -212,6 +212,22 @@ def behavior_bouts(df: pd.DataFrame) -> list[tuple[pd.Timestamp, pd.Timestamp, s
     return bouts
 
 
+CHAMBER_CORNERS = ["ul_champber", "ur_champber", "lr_chamber", "ll_chamber"]
+
+
+def chamber_corners_mm(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
+    """Median (x, y) mm position of each chamber corner (empty if columns absent)."""
+    corners: dict[str, tuple[float, float]] = {}
+    for corner in CHAMBER_CORNERS:
+        xc, yc = f"{corner}_x_mm", f"{corner}_y_mm"
+        if xc in df.columns and yc in df.columns:
+            corners[corner] = (
+                float(np.nanmedian(df[xc])),
+                float(np.nanmedian(df[yc])),
+            )
+    return corners
+
+
 def head_position_mm(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Ear-midpoint head position (mm): mean of the left/right ear mm columns."""
     lx = df[f"{LEFT_EAR}_x_mm"].to_numpy(dtype="float64")
@@ -314,6 +330,7 @@ class AppState:
     head_x: np.ndarray | None = None
     head_y: np.ndarray | None = None
     head_t: np.ndarray | None = None  # experiment seconds
+    chamber: dict | None = None
     unit_id: object = None
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
@@ -325,6 +342,7 @@ class AppState:
         self.reader = FrameReader(self.video_dir)
         self.head_x, self.head_y = head_position_mm(self.df)
         self.head_t = self.df[COL_TIME].to_numpy(dtype="float64")
+        self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
         return self
 
@@ -350,62 +368,70 @@ def build_timeseries_top(df: pd.DataFrame):
         rows=3,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.04,
-        row_heights=[0.18, 0.41, 0.41],
-        subplot_titles=("behaviour", "smoothed velocity (mm/s)", "heading (deg)"),
+        vertical_spacing=0.11,
+        row_heights=[0.08, 0.46, 0.46],
+        subplot_titles=("behaviour", "smoothed velocity", "heading"),
     )
 
-    # Behaviour as a 2-colour heatmap row.
+    # Behaviour as a thin 2-colour heatmap row.
     s = _stride(len(df))
     x = df[COL_DATETIME].iloc[::s]
     beh = (df[COL_BEHAVIOR].iloc[::s] == "movement").astype(int).to_numpy()
     fig.add_trace(
         go.Heatmap(
-            x=x,
-            z=[beh],
-            colorscale=[[0, REST_COLOR], [1, MOVE_COLOR]],
-            showscale=False,
-            hoverinfo="skip",
+            x=x, z=[beh], colorscale=[[0, REST_COLOR], [1, MOVE_COLOR]],
+            showscale=False, hoverinfo="skip",
         ),
-        row=1,
-        col=1,
+        row=1, col=1,
     )
+    # Legend entries for the behaviour colours (dummy points).
+    for label, color in (("rest", REST_COLOR), ("movement", MOVE_COLOR)):
+        fig.add_trace(
+            go.Scatter(
+                x=[None], y=[None], mode="markers",
+                marker=dict(size=10, color=color, symbol="square"),
+                name=label, showlegend=True,
+            ),
+            row=1, col=1,
+        )
 
     fig.add_trace(
         go.Scattergl(
             x=x, y=df[COL_VELOCITY].iloc[::s], line=dict(color="black", width=1),
-            name="velocity",
+            name="velocity", showlegend=False,
         ),
-        row=2,
-        col=1,
+        row=2, col=1,
     )
 
     fig.add_trace(
         go.Scattergl(
             x=x, y=df[COL_COMM_HEADING].iloc[::s],
-            line=dict(color="black", width=1, dash="dash"), name="commutator",
+            line=dict(color="black", width=1, dash="dash"),
+            name="commutator", showlegend=True,
         ),
-        row=3,
-        col=1,
+        row=3, col=1,
     )
     fig.add_trace(
         go.Scattergl(
             x=x, y=df[COL_EAR_HEADING].iloc[::s],
-            line=dict(color="black", width=1), name="ear vector",
+            line=dict(color="black", width=1), name="ear vector", showlegend=True,
         ),
-        row=3,
-        col=1,
+        row=3, col=1,
     )
 
     x0 = df[COL_DATETIME].iloc[0]
     fig.add_shape(
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
-        line=dict(color=CURSOR_COLOR, width=1.5),
+        line=dict(color=CURSOR_COLOR, width=2.5),
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
+    fig.update_yaxes(title_text="mm/s", row=2, col=1)
+    fig.update_yaxes(title_text="deg", row=3, col=1)
     fig.update_layout(
-        height=430, margin=dict(l=50, r=20, t=25, b=20), showlegend=False,
-        template="plotly_white",
+        height=460, margin=dict(l=55, r=120, t=25, b=20),
+        showlegend=True,
+        legend=dict(x=1.02, y=1, xanchor="left"),
+        template="plotly_white", uirevision="ts-top",
     )
     return fig
 
@@ -430,7 +456,7 @@ def build_timeseries_bottom(
     fig.add_trace(
         go.Scattergl(
             x=spike_dt, y=np.zeros(len(spike_dt)), mode="markers",
-            marker=dict(symbol="line-ns-open", color="black", size=8, line=dict(width=1)),
+            marker=dict(symbol="line-ns-open", color="black", size=14, line=dict(width=1)),
             name="spikes", hoverinfo="x",
         ),
         row=1, col=1,
@@ -441,14 +467,15 @@ def build_timeseries_bottom(
     )
     fig.add_shape(
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
-        line=dict(color=CURSOR_COLOR, width=1.5),
+        line=dict(color=CURSOR_COLOR, width=2.5),
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
+    fig.update_yaxes(title_text="Hz", row=2, col=1)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
-        height=300, margin=dict(l=50, r=20, t=25, b=20), showlegend=False,
-        template="plotly_white",
+        height=300, margin=dict(l=55, r=120, t=25, b=20), showlegend=False,
+        template="plotly_white", uirevision=f"ts-bottom-{unit_label}",
     )
     return fig
 
@@ -460,8 +487,13 @@ def build_head_position(
     current_row: int,
     window_s: float,
     fps: float = 60.0,
+    chamber: dict | None = None,
 ):
-    """Spatial head-position trail over a time window, inferno-coloured by time."""
+    """Spatial head-position trail over a time window, inferno-coloured by time.
+
+    The dots are connected in time order; if *chamber* corner positions are
+    given, a black box marks the chamber walls and the axes are bounded to it.
+    """
     import plotly.graph_objects as go
 
     half = int(round(window_s * fps))
@@ -472,9 +504,10 @@ def build_head_position(
     fig = go.Figure()
     fig.add_trace(
         go.Scattergl(
-            x=xs, y=ys, mode="markers",
+            x=xs, y=ys, mode="lines+markers",
+            line=dict(color="rgba(120,120,120,0.45)", width=1),
             marker=dict(
-                size=4, color=ts, colorscale="Inferno",
+                size=5, color=ts, colorscale="Inferno",
                 colorbar=dict(title="t (s)", thickness=12), showscale=True,
             ),
             name="trail", hoverinfo="skip",
@@ -484,14 +517,35 @@ def build_head_position(
         fig.add_trace(
             go.Scattergl(
                 x=[head_x[current_row]], y=[head_y[current_row]], mode="markers",
-                marker=dict(size=11, color=CURSOR_COLOR, line=dict(color="white", width=1)),
+                marker=dict(size=12, color=CURSOR_COLOR, line=dict(color="white", width=1)),
                 name="current", hoverinfo="skip",
             )
         )
-    fig.update_yaxes(autorange="reversed", scaleanchor="x", scaleratio=1)  # image convention
+
+    order = ["ul_champber", "ur_champber", "lr_chamber", "ll_chamber"]
+    if chamber and all(c in chamber for c in order):
+        bx = [chamber[c][0] for c in order] + [chamber[order[0]][0]]
+        by = [chamber[c][1] for c in order] + [chamber[order[0]][1]]
+        fig.add_trace(
+            go.Scatter(
+                x=bx, y=by, mode="lines", line=dict(color="black", width=2),
+                name="chamber", hoverinfo="skip",
+            )
+        )
+        cxs = [chamber[c][0] for c in order]
+        cys = [chamber[c][1] for c in order]
+        mx = (max(cxs) - min(cxs)) * 0.05 + 5
+        my = (max(cys) - min(cys)) * 0.05 + 5
+        fig.update_xaxes(range=[min(cxs) - mx, max(cxs) + mx])
+        fig.update_yaxes(range=[max(cys) + my, min(cys) - my])  # image convention (y down)
+    else:
+        fig.update_yaxes(autorange="reversed")
+
+    fig.update_yaxes(scaleanchor="x", scaleratio=1)
     fig.update_layout(
-        height=320, margin=dict(l=50, r=20, t=25, b=20), showlegend=False,
+        height=340, margin=dict(l=55, r=20, t=25, b=20), showlegend=False,
         template="plotly_white", title="head position (mm), time-coloured",
+        uirevision="head",
     )
     return fig
 
@@ -570,6 +624,8 @@ def create_app(
                "padding": "8px"},
     )
 
+    graph_config = {"scrollZoom": True, "displaylogo": False}
+
     left = html.Div(
         [
             html.Img(id="video", style={"width": "100%", "border": "1px solid #ccc"}),
@@ -583,16 +639,16 @@ def create_app(
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
         ],
-        style={"flex": "1", "minWidth": "360px", "padding": "8px"},
+        style={"flex": "1.5", "minWidth": "640px", "padding": "8px"},
     )
 
     right = html.Div(
         [
-            dcc.Graph(id="ts-top"),
-            dcc.Graph(id="head"),
-            dcc.Graph(id="ts-bottom"),
+            dcc.Graph(id="ts-top", config=graph_config),
+            dcc.Graph(id="head", config=graph_config),
+            dcc.Graph(id="ts-bottom", config=graph_config),
         ],
-        style={"flex": "2", "padding": "8px"},
+        style={"flex": "1.5", "padding": "8px"},
     )
 
     app.layout = html.Div([
@@ -648,14 +704,24 @@ def create_app(
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
         Input("unit", "value"),
-        Input("offset", "value"),
         prevent_initial_call=True,
     )
-    def _select_unit(unit_value, offset):
+    def _select_unit(unit_value):
+        # Selecting a unit updates the spike + firing-rate plots immediately.
         if state.df is None or unit_value is None:
             return no_update
         state.unit_id = unit_value
-        state.spike_offset_s = float(offset or 0.0)
+        return _bottom_figure()
+
+    @app.callback(
+        Output("ts-bottom", "figure", allow_duplicate=True),
+        Input("offset", "value"),
+        prevent_initial_call=True,
+    )
+    def _set_offset(offset):
+        if state.df is None or offset is None:
+            return no_update
+        state.spike_offset_s = float(offset)
         return _bottom_figure()
 
     @app.callback(
@@ -688,7 +754,8 @@ def create_app(
         ])
 
         head_fig = build_head_position(
-            state.head_x, state.head_y, state.head_t, row, float(window_s)
+            state.head_x, state.head_y, state.head_t, row, float(window_s),
+            chamber=state.chamber,
         )
 
         # Move the red cursor on both timeseries figures via a partial update.

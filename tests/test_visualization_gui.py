@@ -156,7 +156,34 @@ def test_build_head_position_current_marker():
     hx, hy = viz.head_position_mm(df)
     ht = df["time_since_start"].to_numpy()
     fig = viz.build_head_position(hx, hy, ht, current_row=150, window_s=1.0)
-    assert len(fig.data) == 2  # trail + current marker
+    assert len(fig.data) == 2  # trail + current marker (no chamber)
+    # dots are connected
+    assert "lines" in fig.data[0].mode
+
+
+def test_build_head_position_with_chamber_box():
+    df = _dataset(300)
+    hx, hy = viz.head_position_mm(df)
+    ht = df["time_since_start"].to_numpy()
+    chamber = {
+        "ul_champber": (0.0, 0.0), "ur_champber": (373.0, 0.0),
+        "lr_chamber": (373.0, 194.0), "ll_chamber": (0.0, 194.0),
+    }
+    fig = viz.build_head_position(hx, hy, ht, 150, 1.0, chamber=chamber)
+    assert len(fig.data) == 3  # trail + current + chamber box
+    assert fig.data[2].line.color == "black"
+
+
+def test_chamber_corners_mm():
+    df = pd.DataFrame({
+        "ul_champber_x_mm": [0.0, 0.2], "ul_champber_y_mm": [0.0, 0.0],
+        "ur_champber_x_mm": [373.0, 373.0], "ur_champber_y_mm": [0.0, 0.0],
+        "lr_chamber_x_mm": [373.0, 373.0], "lr_chamber_y_mm": [194.0, 194.0],
+        "ll_chamber_x_mm": [0.0, 0.0], "ll_chamber_y_mm": [194.0, 194.0],
+    })
+    corners = viz.chamber_corners_mm(df)
+    assert set(corners) == {"ul_champber", "ur_champber", "lr_chamber", "ll_chamber"}
+    assert corners["ur_champber"] == (373.0, 0.0)
 
 
 def test_frame_to_data_uri_placeholder():
