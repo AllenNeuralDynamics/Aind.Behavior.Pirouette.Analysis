@@ -420,7 +420,7 @@ def build_timeseries_top(df: pd.DataFrame):
     fig.update_yaxes(title_text="deg", row=3, col=1)
     fig.update_annotations(font_size=12)  # subplot titles hold the labels
     fig.update_layout(
-        height=340, margin=dict(l=55, r=25, t=28, b=20),
+        height=460, margin=dict(l=55, r=25, t=30, b=20),
         showlegend=False, template="plotly_white", uirevision="ts-top",
     )
     return fig
@@ -464,7 +464,7 @@ def build_timeseries_bottom(
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
-        height=220, margin=dict(l=55, r=25, t=28, b=20), showlegend=False,
+        height=320, margin=dict(l=55, r=25, t=30, b=20), showlegend=False,
         template="plotly_white", uirevision=f"ts-bottom-{unit_label}",
     )
     return fig
@@ -524,8 +524,8 @@ def build_head_position(
         )
         cxs = [chamber[c][0] for c in order]
         cys = [chamber[c][1] for c in order]
-        mx = (max(cxs) - min(cxs)) * 0.05 + 5
-        my = (max(cys) - min(cys)) * 0.05 + 5
+        mx = (max(cxs) - min(cxs)) * 0.02 + 2  # barely larger than the chamber
+        my = (max(cys) - min(cys)) * 0.02 + 2
         fig.update_xaxes(range=[min(cxs) - mx, max(cxs) + mx])
         fig.update_yaxes(range=[max(cys) + my, min(cys) - my])  # image convention (y down)
     else:
@@ -533,7 +533,7 @@ def build_head_position(
 
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     fig.update_layout(
-        height=300, margin=dict(l=55, r=20, t=28, b=20), showlegend=False,
+        height=480, margin=dict(l=55, r=20, t=30, b=20), showlegend=False,
         template="plotly_white", title="head position (mm), time-coloured",
         uirevision="head",
     )
@@ -616,14 +616,15 @@ def create_app(
 
     graph_config = {"scrollZoom": True, "displaylogo": False}
 
-    # Left column height (video + controls) is balanced against the right stack
-    # (ts-top 340 + head 300 + ts-bottom 220 = 860 px).
+    # Equal-width columns: the video and the plots share the same horizontal
+    # extent. The video sizes naturally to that width (no letterbox); the plots
+    # are stacked taller for a bigger view.
     left = html.Div(
         [
             html.Img(
                 id="video",
-                style={"width": "100%", "height": "660px", "objectFit": "contain",
-                       "background": "#000", "border": "1px solid #ccc"},
+                style={"width": "100%", "border": "1px solid #ccc",
+                       "background": "#000"},
             ),
             html.Div(id="frame-info", style={"fontFamily": "monospace", "padding": "6px 0"}),
             dcc.Slider(id="frame", min=0, max=1, step=1, value=0,
