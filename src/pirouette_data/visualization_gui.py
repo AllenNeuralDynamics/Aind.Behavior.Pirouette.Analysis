@@ -481,8 +481,9 @@ def build_head_position(
 ):
     """Spatial head-position trail over a time window, inferno-coloured by time.
 
-    The dots are connected in time order; if *chamber* corner positions are
-    given, a black box marks the chamber walls and the axes are bounded to it.
+    Points are drawn as time-coloured markers (no connecting line); if *chamber*
+    corner positions are given, a black box marks the chamber walls and the axes
+    are bounded to it.
     """
     import plotly.graph_objects as go
 
@@ -494,8 +495,7 @@ def build_head_position(
     fig = go.Figure()
     fig.add_trace(
         go.Scattergl(
-            x=xs, y=ys, mode="lines+markers",
-            line=dict(color="rgba(120,120,120,0.45)", width=1),
+            x=xs, y=ys, mode="markers",
             marker=dict(
                 size=5, color=ts, colorscale="Inferno",
                 colorbar=dict(title="t (s)", thickness=12), showscale=True,

@@ -157,8 +157,8 @@ def test_build_head_position_current_marker():
     ht = df["time_since_start"].to_numpy()
     fig = viz.build_head_position(hx, hy, ht, current_row=150, window_s=1.0)
     assert len(fig.data) == 2  # trail + current marker (no chamber)
-    # dots are connected
-    assert "lines" in fig.data[0].mode
+    # markers only, no connecting line
+    assert fig.data[0].mode == "markers"
 
 
 def test_build_head_position_with_chamber_box():
