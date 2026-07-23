@@ -394,6 +394,7 @@ def build_dataset(
     order_by: str = "harp",
     experiment_start_harp: float | None = None,
     flatten: bool = True,
+    max_files: int | None = None,
 ) -> pd.DataFrame:
     """Build a single time-ordered pose DataFrame with Harp timing columns.
 
@@ -433,6 +434,9 @@ def build_dataset(
     flatten:
         Passed to :func:`load_pose_h5`; flattens the DLC column MultiIndex when
         ``True`` (default).
+    max_files:
+        When set, only the first *max_files* pose files (chronological) are
+        processed. Useful for quick/partial builds.
 
     Returns
     -------
@@ -461,6 +465,8 @@ def build_dataset(
     pose_files = sorted(pose_dir.glob("*.h5"))
     if not pose_files:
         raise FileNotFoundError(f"No .h5 files found in {pose_dir}.")
+    if max_files is not None:
+        pose_files = pose_files[:max_files]
 
     s3_client = get_s3_client(anonymous=anonymous)
 

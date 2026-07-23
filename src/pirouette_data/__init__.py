@@ -2,6 +2,7 @@
 
 from pirouette_data import (
     behavior_classification,
+    cli,
     ingestion,
     kinematics,
     processing,
@@ -41,6 +42,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "behavior_classification",
+    "cli",
     "ingestion",
     "kinematics",
     "processing",
