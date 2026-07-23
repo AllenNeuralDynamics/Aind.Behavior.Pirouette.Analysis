@@ -370,7 +370,11 @@ def build_timeseries_top(df: pd.DataFrame):
         shared_xaxes=True,
         vertical_spacing=0.11,
         row_heights=[0.08, 0.46, 0.46],
-        subplot_titles=("behaviour", "smoothed velocity", "heading"),
+        subplot_titles=(
+            "behaviour  (rest: gray, movement: salmon)",
+            "smoothed velocity (mm/s)",
+            "heading (deg)  -  commutator: dashed, ear-vector: solid",
+        ),
     )
 
     # Behaviour as a thin 2-colour heatmap row.
@@ -384,37 +388,24 @@ def build_timeseries_top(df: pd.DataFrame):
         ),
         row=1, col=1,
     )
-    # Legend entries for the behaviour colours (dummy points).
-    for label, color in (("rest", REST_COLOR), ("movement", MOVE_COLOR)):
-        fig.add_trace(
-            go.Scatter(
-                x=[None], y=[None], mode="markers",
-                marker=dict(size=10, color=color, symbol="square"),
-                name=label, showlegend=True,
-            ),
-            row=1, col=1,
-        )
-
     fig.add_trace(
         go.Scattergl(
             x=x, y=df[COL_VELOCITY].iloc[::s], line=dict(color="black", width=1),
-            name="velocity", showlegend=False,
+            name="velocity",
         ),
         row=2, col=1,
     )
-
     fig.add_trace(
         go.Scattergl(
             x=x, y=df[COL_COMM_HEADING].iloc[::s],
-            line=dict(color="black", width=1, dash="dash"),
-            name="commutator", showlegend=True,
+            line=dict(color="black", width=1, dash="dash"), name="commutator",
         ),
         row=3, col=1,
     )
     fig.add_trace(
         go.Scattergl(
             x=x, y=df[COL_EAR_HEADING].iloc[::s],
-            line=dict(color="black", width=1), name="ear vector", showlegend=True,
+            line=dict(color="black", width=1), name="ear vector",
         ),
         row=3, col=1,
     )
@@ -427,11 +418,10 @@ def build_timeseries_top(df: pd.DataFrame):
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="mm/s", row=2, col=1)
     fig.update_yaxes(title_text="deg", row=3, col=1)
+    fig.update_annotations(font_size=12)  # subplot titles hold the labels
     fig.update_layout(
-        height=460, margin=dict(l=55, r=120, t=25, b=20),
-        showlegend=True,
-        legend=dict(x=1.02, y=1, xanchor="left"),
-        template="plotly_white", uirevision="ts-top",
+        height=340, margin=dict(l=55, r=25, t=28, b=20),
+        showlegend=False, template="plotly_white", uirevision="ts-top",
     )
     return fig
 
@@ -474,7 +464,7 @@ def build_timeseries_bottom(
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
-        height=300, margin=dict(l=55, r=120, t=25, b=20), showlegend=False,
+        height=220, margin=dict(l=55, r=25, t=28, b=20), showlegend=False,
         template="plotly_white", uirevision=f"ts-bottom-{unit_label}",
     )
     return fig
@@ -543,7 +533,7 @@ def build_head_position(
 
     fig.update_yaxes(scaleanchor="x", scaleratio=1)
     fig.update_layout(
-        height=340, margin=dict(l=55, r=20, t=25, b=20), showlegend=False,
+        height=300, margin=dict(l=55, r=20, t=28, b=20), showlegend=False,
         template="plotly_white", title="head position (mm), time-coloured",
         uirevision="head",
     )
@@ -626,9 +616,15 @@ def create_app(
 
     graph_config = {"scrollZoom": True, "displaylogo": False}
 
+    # Left column height (video + controls) is balanced against the right stack
+    # (ts-top 340 + head 300 + ts-bottom 220 = 860 px).
     left = html.Div(
         [
-            html.Img(id="video", style={"width": "100%", "border": "1px solid #ccc"}),
+            html.Img(
+                id="video",
+                style={"width": "100%", "height": "660px", "objectFit": "contain",
+                       "background": "#000", "border": "1px solid #ccc"},
+            ),
             html.Div(id="frame-info", style={"fontFamily": "monospace", "padding": "6px 0"}),
             dcc.Slider(id="frame", min=0, max=1, step=1, value=0,
                        marks=None, tooltip={"placement": "bottom"},
@@ -639,7 +635,7 @@ def create_app(
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
         ],
-        style={"flex": "1.5", "minWidth": "640px", "padding": "8px"},
+        style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
 
     right = html.Div(
@@ -648,7 +644,7 @@ def create_app(
             dcc.Graph(id="head", config=graph_config),
             dcc.Graph(id="ts-bottom", config=graph_config),
         ],
-        style={"flex": "1.5", "padding": "8px"},
+        style={"flex": "1", "padding": "8px"},
     )
 
     app.layout = html.Div([
