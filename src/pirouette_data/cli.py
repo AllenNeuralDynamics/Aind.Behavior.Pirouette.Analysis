@@ -67,6 +67,7 @@ class BuildConfig:
     log_otsu: bool
     anonymous_s3: bool
     max_files: int | None
+    output_format: str  # "parquet" (default) or "csv"
 
     @property
     def session_name(self) -> str:
@@ -85,8 +86,9 @@ class BuildConfig:
 
     @property
     def output_path(self) -> Path:
-        """Destination CSV: ``<save_dir>/<session>_pirouette_dataset.csv``."""
-        return self.save_dir / f"{self.session_name}_pirouette_dataset.csv"
+        """Destination file: ``<save_dir>/<session>_pirouette_dataset.<ext>``."""
+        ext = "parquet" if self.output_format == "parquet" else "csv"
+        return self.save_dir / f"{self.session_name}_pirouette_dataset.{ext}"
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default=_env_bool("ANONYMOUS_S3", True),
                    help="Access S3 with unsigned (anonymous) requests.")
 
+    # Output format
+    p.add_argument("--format", dest="output_format", choices=("parquet", "csv"),
+                   default=os.getenv("OUTPUT_FORMAT", "parquet"),
+                   help="Output file format (default parquet).")
+
     # Testing / partial builds
     p.add_argument("--limit-files", type=int, default=_env_int_or_none("MAX_FILES"),
                    help="Process only the first N pose files (for quick runs).")
@@ -208,4 +215,5 @@ def resolve_config(argv: list[str] | None = None, use_dotenv: bool = True) -> Bu
         log_otsu=args.log_otsu,
         anonymous_s3=args.anonymous_s3,
         max_files=args.limit_files,
+        output_format=args.output_format,
     )

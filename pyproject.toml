@@ -60,6 +60,8 @@ dependencies = [
     # --- .h5 support ---
     "h5py>=3.9",            # generic HDF5 read/write
     "tables>=3.9",          # PyTables backend for pandas.read_hdf (DeepLabCut pose files)
+    # --- .parquet support (default dataset output format) ---
+    "pyarrow>=14.0",
     # --- .mp4 / video support ---
     "opencv-python>=4.8",
     "imageio>=2.31",

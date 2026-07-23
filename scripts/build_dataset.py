@@ -122,7 +122,10 @@ def main(argv: list[str] | None = None) -> None:
 
     config.save_dir.mkdir(parents=True, exist_ok=True)
     out_path = config.output_path
-    df.to_csv(out_path, index=False)
+    if config.output_format == "parquet":
+        df.to_parquet(out_path, index=False)
+    else:
+        df.to_csv(out_path, index=False)
 
     elapsed = time.perf_counter() - start
     print(

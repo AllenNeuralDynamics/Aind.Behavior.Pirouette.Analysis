@@ -74,7 +74,18 @@ def test_derived_paths_and_session(monkeypatch):
     assert cfg.session_name == "854393_2026-06-09_19-34-26"
     assert cfg.s3_video_uri.endswith("/behavior-videos")
     assert cfg.s3_behavior_uri.endswith("/behavior")
-    assert cfg.output_path == Path("/data/out/854393_2026-06-09_19-34-26_pirouette_dataset.csv")
+    # default format is parquet
+    assert cfg.output_format == "parquet"
+    assert cfg.output_path == Path(
+        "/data/out/854393_2026-06-09_19-34-26_pirouette_dataset.parquet"
+    )
+
+
+def test_format_csv_override(monkeypatch):
+    _set_env(monkeypatch)
+    cfg = cli.resolve_config(["--format", "csv"], use_dotenv=False)
+    assert cfg.output_format == "csv"
+    assert cfg.output_path.suffix == ".csv"
 
 
 # ---------------------------------------------------------------------------
