@@ -6,6 +6,7 @@ from pirouette_data import (
     ingestion,
     kinematics,
     processing,
+    visualization_gui,
 )
 from pirouette_data.behavior_classification import (
     append_behavior_labels,
@@ -46,6 +47,7 @@ __all__ = [
     "ingestion",
     "kinematics",
     "processing",
+    "visualization_gui",
     "build_dataset",
     "flatten_pose_columns",
     "get_experiment_start_harp",

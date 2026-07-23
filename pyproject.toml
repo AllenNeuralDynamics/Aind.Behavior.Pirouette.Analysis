@@ -81,6 +81,11 @@ video = [
     "scikit-image>=0.22",
 ]
 
+gui = [
+    "dash>=2.16",
+    "plotly>=5.18",
+]
+
 notebook = [
     "jupyterlab>=4.0",
     "notebook>=7.0",
@@ -113,7 +118,7 @@ docs = [
 ]
 
 all = [
-    "aind-behavior-pirouette-analysis[video,notebook,dev,docs]",
+    "aind-behavior-pirouette-analysis[video,gui,notebook,dev,docs]",
 ]
 
 # ---------------------------------------------------------------------
@@ -161,6 +166,11 @@ docs = [
 
 video = [
     "scikit-image>=0.22",
+]
+
+gui = [
+    "dash>=2.16",
+    "plotly>=5.18",
 ]
 
 # ---------------------------------------------------------------------

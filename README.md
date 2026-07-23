@@ -66,6 +66,7 @@ Then select **Python (pirouette_data)** in Jupyter / VS Code.
 | `kinematics` | Heading (ear‑vector & commutator) and signed ear‑midpoint velocity, instantaneous + Gaussian‑smoothed (`append_ear_heading`, `append_commutator_heading`, `append_ear_velocity`). |
 | `behavior_classification` | Velocity‑threshold rest/movement labels with unsupervised (Otsu) threshold and a minimum‑bout‑duration filter (`append_behavior_labels`). |
 | `cli` | Command‑line / `.env` configuration for the build script (`resolve_config`, `BuildConfig`). |
+| `visualization_gui` | Interactive Dash web app to explore a dataset alongside ephys spikes (video scrubbing + time‑aligned plots). |
 
 ---
 
@@ -130,6 +131,33 @@ df = bc.append_behavior_labels(df)          # smoothed velocity, log-Otsu, 0.5 s
 ```
 
 ---
+
+## Visualization GUI
+
+`scripts/run_gui.py` serves an interactive [Dash](https://dash.plotly.com/) web
+app for exploring a built dataset together with an ephys spike‑times file
+(`good_units.pkl`). The app shows the tracked video frame (scrubbable, with frame
+number / time‑since‑start / Pacific time) beside time‑aligned plots — behaviour
+(gray = rest, salmon = movement), smoothed velocity, heading (commutator dashed +
+ear‑vector solid), head position (inferno‑coloured by time, windowed), the
+selected unit's spike raster, and its instantaneous firing rate — each with a red
+cursor at the current frame.
+
+```bash
+uv sync --extra gui                       # install dash/plotly
+uv run python scripts/run_gui.py          # serve on 127.0.0.1:8050 (from .env)
+uv run python scripts/run_gui.py --host 0.0.0.0 --port 8050   # share on the LAN
+uv run python scripts/run_gui.py --spike-offset-s 113097.0    # align spikes
+```
+
+The server runs on the machine that holds the data, so **viewers only need a
+browser** — no local files. For remote sharing, put a tunnel (e.g. ngrok,
+Cloudflare Tunnel) in front of the port.
+
+Spike times are shifted by `--spike-offset-s` (env `SPIKE_OFFSET_S`, also editable
+live in the app) so they are referenced to the **experiment start**, matching the
+dataset's `time_since_start`. GUI paths come from `.env`: `DATASET_DIR`,
+`UNITS_DIR`, `VIDEO_DIR`, plus `GUI_HOST` / `GUI_PORT`.
 
 ## Methods notes
 
