@@ -555,8 +555,8 @@ def build_head_position(
         )
         cxs = [chamber[c][0] for c in order]
         cys = [chamber[c][1] for c in order]
-        mx = (max(cxs) - min(cxs)) * 0.02 + 2  # barely larger than the chamber
-        my = (max(cys) - min(cys)) * 0.02 + 2
+        mx = (max(cxs) - min(cxs)) * 0.01 + 1  # just a little larger than the chamber
+        my = (max(cys) - min(cys)) * 0.01 + 1
         fig.update_xaxes(range=[min(cxs) - mx, max(cxs) + mx])
         fig.update_yaxes(range=[max(cys) + my, min(cys) - my])  # image convention (y down)
     else:
@@ -670,6 +670,9 @@ def create_app(
                 style={"width": "100%", "border": "1px solid #ccc", "background": "#000"},
             ),
             html.Div(id="frame-info", style={"fontFamily": "monospace", "padding": "6px 0"}),
+            # Global scrubber across the whole session; jumps to the right video.
+            dcc.Slider(id="frame", min=0, max=1, step=1, value=0, marks=None,
+                       tooltip={"placement": "bottom"}, updatemode="mouseup"),
             html.Div([
                 html.Label("Segment (hour)"),
                 dcc.Dropdown(id="segment", options=[], clearable=False,
@@ -692,6 +695,7 @@ def create_app(
             dcc.Interval(id="sync", interval=150, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="vrow"),
+            dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
@@ -736,6 +740,9 @@ def create_app(
         Output("unit", "value"),
         Output("segment", "options"),
         Output("segment", "value"),
+        Output("frame", "max"),
+        Output("frame", "value"),
+        Output("frame", "marks"),
         Input("load", "n_clicks"),
         State("dataset", "value"),
         State("unitsfile", "value"),
@@ -744,10 +751,17 @@ def create_app(
     )
     def _load(_clicks, dataset_path, units_path, offset):
         if not dataset_path or not units_path:
-            return (no_update,) * 6
+            return (no_update,) * 9
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         segs = segments(state.df)
+        # Slider marks at each segment start, labelled with the Pacific hour.
+        marks = {}
+        for s in segs:
+            base, _, _ = segment_info(state.df, s)
+            marks[int(base)] = pd.Timestamp(
+                state.df[COL_DATETIME].iloc[base]
+            ).strftime("%H:%M")
         return (
             build_timeseries_top(state.df),
             _bottom_figure(),
@@ -755,6 +769,9 @@ def create_app(
             state.unit_id,
             [{"label": s, "value": s} for s in segs],
             segs[0],
+            len(state.df) - 1,
+            0,
+            marks,
         )
 
     @app.callback(
@@ -768,26 +785,56 @@ def create_app(
         if state.df is None or not seg:
             return no_update, no_update
         base, n, fps = segment_info(state.df, seg)
-        return f"/pirouette-video/{seg}.mp4", {"base": base, "n": n, "fps": fps}
+        return f"/pirouette-video/{seg}.mp4", {"base": base, "n": n, "fps": fps, "name": seg}
 
-    # Read the video's currentTime each tick -> global row (client-side, cheap).
+    @app.callback(
+        Output("segment", "value", allow_duplicate=True),
+        Output("seek", "data"),
+        Input("frame", "value"),
+        State("seg", "data"),
+        prevent_initial_call=True,
+    )
+    def _seek(row, seg):
+        # Slider -> jump to the video/hour containing this row and seek to it.
+        if state.df is None or row is None:
+            return no_update, no_update
+        row = int(min(max(0, row), len(state.df) - 1))
+        name = state.df[COL_SOURCE].iloc[row]
+        base, _, fps = segment_info(state.df, name)
+        seek = {"seg": name, "t": (row - base) / fps}
+        current = seg.get("name") if seg else None
+        seg_out = no_update if current == name else name
+        return seg_out, seek
+
+    # Each tick: apply any pending seek (once the right video is ready) and read
+    # the video's currentTime -> global row (client-side, cheap).
     app.clientside_callback(
         """
-        function(_n, seg) {
-            if (!seg) { return window.dash_clientside.no_update; }
+        function(_n, seg, seek) {
+            var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
-            if (!v) { return window.dash_clientside.no_update; }
+            if (!v || !seg) { return [nou, nou]; }
+            var clearSeek = nou;
+            if (seek && seek.seg && v.readyState >= 1 &&
+                v.currentSrc && v.currentSrc.indexOf(seek.seg) >= 0) {
+                v.currentTime = seek.t;
+                clearSeek = null;
+            }
             var row = seg.base + Math.round((v.currentTime || 0) * seg.fps);
             var maxr = seg.base + seg.n - 1;
             if (row > maxr) { row = maxr; }
-            if (window.__pirRow === row) { return window.dash_clientside.no_update; }
-            window.__pirRow = row;
-            return row;
+            var out = row;
+            if (window.__pirRow === row) { out = nou; }
+            else { window.__pirRow = row; }
+            return [out, clearSeek];
         }
         """,
         Output("vrow", "data"),
+        Output("seek", "data", allow_duplicate=True),
         Input("sync", "n_intervals"),
         State("seg", "data"),
+        State("seek", "data"),
+        prevent_initial_call=True,
     )
 
     # Apply the playback speed to the native player (client-side).
