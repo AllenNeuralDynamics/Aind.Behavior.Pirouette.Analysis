@@ -39,7 +39,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--port", type=int, default=int(os.getenv("GUI_PORT", "8050")))
     p.add_argument("--share", action="store_true",
                    default=os.getenv("SHARE", "").lower() in ("1", "true", "yes"),
-                   help="Open a public ngrok tunnel (needs pyngrok + NGROK_AUTHTOKEN).")
+                   help="Open a public tunnel so remote viewers can access it.")
+    p.add_argument("--share-method", choices=("cloudflare", "ngrok"),
+                   default=os.getenv("SHARE_METHOD", "cloudflare"),
+                   help="Tunnel backend: cloudflare (default, no account) or ngrok.")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
 
@@ -56,6 +59,7 @@ def main(argv: list[str] | None = None) -> None:
         port=args.port,
         debug=args.debug,
         share=args.share,
+        share_method=args.share_method,
     )
 
 

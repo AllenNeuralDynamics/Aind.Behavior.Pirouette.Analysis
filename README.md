@@ -147,9 +147,9 @@ The video can be scrubbed with the slider or **played** (▶ Play, with a speed
 selector).
 
 ```bash
-uv sync --extra gui                       # install dash/plotly/pyngrok
+uv sync --extra gui                       # install dash/plotly/tunnel helpers
 uv run python scripts/run_gui.py          # serve (host/port from .env)
-uv run python scripts/run_gui.py --share  # also open a public link (ngrok)
+uv run python scripts/run_gui.py --share  # also open a public link (Cloudflare)
 uv run python scripts/run_gui.py --spike-offset-s 113097.0   # align spikes
 ```
 
@@ -160,9 +160,12 @@ browser** — no local files. On start it prints the links to share:
   your Wi‑Fi/LAN the printed `http://<your-ip>:8050` link. Allow Python through
   the Windows Firewall when prompted.
 - **Anywhere (internet):** `127.0.0.1`/LAN links do **not** work off your network
-  (NAT/firewall). Use `--share` to open an [ngrok](https://ngrok.com) tunnel and
-  share the printed `https://…` public URL. This needs a free ngrok auth token —
-  set `NGROK_AUTHTOKEN` in `.env` (or run `ngrok config add-authtoken <token>`).
+  (NAT/firewall). Use `--share` to open a public tunnel and share the printed
+  `https://…` URL. Two backends (`--share-method`):
+  - `cloudflare` (default) — a Cloudflare quick tunnel; **no account, no browser
+    interstitial**, `cloudflared` is auto-downloaded on first use.
+  - `ngrok` — needs a free `NGROK_AUTHTOKEN` in `.env`; the free tier shows a
+    one-time "Visit Site" warning page.
 
 Spike times are shifted by `--spike-offset-s` (env `SPIKE_OFFSET_S`, also editable
 live in the app) so they are referenced to the **experiment start**, matching the

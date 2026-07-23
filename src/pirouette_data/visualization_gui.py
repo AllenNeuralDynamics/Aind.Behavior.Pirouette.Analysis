@@ -863,6 +863,30 @@ def _reset_ngrok() -> None:
     time.sleep(1)  # let the tunnel/ports free up
 
 
+def _start_cloudflare_tunnel(port: int) -> str:
+    """Open a Cloudflare quick tunnel and return the public URL.
+
+    Needs no account and shows no interstitial. Downloads the ``cloudflared``
+    helper on first use.
+    """
+    from pycloudflared import try_cloudflare
+
+    return try_cloudflare(port=port).tunnel
+
+
+def _start_ngrok_tunnel(port: int) -> str:
+    """Open an ngrok tunnel and return the public URL (requires an auth token)."""
+    import os
+
+    from pyngrok import ngrok
+
+    token = os.getenv("NGROK_AUTHTOKEN")
+    if token:
+        ngrok.set_auth_token(token)
+    _reset_ngrok()  # clear any tunnel left over from a previous run
+    return ngrok.connect(port, "http").public_url
+
+
 def run(
     dataset_dir: str | Path,
     units_dir: str | Path,
@@ -872,6 +896,7 @@ def run(
     port: int = 8050,
     debug: bool = False,
     share: bool = False,
+    share_method: str = "cloudflare",
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -882,13 +907,13 @@ def run(
         network so viewers on the same Wi-Fi/LAN can open the printed LAN URL.
         ``"127.0.0.1"`` restricts it to this machine only.
     share:
-        When ``True``, open an ngrok tunnel and print a public ``https`` URL that
-        works for viewers **anywhere** (data stays on this machine). Requires
-        ``pyngrok`` and a free ngrok auth token (``NGROK_AUTHTOKEN`` env var or
-        ``ngrok config add-authtoken ...``).
+        When ``True``, open a public tunnel and print an ``https`` URL that works
+        for viewers **anywhere** (data stays on this machine).
+    share_method:
+        ``"cloudflare"`` (default) uses a Cloudflare quick tunnel — no account,
+        no browser interstitial. ``"ngrok"`` uses ngrok (needs ``NGROK_AUTHTOKEN``
+        and shows a warning page on the free tier).
     """
-    import os
-
     app = create_app(dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s)
 
     print("\nPirouette explorer — share one of these links:")
@@ -896,19 +921,16 @@ def run(
     if host == "0.0.0.0":
         print(f"  same network : http://{_lan_ip()}:{port}")
     if share:
+        method = (share_method or "cloudflare").lower()
         try:
-            from pyngrok import ngrok
-
-            token = os.getenv("NGROK_AUTHTOKEN")
-            if token:
-                ngrok.set_auth_token(token)
-            _reset_ngrok()  # clear any tunnel left over from a previous run
-            public = ngrok.connect(port, "http").public_url
+            if method == "ngrok":
+                public = _start_ngrok_tunnel(port)
+            else:
+                public = _start_cloudflare_tunnel(port)
             print(f"  public       : {public}   <-- send this to anyone")
         except Exception as exc:  # noqa: BLE001 - report and continue serving
-            print(f"  [share] ngrok tunnel failed: {exc}")
-            print("  [share] `uv sync --extra gui` and set NGROK_AUTHTOKEN "
-                  "(free at ngrok.com).")
+            print(f"  [share] {method} tunnel failed: {exc}")
+            print("  [share] run `uv sync --extra gui` to install the tunnel helper.")
     print(
         "\nNote: for the LAN link, allow Python through the Windows Firewall when "
         "prompted.\n"
