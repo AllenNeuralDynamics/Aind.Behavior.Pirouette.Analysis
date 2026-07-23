@@ -645,7 +645,8 @@ def create_app(
                 html.Label("Speed", style={"marginRight": "6px"}),
                 dcc.Dropdown(
                     id="speed",
-                    options=[{"label": f"{s}x", "value": s} for s in (0.25, 0.5, 1, 2, 4)],
+                    options=[{"label": f"{s}x", "value": s}
+                             for s in (0.25, 0.5, 1, 2, 4, 10)],
                     value=1, clearable=False,
                     style={"width": "90px"},
                 ),
@@ -835,6 +836,33 @@ def _lan_ip() -> str:
         s.close()
 
 
+def _reset_ngrok() -> None:
+    """Terminate any ngrok agent left running from a previous session.
+
+    A crashed or re-launched run can leave an ngrok agent holding the tunnel,
+    causing ``ERR_NGROK_334`` ("endpoint is already online") on the next start.
+    """
+    import platform
+    import subprocess
+    import time
+
+    try:
+        from pyngrok import ngrok
+
+        ngrok.kill()  # stop the agent this process may have started
+    except Exception:
+        pass
+    try:
+        if platform.system() == "Windows":
+            subprocess.run(["taskkill", "/F", "/IM", "ngrok.exe"],
+                           capture_output=True, check=False)
+        else:
+            subprocess.run(["pkill", "-x", "ngrok"], capture_output=True, check=False)
+    except Exception:
+        pass
+    time.sleep(1)  # let the tunnel/ports free up
+
+
 def run(
     dataset_dir: str | Path,
     units_dir: str | Path,
@@ -874,6 +902,7 @@ def run(
             token = os.getenv("NGROK_AUTHTOKEN")
             if token:
                 ngrok.set_auth_token(token)
+            _reset_ngrok()  # clear any tunnel left over from a previous run
             public = ngrok.connect(port, "http").public_url
             print(f"  public       : {public}   <-- send this to anyone")
         except Exception as exc:  # noqa: BLE001 - report and continue serving
