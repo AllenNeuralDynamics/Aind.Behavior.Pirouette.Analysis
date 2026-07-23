@@ -557,12 +557,13 @@ def build_head_position(
         cys = [chamber[c][1] for c in order]
         mx = (max(cxs) - min(cxs)) * 0.01 + 1  # just a little larger than the chamber
         my = (max(cys) - min(cys)) * 0.01 + 1
-        fig.update_xaxes(range=[min(cxs) - mx, max(cxs) + mx])
+        # Honour the tight ranges exactly (no equal-aspect padding); the axes hug
+        # the chamber even if that means slightly non-proportional scaling.
+        fig.update_xaxes(range=[min(cxs) - mx, max(cxs) + mx], constrain="domain")
         fig.update_yaxes(range=[max(cys) + my, min(cys) - my])  # image convention (y down)
     else:
         fig.update_yaxes(autorange="reversed")
 
-    fig.update_yaxes(scaleanchor="x", scaleratio=1)
     fig.update_layout(
         height=480, margin=dict(l=55, r=20, t=30, b=20), showlegend=False,
         template="plotly_white", title="head position (mm), time-coloured",
