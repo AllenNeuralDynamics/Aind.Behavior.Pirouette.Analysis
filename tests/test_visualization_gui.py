@@ -173,6 +173,43 @@ def test_build_timeseries_top_has_cursor():
     assert fig.layout.shapes[0].line.color == viz.CURSOR_COLOR
 
 
+def _ts_top_df(n=200):
+    t = np.arange(n) / 60.0
+    return pd.DataFrame({
+        "datetime_pacific": pd.Timestamp("2026-06-10 20:00", tz="America/Los_Angeles")
+        + pd.to_timedelta(t, unit="s"),
+        "behavior": np.where((np.arange(n) // 30) % 2 == 0, "rest", "movement"),
+        "ear_velocity_smooth_mm_s": np.sin(t),
+        "ear_heading_deg": (t * 10) % 360,
+        "commutator_heading_deg": (t * 10 + 5) % 360,
+    })
+
+
+def _heading_trace_names(fig):
+    return [tr.name for tr in fig.data if tr.name in ("ear vector", "commutator")]
+
+
+def test_heading_mode_vector_default():
+    fig = viz.build_timeseries_top(_ts_top_df())
+    assert _heading_trace_names(fig) == ["ear vector"]
+    # no dashed/solid legend note in the title when not "both"
+    titles = [a.text for a in fig.layout.annotations]
+    assert any(t == "heading (deg)" for t in titles)
+    assert all("commutator: dashed" not in t for t in titles)
+
+
+def test_heading_mode_commutator():
+    fig = viz.build_timeseries_top(_ts_top_df(), heading_mode="commutator")
+    assert _heading_trace_names(fig) == ["commutator"]
+    assert all("commutator: dashed" not in a.text for a in fig.layout.annotations)
+
+
+def test_heading_mode_both():
+    fig = viz.build_timeseries_top(_ts_top_df(), heading_mode="both")
+    assert set(_heading_trace_names(fig)) == {"ear vector", "commutator"}
+    assert any("commutator: dashed" in a.text for a in fig.layout.annotations)
+
+
 def test_build_head_position_current_marker():
     df = _dataset(300)
     hx, hy = viz.head_position_mm(df)
