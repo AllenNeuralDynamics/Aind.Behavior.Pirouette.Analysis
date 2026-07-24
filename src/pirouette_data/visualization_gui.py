@@ -50,7 +50,6 @@ CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
 MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
-RATE_MAX_BINS = 60000  # cap firing-rate histogram bins for speed
 
 
 # ---------------------------------------------------------------------------
@@ -751,11 +750,10 @@ def create_app(
                 idx = np.linspace(0, in_range.size - 1, MAX_RASTER_SPIKES).astype("int64")
                 in_range = in_range[idx]
             spike_dt = spikes_to_datetime(in_range, state.exp_start_dt)
-            # Firing rate: capped bins, and downsample BEFORE the datetime
-            # conversion (converting the full fine grid was the main cost).
-            centers, rate = instantaneous_firing_rate(
-                spikes, t0, t1, max_bins=RATE_MAX_BINS
-            )
+            # Firing rate at full (fine) resolution so the trace stays smooth;
+            # downsample the plotted points BEFORE the datetime conversion (that
+            # conversion of the full fine grid was the main cost, not the bins).
+            centers, rate = instantaneous_firing_rate(spikes, t0, t1)
             rs = _stride(len(centers))
             rate_dt = spikes_to_datetime(centers[::rs], state.exp_start_dt)
             rate_ds = rate[::rs]
