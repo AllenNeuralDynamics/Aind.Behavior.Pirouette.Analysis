@@ -375,6 +375,7 @@ class AppState:
     head_x: np.ndarray | None = None
     head_y: np.ndarray | None = None
     head_t: np.ndarray | None = None  # experiment seconds
+    head_ms: np.ndarray | None = None  # wall-clock epoch ms (for datetime colour)
     chamber: dict | None = None
     unit_id: object = None
     bottom_cache: dict = field(default_factory=dict)
@@ -388,6 +389,9 @@ class AppState:
         self.reader = FrameReader(self.video_dir)
         self.head_x, self.head_y = head_position_mm(self.df)
         self.head_t = self.df[COL_TIME].to_numpy(dtype="float64")
+        # Wall-clock epoch ms (tz-naive) for datetime colouring of the head plot.
+        naive = self.df[COL_DATETIME].dt.tz_localize(None).to_numpy()
+        self.head_ms = naive.astype("datetime64[ms]").astype("int64")
         self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
         self.bottom_cache = {}
@@ -482,6 +486,8 @@ def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="mm/s", row=2, col=1)
     fig.update_yaxes(title_text="deg", row=3, col=1)
+    # Zoom only affects time (x); keep the y-scale constant.
+    fig.update_yaxes(fixedrange=True)
     fig.update_annotations(font_size=12)  # subplot titles hold the labels
     fig.update_layout(
         height=460, margin=dict(l=55, r=25, t=30, b=20),
@@ -525,6 +531,8 @@ def build_timeseries_bottom(
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="Hz", row=2, col=1)
+    # Zoom only affects time (x); keep the y-scale constant.
+    fig.update_yaxes(fixedrange=True)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
@@ -534,10 +542,24 @@ def build_timeseries_bottom(
     return fig
 
 
+def _ms_colorbar_ticks(color_ms: np.ndarray, n: int = 4) -> dict:
+    """Colorbar tick config that labels epoch-ms values as ``HH:MM:SS``."""
+    cs = np.asarray(color_ms, dtype="float64")
+    cs = cs[np.isfinite(cs)]
+    if cs.size == 0:
+        return {}
+    lo, hi = float(cs.min()), float(cs.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    vals = np.linspace(lo, hi, n)
+    txt = [pd.Timestamp(v, unit="ms").strftime("%H:%M:%S") for v in vals]
+    return dict(tickmode="array", tickvals=vals.tolist(), ticktext=txt)
+
+
 def build_head_position(
     head_x: np.ndarray,
     head_y: np.ndarray,
-    head_t: np.ndarray,
+    color_ms: np.ndarray,
     current_row: int,
     window_s: float,
     fps: float = 60.0,
@@ -545,27 +567,29 @@ def build_head_position(
 ):
     """Spatial head-position trail over a time window, inferno-coloured by time.
 
-    Points are drawn as time-coloured markers (no connecting line); if *chamber*
-    corner positions are given, a black box marks the chamber walls and the axes
-    are bounded to it.
+    Points are drawn as markers (no connecting line) coloured by wall-clock time
+    (*color_ms* = epoch milliseconds), with a ``HH:MM:SS`` colorbar to match the
+    timeseries plots. If *chamber* corner positions are given, a black box marks
+    the chamber walls and the axes are bounded to it.
     """
     import plotly.graph_objects as go
 
     half = int(round(window_s * fps))
     lo = max(0, current_row - half)
     hi = min(len(head_x), current_row + 1)
-    xs, ys, ts = head_x[lo:hi], head_y[lo:hi], head_t[lo:hi]
+    xs, ys, cs = head_x[lo:hi], head_y[lo:hi], color_ms[lo:hi]
+
+    marker = dict(
+        size=5, color=cs, colorscale="Inferno", showscale=True,
+        colorbar=dict(title="time", thickness=12, **_ms_colorbar_ticks(cs)),
+    )
+    if len(cs):
+        marker["cmin"], marker["cmax"] = float(np.min(cs)), float(np.max(cs))
 
     fig = go.Figure()
     fig.add_trace(
-        go.Scattergl(
-            x=xs, y=ys, mode="markers",
-            marker=dict(
-                size=5, color=ts, colorscale="Inferno",
-                colorbar=dict(title="t (s)", thickness=12), showscale=True,
-            ),
-            name="trail", hoverinfo="skip",
-        )
+        go.Scattergl(x=xs, y=ys, mode="markers", marker=marker,
+                     name="trail", hoverinfo="skip")
     )
     if hi > lo:
         fig.add_trace(
@@ -879,7 +903,7 @@ def create_app(
             "ht": np.round(state.head_t[sl], 3).tolist(),
         }
         head_fig = build_head_position(
-            state.head_x, state.head_y, state.head_t, base,
+            state.head_x, state.head_y, state.head_ms, base,
             float(window_s or 10.0), chamber=state.chamber,
         )
         return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
@@ -983,11 +1007,32 @@ def create_app(
             var hi = i + 1;
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
+                // Colour the trail by wall-clock time (epoch ms) with HH:MM:SS
+                // colorbar ticks, matching the timeseries plots.
+                var color = [];
+                for (var j = lo; j < hi; j++) {
+                    color.push(seg.startMs + (j / seg.fps) * 1000);
+                }
+                var cmin = color.length ? color[0] : 0;
+                var cmax = color.length ? color[color.length - 1] : 1;
+                if (cmax <= cmin) { cmax = cmin + 1; }
+                var tv = [], tt = [], NT = 4;
+                for (var t = 0; t < NT; t++) {
+                    var val = cmin + (cmax - cmin) * t / (NT - 1);
+                    tv.push(val);
+                    tt.push(new Date(val).toISOString().slice(11, 19));
+                }
                 try {
                     Plotly.restyle(hgd, {
                         x: [seg.hx.slice(lo, hi)],
                         y: [seg.hy.slice(lo, hi)],
-                        'marker.color': [seg.ht.slice(lo, hi)],
+                        'marker.color': [color],
+                        'marker.cmin': [cmin],
+                        'marker.cmax': [cmax],
+                        'marker.cauto': [false],
+                        'marker.colorbar.tickmode': ['array'],
+                        'marker.colorbar.tickvals': [tv],
+                        'marker.colorbar.ticktext': [tt],
                     }, [0]);
                     Plotly.restyle(hgd, {
                         x: [[seg.hx[i]]], y: [[seg.hy[i]]],
