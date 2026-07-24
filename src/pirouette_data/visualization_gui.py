@@ -781,6 +781,17 @@ def create_app(
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
+            html.Div([
+                dcc.Checklist(
+                    id="listen",
+                    options=[{"label": " 🔊 listen to spikes", "value": "on"}],
+                    value=[],
+                    style={"fontSize": "16px", "fontWeight": "bold"},
+                ),
+                html.Label("Audio gain", style={"fontSize": "12px"}),
+                dcc.Slider(id="gain", min=0, max=1, step=0.05, value=0.35,
+                           marks={0: "0", 0.5: "0.5", 1: "1"}),
+            ], style={"paddingTop": "14px"}),
             # Poll the video's playback time to drive the plot cursor + head plot
             # (fast, so they track the video closely).
             dcc.Interval(id="sync", interval=40, n_intervals=0),
@@ -792,6 +803,7 @@ def create_app(
             html.Div(id="_dummy2", style={"display": "none"}),
             html.Div(id="_dummy3", style={"display": "none"}),
             html.Div(id="_dummy4", style={"display": "none"}),
+            html.Div(id="_dummy5", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -800,19 +812,7 @@ def create_app(
         [
             dcc.Graph(id="ts-top", config=graph_config),
             dcc.Graph(id="head", config=graph_config),
-            html.Div(
-                [
-                    dcc.Checklist(
-                        id="listen",
-                        options=[{"label": " 🔊 listen to spikes", "value": "on"}],
-                        value=[],
-                        style={"whiteSpace": "nowrap", "fontSize": "13px"},
-                    ),
-                    dcc.Graph(id="ts-bottom", config=graph_config,
-                              style={"flex": "1", "minWidth": "0"}),
-                ],
-                style={"display": "flex", "alignItems": "center", "gap": "6px"},
-            ),
+            dcc.Graph(id="ts-bottom", config=graph_config),
         ],
         style={"flex": "1", "padding": "8px"},
     )
@@ -1099,22 +1099,33 @@ def create_app(
                 (tss / 3600).toFixed(3) + ' h)\\n' +
                 'PST: ' + wall;
 
-            // Audible spike monitor: a click for each spike the cursor crosses
-            // since the last tick (forward playback only).
+            // Audible spike monitor: schedule a click for each spike the cursor
+            // crossed since the last tick, spread across the tick's real duration
+            // so it crackles and stays in sync at any playback speed.
             var listenOn = listen && listen.indexOf && listen.indexOf('on') >= 0;
             if (listenOn && window.__audioCtx && window.__pop &&
                 segspikes && segspikes.length && !v.paused) {
+                var actx = window.__audioCtx;
+                var nowP = (window.performance && performance.now)
+                    ? performance.now() : Date.now();
+                var realDt = (window.__lastTickPerf !== undefined)
+                    ? (nowP - window.__lastTickPerf) : 40;
+                window.__lastTickPerf = nowP;
+                realDt = Math.min(Math.max(realDt, 5), 500) / 1000;  // seconds
                 var prev = window.__lastSpikeCt;
-                if (prev !== undefined && ct >= prev && (ct - prev) <= 1.0) {
-                    // first index with segspikes[idx] > prev (binary search)
+                // Play only for a forward advance consistent with playback (not a
+                // seek). 8 s covers even 10x with laggy ticks; seeks are larger.
+                if (prev !== undefined && ct > prev && (ct - prev) <= 8.0) {
                     var a = 0, b = segspikes.length;
-                    while (a < b) {
+                    while (a < b) {  // first index with segspikes[idx] > prev
                         var mm = (a + b) >> 1;
                         if (segspikes[mm] <= prev) a = mm + 1; else b = mm;
                     }
-                    var cnt = 0;
+                    var span = ct - prev, base = actx.currentTime, cnt = 0;
                     for (var si = a; si < segspikes.length && segspikes[si] <= ct; si++) {
-                        if (cnt < 8) window.__pop(window.__audioCtx);  // cap per tick
+                        if (cnt >= 60) break;  // avoid extreme bursts
+                        var frac = span > 0 ? (segspikes[si] - prev) / span : 0;
+                        window.__pop(actx, base + frac * realDt);
                         cnt++;
                     }
                 }
@@ -1161,7 +1172,7 @@ def create_app(
                 if (window.__audioCtx && window.__audioCtx.state === 'suspended') {
                     window.__audioCtx.resume();
                 }
-                window.__pop = function (ctx) {
+                window.__pop = function (ctx, when) {
                     try {
                         var dur = 0.006, sr = ctx.sampleRate, n = Math.floor(sr * dur);
                         var buf = ctx.createBuffer(1, n, sr);
@@ -1170,8 +1181,10 @@ def create_app(
                             d[k] = (Math.random() * 2 - 1) * Math.pow(1 - k / n, 2);
                         }
                         var s = ctx.createBufferSource(); s.buffer = buf;
-                        var g = ctx.createGain(); g.gain.value = 0.35;
-                        s.connect(g); g.connect(ctx.destination); s.start();
+                        var g = ctx.createGain();
+                        g.gain.value = (window.__audioGain != null) ? window.__audioGain : 0.35;
+                        s.connect(g); g.connect(ctx.destination);
+                        s.start(when || ctx.currentTime);
                     } catch (e) { /* ignore */ }
                 };
                 window.__lastSpikeCt = undefined;  // resync on enable
@@ -1182,6 +1195,14 @@ def create_app(
         Output("_dummy4", "children"),
         Input("listen", "value"),
         prevent_initial_call=True,
+    )
+
+    # Audio gain slider -> click volume.
+    app.clientside_callback(
+        "function(g){ window.__audioGain = (g == null) ? 0.35 : g; return ''; }",
+        Output("_dummy5", "children"),
+        Input("gain", "value"),
+        prevent_initial_call=False,
     )
 
     # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
