@@ -117,6 +117,14 @@ def test_firing_rate_empty_window():
     assert c.size == 0 and r.size == 0
 
 
+def test_firing_rate_max_bins_cap():
+    spikes = np.arange(0, 1000, 0.1)  # would be 20000 bins at 0.05 s
+    c, r = viz.instantaneous_firing_rate(spikes, 0.0, 1000.0, bin_s=0.05, max_bins=5000)
+    assert len(c) == 5000 and len(r) == 5000
+    # rate is still ~10 Hz despite the coarser bins
+    assert np.median(r) == pytest.approx(10.0, rel=0.3)
+
+
 def test_behavior_bouts_alternate():
     df = _dataset(180)  # 3 bouts of 60 frames: rest, movement, rest
     bouts = viz.behavior_bouts(df)

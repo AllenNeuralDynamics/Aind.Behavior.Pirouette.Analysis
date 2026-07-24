@@ -26,7 +26,7 @@ from __future__ import annotations
 import base64
 import pickle
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +49,7 @@ MOVE_COLOR = "#fa8072"  # salmon
 CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
+MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,7 @@ def instantaneous_firing_rate(
     t1_s: float,
     bin_s: float = 0.05,
     smooth_sigma_s: float = 0.2,
+    max_bins: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Gaussian-smoothed instantaneous firing rate over ``[t0_s, t1_s]``.
 
@@ -171,9 +173,14 @@ def instantaneous_firing_rate(
     t0_s, t1_s:
         Time window (experiment seconds) over which to compute the rate.
     bin_s:
-        Histogram bin width (seconds).
+        Requested histogram bin width (seconds).
     smooth_sigma_s:
         Gaussian smoothing sigma (seconds).
+    max_bins:
+        Optional cap on the number of bins. Over long windows the ``bin_s``
+        resolution can imply millions of bins that are far finer than the plot
+        can show; capping keeps the computation fast (the effective bin width
+        widens to ``(t1 - t0) / max_bins``).
 
     Returns
     -------
@@ -187,12 +194,15 @@ def instantaneous_firing_rate(
     if t1_s <= t0_s:
         return np.array([]), np.array([])
     n_bins = max(1, int(round((t1_s - t0_s) / bin_s)))
+    if max_bins is not None and n_bins > max_bins:
+        n_bins = max_bins
     edges = np.linspace(t0_s, t1_s, n_bins + 1)
+    width = (t1_s - t0_s) / n_bins
     spikes = np.asarray(spike_exp_s, dtype="float64")
     spikes = spikes[(spikes >= t0_s) & (spikes <= t1_s)]
     counts, _ = np.histogram(spikes, bins=edges)
-    rate = counts / bin_s
-    sigma_bins = max(1e-6, smooth_sigma_s / bin_s)
+    rate = counts / width
+    sigma_bins = max(1e-6, smooth_sigma_s / width)
     rate = gaussian_filter1d(rate, sigma_bins, mode="nearest")
     centers = (edges[:-1] + edges[1:]) / 2.0
     return centers, rate
@@ -353,6 +363,9 @@ class AppState:
     units_dir: Path
     video_dir: Path
     spike_offset_s: float = 0.0
+    show_all_spikes: bool = False
+    firing_rate_bin_s: float = 0.05
+    firing_rate_smooth_s: float = 0.2
 
     df: pd.DataFrame | None = None
     units: dict | None = None
@@ -363,6 +376,7 @@ class AppState:
     head_t: np.ndarray | None = None  # experiment seconds
     chamber: dict | None = None
     unit_id: object = None
+    bottom_cache: dict = field(default_factory=dict)
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
         """Load a dataset + units file into the state."""
@@ -375,6 +389,7 @@ class AppState:
         self.head_t = self.df[COL_TIME].to_numpy(dtype="float64")
         self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
+        self.bottom_cache = {}
         return self
 
 
@@ -408,9 +423,10 @@ def build_timeseries_top(df: pd.DataFrame):
         ),
     )
 
-    # Behaviour as a thin 2-colour heatmap row.
+    # Behaviour as a thin 2-colour heatmap row. Plot as tz-naive wall-clock so
+    # the client-side cursor (also naive) lines up exactly.
     s = _stride(len(df))
-    x = df[COL_DATETIME].iloc[::s]
+    x = df[COL_DATETIME].iloc[::s].dt.tz_localize(None)
     beh = (df[COL_BEHAVIOR].iloc[::s] == "movement").astype(int).to_numpy()
     fig.add_trace(
         go.Heatmap(
@@ -441,7 +457,7 @@ def build_timeseries_top(df: pd.DataFrame):
         row=3, col=1,
     )
 
-    x0 = df[COL_DATETIME].iloc[0]
+    x0 = x.iloc[0]
     fig.add_shape(
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
         line=dict(color=CURSOR_COLOR, width=2.5),
@@ -581,6 +597,9 @@ def create_app(
     video_dir: str | Path,
     spike_offset_s: float = 0.0,
     head_window_s: float = 10.0,
+    show_all_spikes: bool = False,
+    firing_rate_bin_s: float = 0.05,
+    firing_rate_smooth_s: float = 0.2,
 ):
     """Build the Dash application.
 
@@ -602,7 +621,7 @@ def create_app(
     dash.Dash
         The configured app. Call ``app.run(...)`` (or :func:`run`) to serve it.
     """
-    from dash import Dash, Input, Output, Patch, State, dcc, html, no_update
+    from dash import Dash, Input, Output, State, dcc, html, no_update
     from flask import abort, send_file
 
     state = AppState(
@@ -610,6 +629,9 @@ def create_app(
         units_dir=Path(units_dir),
         video_dir=Path(video_dir),
         spike_offset_s=spike_offset_s,
+        show_all_spikes=show_all_spikes,
+        firing_rate_bin_s=firing_rate_bin_s,
+        firing_rate_smooth_s=firing_rate_smooth_s,
     )
 
     datasets = _list_files(state.dataset_dir, (".parquet", ".pkl", ".csv"))
@@ -670,10 +692,13 @@ def create_app(
                 id="video", controls=True, autoPlay=False,
                 style={"width": "100%", "border": "1px solid #ccc", "background": "#000"},
             ),
-            html.Div(id="frame-info", style={"fontFamily": "monospace", "padding": "6px 0"}),
+            html.Div(id="frame-info",
+                     style={"fontFamily": "monospace", "padding": "6px 0",
+                            "whiteSpace": "pre-line"}),
             # Global scrubber across the whole session; jumps to the right video.
+            # updatemode="drag" so the red cursor follows the handle live.
             dcc.Slider(id="frame", min=0, max=1, step=1, value=0, marks=None,
-                       tooltip={"placement": "bottom"}, updatemode="mouseup"),
+                       tooltip={"placement": "bottom"}, updatemode="drag"),
             html.Div([
                 html.Label("Segment (hour)"),
                 dcc.Dropdown(id="segment", options=[], clearable=False,
@@ -695,7 +720,7 @@ def create_app(
             # Poll the video's playback time to drive the plot cursor.
             dcc.Interval(id="sync", interval=150, n_intervals=0),
             dcc.Store(id="seg"),
-            dcc.Store(id="vrow"),
+            dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
         ],
@@ -720,17 +745,45 @@ def create_app(
     # ---- helpers bound to state ----
     def _bottom_figure():
         df = state.df
-        spikes = unit_spike_times_experiment(state.units, state.unit_id, state.spike_offset_s)
-        t0, t1 = float(df[COL_TIME].iloc[0]), float(df[COL_TIME].iloc[-1])
-        in_range = spikes[(spikes >= t0) & (spikes <= t1)]
-        spike_dt = spikes_to_datetime(in_range, state.exp_start_dt)
-        centers, rate = instantaneous_firing_rate(spikes, t0, t1)
-        rate_dt = spikes_to_datetime(centers, state.exp_start_dt)
-        rs = _stride(len(centers))
-        x0 = df[COL_DATETIME].iloc[0]
-        x_range = (df[COL_DATETIME].iloc[0], df[COL_DATETIME].iloc[-1])
+        key = (state.unit_id, round(float(state.spike_offset_s), 3))
+        cached = state.bottom_cache.get(key)
+        if cached is None:
+            spikes = unit_spike_times_experiment(
+                state.units, state.unit_id, state.spike_offset_s
+            )
+            t0, t1 = float(df[COL_TIME].iloc[0]), float(df[COL_TIME].iloc[-1])
+            in_range = spikes[(spikes >= t0) & (spikes <= t1)]
+            # Cap the raster: converting/rendering hundreds of thousands of ticks
+            # is slow and unreadable; a uniform subsample looks the same. Set
+            # show_all_spikes to render every tick (slower for busy units).
+            if not state.show_all_spikes and in_range.size > MAX_RASTER_SPIKES:
+                idx = np.linspace(0, in_range.size - 1, MAX_RASTER_SPIKES).astype("int64")
+                in_range = in_range[idx]
+            # tz-naive wall-clock so the client-side cursor lines up exactly.
+            spike_dt = spikes_to_datetime(in_range, state.exp_start_dt).tz_localize(None)
+            # Firing rate at full (fine) resolution so the trace stays smooth;
+            # downsample the plotted points BEFORE the datetime conversion (that
+            # conversion of the full fine grid was the main cost, not the bins).
+            centers, rate = instantaneous_firing_rate(
+                spikes, t0, t1,
+                bin_s=state.firing_rate_bin_s,
+                smooth_sigma_s=state.firing_rate_smooth_s,
+            )
+            rs = _stride(len(centers))
+            rate_dt = spikes_to_datetime(
+                centers[::rs], state.exp_start_dt
+            ).tz_localize(None)
+            rate_ds = rate[::rs]
+            cached = (spike_dt, rate_dt, rate_ds)
+            state.bottom_cache[key] = cached
+        spike_dt, rate_dt, rate_ds = cached
+        x0 = df[COL_DATETIME].iloc[0].tz_localize(None)
+        x_range = (
+            df[COL_DATETIME].iloc[0].tz_localize(None),
+            df[COL_DATETIME].iloc[-1].tz_localize(None),
+        )
         return build_timeseries_bottom(
-            spike_dt, rate_dt[::rs], rate[::rs], x0, x_range, str(state.unit_id)
+            spike_dt, rate_dt, rate_ds, x0, x_range, str(state.unit_id)
         )
 
     # ---- callbacks ----
@@ -744,6 +797,7 @@ def create_app(
         Output("frame", "max"),
         Output("frame", "value"),
         Output("frame", "marks"),
+        Output("segmap", "data"),
         Input("load", "n_clicks"),
         State("dataset", "value"),
         State("unitsfile", "value"),
@@ -752,17 +806,20 @@ def create_app(
     )
     def _load(_clicks, dataset_path, units_path, offset):
         if not dataset_path or not units_path:
-            return (no_update,) * 9
+            return (no_update,) * 10
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         segs = segments(state.df)
-        # Slider marks at each segment start, labelled with the Pacific hour.
+        # Slider marks at each segment start (Pacific hour), and a global map of
+        # row -> (segment, fps, start time) so the slider can move the cursor and
+        # seek the right video entirely client-side.
         marks = {}
+        segmap = []
         for s in segs:
-            base, _, _ = segment_info(state.df, s)
-            marks[int(base)] = pd.Timestamp(
-                state.df[COL_DATETIME].iloc[base]
-            ).strftime("%H:%M")
+            base, n, fps = segment_info(state.df, s)
+            marks[int(base)] = pd.Timestamp(state.df[COL_DATETIME].iloc[base]).strftime("%H:%M")
+            start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
+            segmap.append({"name": s, "base": base, "n": n, "fps": fps, "startMs": start_ms})
         return (
             build_timeseries_top(state.df),
             _bottom_figure(),
@@ -773,68 +830,169 @@ def create_app(
             len(state.df) - 1,
             0,
             marks,
+            segmap,
         )
 
     @app.callback(
         Output("video", "src"),
         Output("seg", "data"),
+        Output("head", "figure"),
         Input("segment", "value"),
+        State("window", "value"),
         prevent_initial_call=True,
     )
-    def _load_segment(seg):
-        # Point the <video> at the chosen hour and store its row/fps mapping.
+    def _load_segment(seg, window_s):
+        # Point the <video> at the chosen hour, ship this segment's head-position
+        # data to the browser (so the head plot can update client-side during
+        # playback), and build the initial head figure.
         if state.df is None or not seg:
-            return no_update, no_update
+            return no_update, no_update, no_update
         base, n, fps = segment_info(state.df, seg)
-        return f"/pirouette-video/{seg}.mp4", {"base": base, "n": n, "fps": fps, "name": seg}
+        # tz-naive wall-clock ms so the client-side cursor aligns with the axis.
+        start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
+        sl = slice(base, base + n)
+        seg_store = {
+            "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
+            "hx": np.round(state.head_x[sl], 2).tolist(),
+            "hy": np.round(state.head_y[sl], 2).tolist(),
+            "ht": np.round(state.head_t[sl], 3).tolist(),
+        }
+        head_fig = build_head_position(
+            state.head_x, state.head_y, state.head_t, base,
+            float(window_s or 10.0), chamber=state.chamber,
+        )
+        return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
 
-    @app.callback(
+    # Slider drag -> move the red cursor live (client-side, in sync with the
+    # handle) and seek the video. Within the current hour the seek is client-side
+    # too; crossing into another hour switches the video via the server.
+    app.clientside_callback(
+        """
+        function(row, segmap, seg) {
+            var nou = window.dash_clientside.no_update;
+            if (row == null || !segmap || !segmap.length) { return [nou, nou]; }
+            var s = segmap[segmap.length - 1];
+            for (var k = 0; k < segmap.length; k++) {
+                var m = segmap[k];
+                if (row >= m.base && row < m.base + m.n) { s = m; break; }
+            }
+            var localT = (row - s.base) / s.fps;
+            if (localT < 0) { localT = 0; }
+            // Move the cursor immediately so it tracks the slider handle.
+            var cursor = new Date(s.startMs + localT * 1000).toISOString();
+            if (window.Plotly) {
+                ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                    var el = document.getElementById(gid);
+                    var gd = el && (el.classList.contains('js-plotly-plot')
+                        ? el : el.querySelector('.js-plotly-plot'));
+                    if (gd) {
+                        try {
+                            window.Plotly.relayout(gd, {
+                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
+                            });
+                        } catch (e) { /* not ready */ }
+                    }
+                });
+            }
+            var curName = seg && seg.name;
+            var v = document.getElementById('video');
+            if (s.name === curName) {
+                if (v) { try { v.currentTime = localT; } catch (e) {} }
+                return [nou, nou];
+            }
+            // Different hour: load that video (server) + pending seek.
+            return [s.name, {seg: s.name, t: localT}];
+        }
+        """,
         Output("segment", "value", allow_duplicate=True),
         Output("seek", "data"),
         Input("frame", "value"),
+        State("segmap", "data"),
         State("seg", "data"),
         prevent_initial_call=True,
     )
-    def _seek(row, seg):
-        # Slider -> jump to the video/hour containing this row and seek to it.
-        if state.df is None or row is None:
-            return no_update, no_update
-        row = int(min(max(0, row), len(state.df) - 1))
-        name = state.df[COL_SOURCE].iloc[row]
-        base, _, fps = segment_info(state.df, name)
-        seek = {"seg": name, "t": (row - base) / fps}
-        current = seg.get("name") if seg else None
-        seg_out = no_update if current == name else name
-        return seg_out, seek
 
     # Each tick: apply any pending seek (once the right video is ready) and read
     # the video's currentTime -> global row (client-side, cheap).
+    # Everything that must track the video during playback is updated CLIENT-SIDE
+    # (no server round-trips): the red cursor, the head-position trail, and the
+    # frame-info text. Data for the current segment lives in the `seg` store.
     app.clientside_callback(
         """
-        function(_n, seg, seek) {
+        function(_n, seg, seek, windowS) {
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
-            if (!v || !seg) { return [nou, nou]; }
+            if (!v || !seg || !seg.hx) { return [nou, nou]; }
             var clearSeek = nou;
             if (seek && seek.seg && v.readyState >= 1 &&
                 v.currentSrc && v.currentSrc.indexOf(seek.seg) >= 0) {
                 v.currentTime = seek.t;
                 clearSeek = null;
             }
-            var row = seg.base + Math.round((v.currentTime || 0) * seg.fps);
-            var maxr = seg.base + seg.n - 1;
-            if (row > maxr) { row = maxr; }
-            var out = row;
-            if (window.__pirRow === row) { out = nou; }
-            else { window.__pirRow = row; }
-            return [out, clearSeek];
+            var ct = v.currentTime || 0;
+            var Plotly = window.Plotly;
+            function plotDiv(id) {
+                var el = document.getElementById(id);
+                return el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+            }
+
+            // Red time cursor on both timeseries figures.
+            var cursor = new Date(seg.startMs + ct * 1000).toISOString();
+            if (Plotly) {
+                ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                    var gd = plotDiv(gid);
+                    if (gd) {
+                        try {
+                            Plotly.relayout(gd, {
+                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
+                            });
+                        } catch (e) { /* not ready */ }
+                    }
+                });
+            }
+
+            // Head-position trail + current marker (windowed).
+            var n = seg.hx.length;
+            var i = Math.round(ct * seg.fps);
+            if (i < 0) { i = 0; }
+            if (i > n - 1) { i = n - 1; }
+            var win = Math.round((windowS || 10) * seg.fps);
+            var lo = Math.max(0, i - win);
+            var hi = i + 1;
+            var hgd = plotDiv('head');
+            if (hgd && Plotly) {
+                try {
+                    Plotly.restyle(hgd, {
+                        x: [seg.hx.slice(lo, hi)],
+                        y: [seg.hy.slice(lo, hi)],
+                        'marker.color': [seg.ht.slice(lo, hi)],
+                    }, [0]);
+                    Plotly.restyle(hgd, {
+                        x: [[seg.hx[i]]], y: [[seg.hy[i]]],
+                    }, [1]);
+                } catch (e) { /* not ready */ }
+            }
+
+            // Frame info (client-side; startMs is Pacific wall-clock).
+            var wall = new Date(seg.startMs + ct * 1000).toISOString()
+                .replace('T', ' ').replace('Z', '');
+            var row = seg.base + i;
+            var tss = seg.ht[i];
+            var info = 'frame ' + row.toLocaleString() +
+                '  (' + seg.name + ' #' + i + ')\\n' +
+                't since start: ' + tss.toFixed(3) + ' s  (' +
+                (tss / 3600).toFixed(3) + ' h)\\n' +
+                'PST: ' + wall;
+            return [clearSeek, info];
         }
         """,
-        Output("vrow", "data"),
         Output("seek", "data", allow_duplicate=True),
+        Output("frame-info", "children"),
         Input("sync", "n_intervals"),
         State("seg", "data"),
         State("seek", "data"),
+        State("window", "value"),
         prevent_initial_call=True,
     )
 
@@ -873,43 +1031,6 @@ def create_app(
             return no_update
         state.spike_offset_s = float(offset)
         return _bottom_figure()
-
-    @app.callback(
-        Output("frame-info", "children"),
-        Output("head", "figure"),
-        Output("ts-top", "figure", allow_duplicate=True),
-        Output("ts-bottom", "figure", allow_duplicate=True),
-        Input("vrow", "data"),
-        Input("window", "value"),
-        prevent_initial_call=True,
-    )
-    def _sync(row, window_s):
-        # Driven by the video playhead (vrow): move the cursor + update info/head.
-        if state.df is None or row is None:
-            return no_update, no_update, no_update, no_update
-        row = int(min(max(0, row), len(state.df) - 1))
-        src = state.df[COL_SOURCE].iloc[row]
-        fidx = frame_index_for_row(state.df, row)
-        t_s = float(state.df[COL_TIME].iloc[row])
-        dt = state.df[COL_DATETIME].iloc[row]
-        info = html.Div([
-            html.Span(f"frame {row:,} / {len(state.df) - 1:,}  ({src} #{fidx})"),
-            html.Br(),
-            html.Span(f"t since start: {t_s:,.3f} s  ({t_s / 3600:.3f} h)"),
-            html.Br(),
-            html.Span(f"PST: {pd.Timestamp(dt).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"),
-        ])
-        head_fig = build_head_position(
-            state.head_x, state.head_y, state.head_t, row, float(window_s),
-            chamber=state.chamber,
-        )
-        cursor = pd.Timestamp(dt).isoformat()
-        patch_top, patch_bottom = Patch(), Patch()
-        patch_top["layout"]["shapes"][0]["x0"] = cursor
-        patch_top["layout"]["shapes"][0]["x1"] = cursor
-        patch_bottom["layout"]["shapes"][0]["x0"] = cursor
-        patch_bottom["layout"]["shapes"][0]["x1"] = cursor
-        return info, head_fig, patch_top, patch_bottom
 
     return app
 
@@ -989,6 +1110,9 @@ def run(
     debug: bool = False,
     share: bool = False,
     share_method: str = "cloudflare",
+    show_all_spikes: bool = False,
+    firing_rate_bin_s: float = 0.05,
+    firing_rate_smooth_s: float = 0.2,
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -1006,7 +1130,12 @@ def run(
         no browser interstitial. ``"ngrok"`` uses ngrok (needs ``NGROK_AUTHTOKEN``
         and shows a warning page on the free tier).
     """
-    app = create_app(dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s)
+    app = create_app(
+        dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s,
+        show_all_spikes=show_all_spikes,
+        firing_rate_bin_s=firing_rate_bin_s,
+        firing_rate_smooth_s=firing_rate_smooth_s,
+    )
 
     print("\nPirouette explorer — share one of these links:")
     print(f"  this machine : http://127.0.0.1:{port}")
