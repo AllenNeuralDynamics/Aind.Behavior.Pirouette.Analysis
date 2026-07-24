@@ -375,6 +375,7 @@ class AppState:
     head_x: np.ndarray | None = None
     head_y: np.ndarray | None = None
     head_t: np.ndarray | None = None  # experiment seconds
+    head_ms: np.ndarray | None = None  # wall-clock epoch ms (for datetime colour)
     chamber: dict | None = None
     unit_id: object = None
     bottom_cache: dict = field(default_factory=dict)
@@ -388,6 +389,9 @@ class AppState:
         self.reader = FrameReader(self.video_dir)
         self.head_x, self.head_y = head_position_mm(self.df)
         self.head_t = self.df[COL_TIME].to_numpy(dtype="float64")
+        # Wall-clock epoch ms (tz-naive) for datetime colouring of the head plot.
+        naive = self.df[COL_DATETIME].dt.tz_localize(None).to_numpy()
+        self.head_ms = naive.astype("datetime64[ms]").astype("int64")
         self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
         self.bottom_cache = {}
@@ -482,6 +486,8 @@ def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="mm/s", row=2, col=1)
     fig.update_yaxes(title_text="deg", row=3, col=1)
+    # Zoom only affects time (x); keep the y-scale constant.
+    fig.update_yaxes(fixedrange=True)
     fig.update_annotations(font_size=12)  # subplot titles hold the labels
     fig.update_layout(
         height=460, margin=dict(l=55, r=25, t=30, b=20),
@@ -525,6 +531,8 @@ def build_timeseries_bottom(
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="Hz", row=2, col=1)
+    # Zoom only affects time (x); keep the y-scale constant.
+    fig.update_yaxes(fixedrange=True)
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
@@ -534,10 +542,24 @@ def build_timeseries_bottom(
     return fig
 
 
+def _ms_colorbar_ticks(color_ms: np.ndarray, n: int = 4) -> dict:
+    """Colorbar tick config that labels epoch-ms values as ``HH:MM:SS``."""
+    cs = np.asarray(color_ms, dtype="float64")
+    cs = cs[np.isfinite(cs)]
+    if cs.size == 0:
+        return {}
+    lo, hi = float(cs.min()), float(cs.max())
+    if hi <= lo:
+        hi = lo + 1.0
+    vals = np.linspace(lo, hi, n)
+    txt = [pd.Timestamp(v, unit="ms").strftime("%H:%M:%S") for v in vals]
+    return dict(tickmode="array", tickvals=vals.tolist(), ticktext=txt)
+
+
 def build_head_position(
     head_x: np.ndarray,
     head_y: np.ndarray,
-    head_t: np.ndarray,
+    color_ms: np.ndarray,
     current_row: int,
     window_s: float,
     fps: float = 60.0,
@@ -545,27 +567,29 @@ def build_head_position(
 ):
     """Spatial head-position trail over a time window, inferno-coloured by time.
 
-    Points are drawn as time-coloured markers (no connecting line); if *chamber*
-    corner positions are given, a black box marks the chamber walls and the axes
-    are bounded to it.
+    Points are drawn as markers (no connecting line) coloured by wall-clock time
+    (*color_ms* = epoch milliseconds), with a ``HH:MM:SS`` colorbar to match the
+    timeseries plots. If *chamber* corner positions are given, a black box marks
+    the chamber walls and the axes are bounded to it.
     """
     import plotly.graph_objects as go
 
     half = int(round(window_s * fps))
     lo = max(0, current_row - half)
     hi = min(len(head_x), current_row + 1)
-    xs, ys, ts = head_x[lo:hi], head_y[lo:hi], head_t[lo:hi]
+    xs, ys, cs = head_x[lo:hi], head_y[lo:hi], color_ms[lo:hi]
+
+    marker = dict(
+        size=5, color=cs, colorscale="Inferno", showscale=True,
+        colorbar=dict(title="time", thickness=12, **_ms_colorbar_ticks(cs)),
+    )
+    if len(cs):
+        marker["cmin"], marker["cmax"] = float(np.min(cs)), float(np.max(cs))
 
     fig = go.Figure()
     fig.add_trace(
-        go.Scattergl(
-            x=xs, y=ys, mode="markers",
-            marker=dict(
-                size=5, color=ts, colorscale="Inferno",
-                colorbar=dict(title="t (s)", thickness=12), showscale=True,
-            ),
-            name="trail", hoverinfo="skip",
-        )
+        go.Scattergl(x=xs, y=ys, mode="markers", marker=marker,
+                     name="trail", hoverinfo="skip")
     )
     if hi > lo:
         fig.add_trace(
@@ -658,6 +682,27 @@ def create_app(
 
     app = Dash(__name__, title="Pirouette explorer")
 
+    # Crosshair cursor over the plots (override Plotly's ew/ns-resize cursor that
+    # appears when the y-axis is fixed).
+    app.index_string = """<!DOCTYPE html>
+<html>
+  <head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <style>
+      .js-plotly-plot .nsewdrag,
+      .js-plotly-plot .nsewdrag.cursor-ew-resize,
+      .js-plotly-plot .nsewdrag.cursor-ns-resize { cursor: crosshair !important; }
+    </style>
+  </head>
+  <body>
+    {%app_entry%}
+    <footer>{%config%}{%scripts%}{%renderer%}</footer>
+  </body>
+</html>"""
+
     # Serve the mp4 files to the browser's native <video> player (range requests
     # supported), so playback is decoded/buffered client-side and stays smooth
     # even over a tunnel.
@@ -736,12 +781,15 @@ def create_app(
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
-            # Poll the video's playback time to drive the plot cursor.
-            dcc.Interval(id="sync", interval=150, n_intervals=0),
+            # Poll the video's playback time to drive the plot cursor (fast, so
+            # the red line tracks smoothly).
+            dcc.Interval(id="sync", interval=60, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
+            html.Div(id="_dummy2", style={"display": "none"}),
+            html.Div(id="_dummy3", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -878,7 +926,7 @@ def create_app(
             "ht": np.round(state.head_t[sl], 3).tolist(),
         }
         head_fig = build_head_position(
-            state.head_x, state.head_y, state.head_t, base,
+            state.head_x, state.head_y, state.head_ms, base,
             float(window_s or 10.0), chamber=state.chamber,
         )
         return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
@@ -950,6 +998,11 @@ def create_app(
                 clearSeek = null;
             }
             var ct = v.currentTime || 0;
+            // Skip all cursor/head/info work when the playhead hasn't moved (e.g.
+            // paused). This frees the main thread so mouse-wheel zoom is smooth
+            // instead of competing with per-tick relayouts.
+            if (window.__lastCt === ct) { return [clearSeek, nou]; }
+            window.__lastCt = ct;
             var Plotly = window.Plotly;
             function plotDiv(id) {
                 var el = document.getElementById(id);
@@ -982,11 +1035,32 @@ def create_app(
             var hi = i + 1;
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
+                // Colour the trail by wall-clock time (epoch ms) with HH:MM:SS
+                // colorbar ticks, matching the timeseries plots.
+                var color = [];
+                for (var j = lo; j < hi; j++) {
+                    color.push(seg.startMs + (j / seg.fps) * 1000);
+                }
+                var cmin = color.length ? color[0] : 0;
+                var cmax = color.length ? color[color.length - 1] : 1;
+                if (cmax <= cmin) { cmax = cmin + 1; }
+                var tv = [], tt = [], NT = 4;
+                for (var t = 0; t < NT; t++) {
+                    var val = cmin + (cmax - cmin) * t / (NT - 1);
+                    tv.push(val);
+                    tt.push(new Date(val).toISOString().slice(11, 19));
+                }
                 try {
                     Plotly.restyle(hgd, {
                         x: [seg.hx.slice(lo, hi)],
                         y: [seg.hy.slice(lo, hi)],
-                        'marker.color': [seg.ht.slice(lo, hi)],
+                        'marker.color': [color],
+                        'marker.cmin': [cmin],
+                        'marker.cmax': [cmax],
+                        'marker.cauto': [false],
+                        'marker.colorbar.tickmode': ['array'],
+                        'marker.colorbar.tickvals': [tv],
+                        'marker.colorbar.ticktext': [tt],
                     }, [0]);
                     Plotly.restyle(hgd, {
                         x: [[seg.hx[i]]], y: [[seg.hy[i]]],
@@ -1027,6 +1101,124 @@ def create_app(
         """,
         Output("_dummy", "children"),
         Input("speed", "value"),
+    )
+
+    # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
+    # applies the same range to the other. Runs client-side so it's instant and
+    # the per-tick cursor relayout (which also fires relayoutData) is a cheap
+    # no-op here.
+    app.clientside_callback(
+        """
+        function(rdTop, rdBot) {
+            function extractX(rd) {
+                if (!rd) return null;
+                for (var k in rd) {
+                    if (k.indexOf('xaxis') === 0 &&
+                        k.indexOf('autorange') >= 0 && rd[k] === true) return 'auto';
+                }
+                var lo, hi;
+                for (var k in rd) {
+                    if (/^xaxis\\d*\\.range\\[0\\]$/.test(k)) lo = rd[k];
+                    else if (/^xaxis\\d*\\.range\\[1\\]$/.test(k)) hi = rd[k];
+                    else if (/^xaxis\\d*\\.range$/.test(k)) { lo = rd[k][0]; hi = rd[k][1]; }
+                }
+                if (lo !== undefined && hi !== undefined) return [lo, hi];
+                return null;
+            }
+            function apply(id, rng) {
+                var el = document.getElementById(id);
+                var gd = el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+                if (!gd || !window.Plotly || !gd.layout) return;
+                var upd = {};
+                ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(function (ax) {
+                    if (gd.layout[ax]) {
+                        if (rng === 'auto') { upd[ax + '.autorange'] = true; }
+                        else { upd[ax + '.range'] = rng; }
+                    }
+                });
+                try { window.Plotly.relayout(gd, upd); } catch (e) {}
+            }
+            var ctx = window.dash_clientside.callback_context;
+            var trig = ctx && ctx.triggered && ctx.triggered[0];
+            if (!trig || !trig.prop_id) return '';
+            var src = trig.prop_id.split('.')[0];
+            var rng = extractX(src === 'ts-top' ? rdTop : rdBot);
+            if (rng === null) return '';
+            var key = JSON.stringify(rng);
+            if (window.__xsyncKey === key) return '';
+            window.__xsyncKey = key;
+            apply(src === 'ts-top' ? 'ts-bottom' : 'ts-top', rng);
+            return '';
+        }
+        """,
+        Output("_dummy2", "children"),
+        Input("ts-top", "relayoutData"),
+        Input("ts-bottom", "relayoutData"),
+        prevent_initial_call=True,
+    )
+
+    # Click ANYWHERE on either timeseries figure to set the time (not just on a
+    # data point): a native listener converts the click's pixel x to a time,
+    # maps it to the nearest frame, and sets the slider (which seeks the video
+    # and moves the cursor). segmap is mirrored to a window global for the
+    # listener; the listener is attached once.
+    app.clientside_callback(
+        """
+        function(segmap) {
+            window.__segmap = segmap;
+            if (window.__clickAttached) return '';
+            window.__clickAttached = true;
+            function toMs(v) {
+                if (typeof v === 'number') return v;
+                var s = String(v);
+                if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) s = s.replace(' ', 'T') + 'Z';
+                return new Date(s).getTime();
+            }
+            document.addEventListener('click', function (evt) {
+                try {
+                    if (evt.target.closest && evt.target.closest('.modebar')) return;
+                    var container = evt.target.closest &&
+                        evt.target.closest('#ts-top, #ts-bottom');
+                    if (!container) return;
+                    var gd = container.querySelector('.js-plotly-plot');
+                    if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return;
+                    var xa = gd._fullLayout.xaxis;
+                    var rect = gd.getBoundingClientRect();
+                    var px = evt.clientX - rect.left - xa._offset;
+                    if (px < 0 || px > xa._length) return;
+                    var r0 = toMs(xa.range[0]), r1 = toMs(xa.range[1]);
+                    var ms = r0 + (px / xa._length) * (r1 - r0);
+                    var sm = window.__segmap;
+                    if (!sm || !sm.length) return;
+                    var s = null;
+                    for (var k = 0; k < sm.length; k++) {
+                        var m = sm[k];
+                        var end = m.startMs + (m.n / m.fps) * 1000;
+                        if (ms >= m.startMs && ms < end) { s = m; break; }
+                    }
+                    if (!s) { s = ms < sm[0].startMs ? sm[0] : sm[sm.length - 1]; }
+                    var localT = (ms - s.startMs) / 1000;
+                    if (localT < 0) localT = 0;
+                    var maxT = (s.n - 1) / s.fps;
+                    if (localT > maxT) localT = maxT;
+                    var row = s.base + Math.round(localT * s.fps);
+                    var input = document.querySelector('#frame input');
+                    if (input) {
+                        var setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(input, String(row));
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                } catch (e) { /* ignore */ }
+            }, true);
+            return '';
+        }
+        """,
+        Output("_dummy3", "children"),
+        Input("segmap", "data"),
+        prevent_initial_call=True,
     )
 
     @app.callback(
