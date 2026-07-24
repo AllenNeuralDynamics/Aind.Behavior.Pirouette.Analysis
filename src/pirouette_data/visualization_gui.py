@@ -696,8 +696,9 @@ def create_app(
                      style={"fontFamily": "monospace", "padding": "6px 0",
                             "whiteSpace": "pre-line"}),
             # Global scrubber across the whole session; jumps to the right video.
+            # updatemode="drag" so the red cursor follows the handle live.
             dcc.Slider(id="frame", min=0, max=1, step=1, value=0, marks=None,
-                       tooltip={"placement": "bottom"}, updatemode="mouseup"),
+                       tooltip={"placement": "bottom"}, updatemode="drag"),
             html.Div([
                 html.Label("Segment (hour)"),
                 dcc.Dropdown(id="segment", options=[], clearable=False,
@@ -719,6 +720,7 @@ def create_app(
             # Poll the video's playback time to drive the plot cursor.
             dcc.Interval(id="sync", interval=150, n_intervals=0),
             dcc.Store(id="seg"),
+            dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
         ],
@@ -795,6 +797,7 @@ def create_app(
         Output("frame", "max"),
         Output("frame", "value"),
         Output("frame", "marks"),
+        Output("segmap", "data"),
         Input("load", "n_clicks"),
         State("dataset", "value"),
         State("unitsfile", "value"),
@@ -803,17 +806,20 @@ def create_app(
     )
     def _load(_clicks, dataset_path, units_path, offset):
         if not dataset_path or not units_path:
-            return (no_update,) * 9
+            return (no_update,) * 10
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         segs = segments(state.df)
-        # Slider marks at each segment start, labelled with the Pacific hour.
+        # Slider marks at each segment start (Pacific hour), and a global map of
+        # row -> (segment, fps, start time) so the slider can move the cursor and
+        # seek the right video entirely client-side.
         marks = {}
+        segmap = []
         for s in segs:
-            base, _, _ = segment_info(state.df, s)
-            marks[int(base)] = pd.Timestamp(
-                state.df[COL_DATETIME].iloc[base]
-            ).strftime("%H:%M")
+            base, n, fps = segment_info(state.df, s)
+            marks[int(base)] = pd.Timestamp(state.df[COL_DATETIME].iloc[base]).strftime("%H:%M")
+            start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
+            segmap.append({"name": s, "base": base, "n": n, "fps": fps, "startMs": start_ms})
         return (
             build_timeseries_top(state.df),
             _bottom_figure(),
@@ -824,6 +830,7 @@ def create_app(
             len(state.df) - 1,
             0,
             marks,
+            segmap,
         )
 
     @app.callback(
@@ -856,24 +863,54 @@ def create_app(
         )
         return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
 
-    @app.callback(
+    # Slider drag -> move the red cursor live (client-side, in sync with the
+    # handle) and seek the video. Within the current hour the seek is client-side
+    # too; crossing into another hour switches the video via the server.
+    app.clientside_callback(
+        """
+        function(row, segmap, seg) {
+            var nou = window.dash_clientside.no_update;
+            if (row == null || !segmap || !segmap.length) { return [nou, nou]; }
+            var s = segmap[segmap.length - 1];
+            for (var k = 0; k < segmap.length; k++) {
+                var m = segmap[k];
+                if (row >= m.base && row < m.base + m.n) { s = m; break; }
+            }
+            var localT = (row - s.base) / s.fps;
+            if (localT < 0) { localT = 0; }
+            // Move the cursor immediately so it tracks the slider handle.
+            var cursor = new Date(s.startMs + localT * 1000).toISOString();
+            if (window.Plotly) {
+                ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                    var el = document.getElementById(gid);
+                    var gd = el && (el.classList.contains('js-plotly-plot')
+                        ? el : el.querySelector('.js-plotly-plot'));
+                    if (gd) {
+                        try {
+                            window.Plotly.relayout(gd, {
+                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
+                            });
+                        } catch (e) { /* not ready */ }
+                    }
+                });
+            }
+            var curName = seg && seg.name;
+            var v = document.getElementById('video');
+            if (s.name === curName) {
+                if (v) { try { v.currentTime = localT; } catch (e) {} }
+                return [nou, nou];
+            }
+            // Different hour: load that video (server) + pending seek.
+            return [s.name, {seg: s.name, t: localT}];
+        }
+        """,
         Output("segment", "value", allow_duplicate=True),
         Output("seek", "data"),
         Input("frame", "value"),
+        State("segmap", "data"),
         State("seg", "data"),
         prevent_initial_call=True,
     )
-    def _seek(row, seg):
-        # Slider -> jump to the video/hour containing this row and seek to it.
-        if state.df is None or row is None:
-            return no_update, no_update
-        row = int(min(max(0, row), len(state.df) - 1))
-        name = state.df[COL_SOURCE].iloc[row]
-        base, _, fps = segment_info(state.df, name)
-        seek = {"seg": name, "t": (row - base) / fps}
-        current = seg.get("name") if seg else None
-        seg_out = no_update if current == name else name
-        return seg_out, seek
 
     # Each tick: apply any pending seek (once the right video is ready) and read
     # the video's currentTime -> global row (client-side, cheap).
