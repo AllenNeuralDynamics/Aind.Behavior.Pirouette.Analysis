@@ -742,6 +742,7 @@ def create_app(
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
+            html.Div(id="_dummy2", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -1027,6 +1028,101 @@ def create_app(
         """,
         Output("_dummy", "children"),
         Input("speed", "value"),
+    )
+
+    # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
+    # applies the same range to the other. Runs client-side so it's instant and
+    # the per-tick cursor relayout (which also fires relayoutData) is a cheap
+    # no-op here.
+    app.clientside_callback(
+        """
+        function(rdTop, rdBot) {
+            function extractX(rd) {
+                if (!rd) return null;
+                for (var k in rd) {
+                    if (k.indexOf('xaxis') === 0 &&
+                        k.indexOf('autorange') >= 0 && rd[k] === true) return 'auto';
+                }
+                var lo, hi;
+                for (var k in rd) {
+                    if (/^xaxis\\d*\\.range\\[0\\]$/.test(k)) lo = rd[k];
+                    else if (/^xaxis\\d*\\.range\\[1\\]$/.test(k)) hi = rd[k];
+                    else if (/^xaxis\\d*\\.range$/.test(k)) { lo = rd[k][0]; hi = rd[k][1]; }
+                }
+                if (lo !== undefined && hi !== undefined) return [lo, hi];
+                return null;
+            }
+            function apply(id, rng) {
+                var el = document.getElementById(id);
+                var gd = el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+                if (!gd || !window.Plotly || !gd.layout) return;
+                var upd = {};
+                ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(function (ax) {
+                    if (gd.layout[ax]) {
+                        if (rng === 'auto') { upd[ax + '.autorange'] = true; }
+                        else { upd[ax + '.range'] = rng; }
+                    }
+                });
+                try { window.Plotly.relayout(gd, upd); } catch (e) {}
+            }
+            var ctx = window.dash_clientside.callback_context;
+            var trig = ctx && ctx.triggered && ctx.triggered[0];
+            if (!trig || !trig.prop_id) return '';
+            var src = trig.prop_id.split('.')[0];
+            var rng = extractX(src === 'ts-top' ? rdTop : rdBot);
+            if (rng === null) return '';
+            var key = JSON.stringify(rng);
+            if (window.__xsyncKey === key) return '';
+            window.__xsyncKey = key;
+            apply(src === 'ts-top' ? 'ts-bottom' : 'ts-top', rng);
+            return '';
+        }
+        """,
+        Output("_dummy2", "children"),
+        Input("ts-top", "relayoutData"),
+        Input("ts-bottom", "relayoutData"),
+        prevent_initial_call=True,
+    )
+
+    # Click anywhere on either timeseries figure to set the time: map the clicked
+    # x to a global frame and set the slider, which seeks the video and moves the
+    # cursor (the head plot + info follow via the sync loop).
+    app.clientside_callback(
+        """
+        function(clkTop, clkBot, segmap) {
+            var nou = window.dash_clientside.no_update;
+            if (!segmap || !segmap.length) return nou;
+            var ctx = window.dash_clientside.callback_context;
+            var trig = ctx && ctx.triggered && ctx.triggered[0];
+            if (!trig) return nou;
+            var cd = trig.value;
+            if (!cd || !cd.points || !cd.points.length) return nou;
+            var xs = String(cd.points[0].x);
+            if (xs.indexOf('Z') < 0 && xs.indexOf('+') < 0) {
+                xs = xs.replace(' ', 'T') + 'Z';
+            }
+            var ms = new Date(xs).getTime();
+            if (isNaN(ms)) return nou;
+            var s = null;
+            for (var k = 0; k < segmap.length; k++) {
+                var m = segmap[k];
+                var end = m.startMs + (m.n / m.fps) * 1000;
+                if (ms >= m.startMs && ms < end) { s = m; break; }
+            }
+            if (!s) { s = ms < segmap[0].startMs ? segmap[0] : segmap[segmap.length - 1]; }
+            var localT = (ms - s.startMs) / 1000;
+            if (localT < 0) localT = 0;
+            var maxT = (s.n - 1) / s.fps;
+            if (localT > maxT) localT = maxT;
+            return s.base + Math.round(localT * s.fps);
+        }
+        """,
+        Output("frame", "value", allow_duplicate=True),
+        Input("ts-top", "clickData"),
+        Input("ts-bottom", "clickData"),
+        State("segmap", "data"),
+        prevent_initial_call=True,
     )
 
     @app.callback(
