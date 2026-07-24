@@ -366,6 +366,7 @@ class AppState:
     show_all_spikes: bool = False
     firing_rate_bin_s: float = 0.05
     firing_rate_smooth_s: float = 0.2
+    heading_mode: str = "vector"
 
     df: pd.DataFrame | None = None
     units: dict | None = None
@@ -405,10 +406,22 @@ def _list_files(directory: Path, suffixes: tuple[str, ...]) -> list[str]:
 # ---------------------------------------------------------------------------
 # Figure builders (Plotly)
 # ---------------------------------------------------------------------------
-def build_timeseries_top(df: pd.DataFrame):
-    """Behaviour + velocity + heading, shared time x-axis, with a red cursor."""
+def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
+    """Behaviour + velocity + heading, shared time x-axis, with a red cursor.
+
+    Parameters
+    ----------
+    heading_mode:
+        Which heading trace(s) to plot: ``"vector"`` (ear-vector only, default),
+        ``"commutator"`` (commutator only), or ``"both"``. The dashed/solid
+        legend note is only added to the heading title when ``"both"`` is used.
+    """
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
+
+    heading_title = "heading (deg)"
+    if heading_mode == "both":
+        heading_title += "  -  commutator: dashed, ear-vector: solid"
 
     fig = make_subplots(
         rows=3,
@@ -419,7 +432,7 @@ def build_timeseries_top(df: pd.DataFrame):
         subplot_titles=(
             "behaviour  (rest: gray, movement: salmon)",
             "smoothed velocity (mm/s)",
-            "heading (deg)  -  commutator: dashed, ear-vector: solid",
+            heading_title,
         ),
     )
 
@@ -442,20 +455,24 @@ def build_timeseries_top(df: pd.DataFrame):
         ),
         row=2, col=1,
     )
-    fig.add_trace(
-        go.Scattergl(
-            x=x, y=df[COL_COMM_HEADING].iloc[::s],
-            line=dict(color="black", width=1, dash="dash"), name="commutator",
-        ),
-        row=3, col=1,
-    )
-    fig.add_trace(
-        go.Scattergl(
-            x=x, y=df[COL_EAR_HEADING].iloc[::s],
-            line=dict(color="black", width=1), name="ear vector",
-        ),
-        row=3, col=1,
-    )
+    if heading_mode in ("commutator", "both"):
+        # Dashed only when both are shown (to distinguish); solid if alone.
+        dash = "dash" if heading_mode == "both" else "solid"
+        fig.add_trace(
+            go.Scattergl(
+                x=x, y=df[COL_COMM_HEADING].iloc[::s],
+                line=dict(color="black", width=1, dash=dash), name="commutator",
+            ),
+            row=3, col=1,
+        )
+    if heading_mode in ("vector", "both"):
+        fig.add_trace(
+            go.Scattergl(
+                x=x, y=df[COL_EAR_HEADING].iloc[::s],
+                line=dict(color="black", width=1), name="ear vector",
+            ),
+            row=3, col=1,
+        )
 
     x0 = x.iloc[0]
     fig.add_shape(
@@ -600,6 +617,7 @@ def create_app(
     show_all_spikes: bool = False,
     firing_rate_bin_s: float = 0.05,
     firing_rate_smooth_s: float = 0.2,
+    heading_mode: str = "vector",
 ):
     """Build the Dash application.
 
@@ -632,6 +650,7 @@ def create_app(
         show_all_spikes=show_all_spikes,
         firing_rate_bin_s=firing_rate_bin_s,
         firing_rate_smooth_s=firing_rate_smooth_s,
+        heading_mode=heading_mode,
     )
 
     datasets = _list_files(state.dataset_dir, (".parquet", ".pkl", ".csv"))
@@ -809,6 +828,7 @@ def create_app(
             return (no_update,) * 10
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
+        top_fig = build_timeseries_top(state.df, heading_mode=state.heading_mode)
         segs = segments(state.df)
         # Slider marks at each segment start (Pacific hour), and a global map of
         # row -> (segment, fps, start time) so the slider can move the cursor and
@@ -821,7 +841,7 @@ def create_app(
             start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
             segmap.append({"name": s, "base": base, "n": n, "fps": fps, "startMs": start_ms})
         return (
-            build_timeseries_top(state.df),
+            top_fig,
             _bottom_figure(),
             options,
             state.unit_id,
@@ -1113,6 +1133,7 @@ def run(
     show_all_spikes: bool = False,
     firing_rate_bin_s: float = 0.05,
     firing_rate_smooth_s: float = 0.2,
+    heading_mode: str = "vector",
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -1135,6 +1156,7 @@ def run(
         show_all_spikes=show_all_spikes,
         firing_rate_bin_s=firing_rate_bin_s,
         firing_rate_smooth_s=firing_rate_smooth_s,
+        heading_mode=heading_mode,
     )
 
     print("\nPirouette explorer — share one of these links:")

@@ -53,6 +53,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--firing-rate-smooth-s", type=float,
                    default=float(os.getenv("FIRING_RATE_SMOOTH_S", "0.2") or 0.2),
                    help="Firing-rate Gaussian smoothing sigma in seconds (default 0.2).")
+    p.add_argument("--heading-mode", choices=("vector", "commutator", "both"),
+                   default=os.getenv("HEADING_MODE", "vector"),
+                   help="Which heading trace(s) to plot (default vector).")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
 
@@ -73,6 +76,7 @@ def main(argv: list[str] | None = None) -> None:
         show_all_spikes=args.show_all_spikes,
         firing_rate_bin_s=args.firing_rate_bin_s,
         firing_rate_smooth_s=args.firing_rate_smooth_s,
+        heading_mode=args.heading_mode,
     )
 
 
