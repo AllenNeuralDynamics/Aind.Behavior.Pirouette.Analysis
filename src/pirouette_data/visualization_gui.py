@@ -364,6 +364,7 @@ class AppState:
     units_dir: Path
     video_dir: Path
     spike_offset_s: float = 0.0
+    show_all_spikes: bool = False
 
     df: pd.DataFrame | None = None
     units: dict | None = None
@@ -594,6 +595,7 @@ def create_app(
     video_dir: str | Path,
     spike_offset_s: float = 0.0,
     head_window_s: float = 10.0,
+    show_all_spikes: bool = False,
 ):
     """Build the Dash application.
 
@@ -623,6 +625,7 @@ def create_app(
         units_dir=Path(units_dir),
         video_dir=Path(video_dir),
         spike_offset_s=spike_offset_s,
+        show_all_spikes=show_all_spikes,
     )
 
     datasets = _list_files(state.dataset_dir, (".parquet", ".pkl", ".csv"))
@@ -742,8 +745,9 @@ def create_app(
             t0, t1 = float(df[COL_TIME].iloc[0]), float(df[COL_TIME].iloc[-1])
             in_range = spikes[(spikes >= t0) & (spikes <= t1)]
             # Cap the raster: converting/rendering hundreds of thousands of ticks
-            # is slow and unreadable; a uniform subsample looks the same.
-            if in_range.size > MAX_RASTER_SPIKES:
+            # is slow and unreadable; a uniform subsample looks the same. Set
+            # show_all_spikes to render every tick (slower for busy units).
+            if not state.show_all_spikes and in_range.size > MAX_RASTER_SPIKES:
                 idx = np.linspace(0, in_range.size - 1, MAX_RASTER_SPIKES).astype("int64")
                 in_range = in_range[idx]
             spike_dt = spikes_to_datetime(in_range, state.exp_start_dt)
@@ -1020,6 +1024,7 @@ def run(
     debug: bool = False,
     share: bool = False,
     share_method: str = "cloudflare",
+    show_all_spikes: bool = False,
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -1037,7 +1042,10 @@ def run(
         no browser interstitial. ``"ngrok"`` uses ngrok (needs ``NGROK_AUTHTOKEN``
         and shows a warning page on the free tier).
     """
-    app = create_app(dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s)
+    app = create_app(
+        dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s,
+        show_all_spikes=show_all_spikes,
+    )
 
     print("\nPirouette explorer — share one of these links:")
     print(f"  this machine : http://127.0.0.1:{port}")

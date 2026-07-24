@@ -43,6 +43,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--share-method", choices=("cloudflare", "ngrok"),
                    default=os.getenv("SHARE_METHOD", "cloudflare"),
                    help="Tunnel backend: cloudflare (default, no account) or ngrok.")
+    p.add_argument("--show-all-spikes", action="store_true",
+                   default=os.getenv("SHOW_ALL_SPIKES", "").lower() in ("1", "true", "yes"),
+                   help="Render every spike in the raster (slower for busy units) "
+                        "instead of a uniform subsample.")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
 
@@ -60,6 +64,7 @@ def main(argv: list[str] | None = None) -> None:
         debug=args.debug,
         share=args.share,
         share_method=args.share_method,
+        show_all_spikes=args.show_all_spikes,
     )
 
 
