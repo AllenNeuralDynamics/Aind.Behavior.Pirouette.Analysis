@@ -423,9 +423,10 @@ def build_timeseries_top(df: pd.DataFrame):
         ),
     )
 
-    # Behaviour as a thin 2-colour heatmap row.
+    # Behaviour as a thin 2-colour heatmap row. Plot as tz-naive wall-clock so
+    # the client-side cursor (also naive) lines up exactly.
     s = _stride(len(df))
-    x = df[COL_DATETIME].iloc[::s]
+    x = df[COL_DATETIME].iloc[::s].dt.tz_localize(None)
     beh = (df[COL_BEHAVIOR].iloc[::s] == "movement").astype(int).to_numpy()
     fig.add_trace(
         go.Heatmap(
@@ -456,7 +457,7 @@ def build_timeseries_top(df: pd.DataFrame):
         row=3, col=1,
     )
 
-    x0 = df[COL_DATETIME].iloc[0]
+    x0 = x.iloc[0]
     fig.add_shape(
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
         line=dict(color=CURSOR_COLOR, width=2.5),
@@ -691,7 +692,9 @@ def create_app(
                 id="video", controls=True, autoPlay=False,
                 style={"width": "100%", "border": "1px solid #ccc", "background": "#000"},
             ),
-            html.Div(id="frame-info", style={"fontFamily": "monospace", "padding": "6px 0"}),
+            html.Div(id="frame-info",
+                     style={"fontFamily": "monospace", "padding": "6px 0",
+                            "whiteSpace": "pre-line"}),
             # Global scrubber across the whole session; jumps to the right video.
             dcc.Slider(id="frame", min=0, max=1, step=1, value=0, marks=None,
                        tooltip={"placement": "bottom"}, updatemode="mouseup"),
@@ -716,7 +719,6 @@ def create_app(
             # Poll the video's playback time to drive the plot cursor.
             dcc.Interval(id="sync", interval=150, n_intervals=0),
             dcc.Store(id="seg"),
-            dcc.Store(id="vrow"),
             dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
         ],
@@ -755,7 +757,8 @@ def create_app(
             if not state.show_all_spikes and in_range.size > MAX_RASTER_SPIKES:
                 idx = np.linspace(0, in_range.size - 1, MAX_RASTER_SPIKES).astype("int64")
                 in_range = in_range[idx]
-            spike_dt = spikes_to_datetime(in_range, state.exp_start_dt)
+            # tz-naive wall-clock so the client-side cursor lines up exactly.
+            spike_dt = spikes_to_datetime(in_range, state.exp_start_dt).tz_localize(None)
             # Firing rate at full (fine) resolution so the trace stays smooth;
             # downsample the plotted points BEFORE the datetime conversion (that
             # conversion of the full fine grid was the main cost, not the bins).
@@ -765,13 +768,18 @@ def create_app(
                 smooth_sigma_s=state.firing_rate_smooth_s,
             )
             rs = _stride(len(centers))
-            rate_dt = spikes_to_datetime(centers[::rs], state.exp_start_dt)
+            rate_dt = spikes_to_datetime(
+                centers[::rs], state.exp_start_dt
+            ).tz_localize(None)
             rate_ds = rate[::rs]
             cached = (spike_dt, rate_dt, rate_ds)
             state.bottom_cache[key] = cached
         spike_dt, rate_dt, rate_ds = cached
-        x0 = df[COL_DATETIME].iloc[0]
-        x_range = (df[COL_DATETIME].iloc[0], df[COL_DATETIME].iloc[-1])
+        x0 = df[COL_DATETIME].iloc[0].tz_localize(None)
+        x_range = (
+            df[COL_DATETIME].iloc[0].tz_localize(None),
+            df[COL_DATETIME].iloc[-1].tz_localize(None),
+        )
         return build_timeseries_bottom(
             spike_dt, rate_dt, rate_ds, x0, x_range, str(state.unit_id)
         )
@@ -821,18 +829,32 @@ def create_app(
     @app.callback(
         Output("video", "src"),
         Output("seg", "data"),
+        Output("head", "figure"),
         Input("segment", "value"),
+        State("window", "value"),
         prevent_initial_call=True,
     )
-    def _load_segment(seg):
-        # Point the <video> at the chosen hour and store its row/fps mapping.
+    def _load_segment(seg, window_s):
+        # Point the <video> at the chosen hour, ship this segment's head-position
+        # data to the browser (so the head plot can update client-side during
+        # playback), and build the initial head figure.
         if state.df is None or not seg:
-            return no_update, no_update
+            return no_update, no_update, no_update
         base, n, fps = segment_info(state.df, seg)
-        start_ms = int(state.df[COL_DATETIME].iloc[base].value // 1_000_000)
-        return f"/pirouette-video/{seg}.mp4", {
+        # tz-naive wall-clock ms so the client-side cursor aligns with the axis.
+        start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
+        sl = slice(base, base + n)
+        seg_store = {
             "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
+            "hx": np.round(state.head_x[sl], 2).tolist(),
+            "hy": np.round(state.head_y[sl], 2).tolist(),
+            "ht": np.round(state.head_t[sl], 3).tolist(),
         }
+        head_fig = build_head_position(
+            state.head_x, state.head_y, state.head_t, base,
+            float(window_s or 10.0), chamber=state.chamber,
+        )
+        return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
 
     @app.callback(
         Output("segment", "value", allow_duplicate=True),
@@ -855,12 +877,15 @@ def create_app(
 
     # Each tick: apply any pending seek (once the right video is ready) and read
     # the video's currentTime -> global row (client-side, cheap).
+    # Everything that must track the video during playback is updated CLIENT-SIDE
+    # (no server round-trips): the red cursor, the head-position trail, and the
+    # frame-info text. Data for the current segment lives in the `seg` store.
     app.clientside_callback(
         """
-        function(_n, seg, seek) {
+        function(_n, seg, seek, windowS) {
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
-            if (!v || !seg) { return [nou, nou]; }
+            if (!v || !seg || !seg.hx) { return [nou, nou]; }
             var clearSeek = nou;
             if (seek && seek.seg && v.readyState >= 1 &&
                 v.currentSrc && v.currentSrc.indexOf(seek.seg) >= 0) {
@@ -868,38 +893,69 @@ def create_app(
                 clearSeek = null;
             }
             var ct = v.currentTime || 0;
-            // Move the red cursor client-side (instant, no server round-trip) so
-            // it stays aligned with the video during playback.
-            if (seg.startMs != null && window.Plotly) {
-                var cursor = new Date(seg.startMs + ct * 1000).toISOString();
+            var Plotly = window.Plotly;
+            function plotDiv(id) {
+                var el = document.getElementById(id);
+                return el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+            }
+
+            // Red time cursor on both timeseries figures.
+            var cursor = new Date(seg.startMs + ct * 1000).toISOString();
+            if (Plotly) {
                 ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                    var el = document.getElementById(gid);
-                    var gd = el && (el.classList.contains('js-plotly-plot')
-                        ? el : el.querySelector('.js-plotly-plot'));
+                    var gd = plotDiv(gid);
                     if (gd) {
                         try {
-                            window.Plotly.relayout(gd, {
+                            Plotly.relayout(gd, {
                                 'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
                             });
-                        } catch (e) { /* figure not ready yet */ }
+                        } catch (e) { /* not ready */ }
                     }
                 });
             }
-            // Gated integer row drives the (heavier) server info/head update.
-            var row = seg.base + Math.round(ct * seg.fps);
-            var maxr = seg.base + seg.n - 1;
-            if (row > maxr) { row = maxr; }
-            var out = row;
-            if (window.__pirRow === row) { out = nou; }
-            else { window.__pirRow = row; }
-            return [out, clearSeek];
+
+            // Head-position trail + current marker (windowed).
+            var n = seg.hx.length;
+            var i = Math.round(ct * seg.fps);
+            if (i < 0) { i = 0; }
+            if (i > n - 1) { i = n - 1; }
+            var win = Math.round((windowS || 10) * seg.fps);
+            var lo = Math.max(0, i - win);
+            var hi = i + 1;
+            var hgd = plotDiv('head');
+            if (hgd && Plotly) {
+                try {
+                    Plotly.restyle(hgd, {
+                        x: [seg.hx.slice(lo, hi)],
+                        y: [seg.hy.slice(lo, hi)],
+                        'marker.color': [seg.ht.slice(lo, hi)],
+                    }, [0]);
+                    Plotly.restyle(hgd, {
+                        x: [[seg.hx[i]]], y: [[seg.hy[i]]],
+                    }, [1]);
+                } catch (e) { /* not ready */ }
+            }
+
+            // Frame info (client-side; startMs is Pacific wall-clock).
+            var wall = new Date(seg.startMs + ct * 1000).toISOString()
+                .replace('T', ' ').replace('Z', '');
+            var row = seg.base + i;
+            var tss = seg.ht[i];
+            var info = 'frame ' + row.toLocaleString() +
+                '  (' + seg.name + ' #' + i + ')\\n' +
+                't since start: ' + tss.toFixed(3) + ' s  (' +
+                (tss / 3600).toFixed(3) + ' h)\\n' +
+                'PST: ' + wall;
+            return [clearSeek, info];
         }
         """,
-        Output("vrow", "data"),
         Output("seek", "data", allow_duplicate=True),
+        Output("frame-info", "children"),
         Input("sync", "n_intervals"),
         State("seg", "data"),
         State("seek", "data"),
+        State("window", "value"),
         prevent_initial_call=True,
     )
 
@@ -938,36 +994,6 @@ def create_app(
             return no_update
         state.spike_offset_s = float(offset)
         return _bottom_figure()
-
-    @app.callback(
-        Output("frame-info", "children"),
-        Output("head", "figure"),
-        Input("vrow", "data"),
-        Input("window", "value"),
-        prevent_initial_call=True,
-    )
-    def _sync(row, window_s):
-        # Driven by the video playhead (vrow): update the frame info + head plot.
-        # (The red cursor is moved client-side for zero-lag alignment.)
-        if state.df is None or row is None:
-            return no_update, no_update
-        row = int(min(max(0, row), len(state.df) - 1))
-        src = state.df[COL_SOURCE].iloc[row]
-        fidx = frame_index_for_row(state.df, row)
-        t_s = float(state.df[COL_TIME].iloc[row])
-        dt = state.df[COL_DATETIME].iloc[row]
-        info = html.Div([
-            html.Span(f"frame {row:,} / {len(state.df) - 1:,}  ({src} #{fidx})"),
-            html.Br(),
-            html.Span(f"t since start: {t_s:,.3f} s  ({t_s / 3600:.3f} h)"),
-            html.Br(),
-            html.Span(f"PST: {pd.Timestamp(dt).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}"),
-        ])
-        head_fig = build_head_position(
-            state.head_x, state.head_y, state.head_t, row, float(window_s),
-            chamber=state.chamber,
-        )
-        return info, head_fig
 
     return app
 
