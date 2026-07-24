@@ -682,6 +682,27 @@ def create_app(
 
     app = Dash(__name__, title="Pirouette explorer")
 
+    # Crosshair cursor over the plots (override Plotly's ew/ns-resize cursor that
+    # appears when the y-axis is fixed).
+    app.index_string = """<!DOCTYPE html>
+<html>
+  <head>
+    {%metas%}
+    <title>{%title%}</title>
+    {%favicon%}
+    {%css%}
+    <style>
+      .js-plotly-plot .nsewdrag,
+      .js-plotly-plot .nsewdrag.cursor-ew-resize,
+      .js-plotly-plot .nsewdrag.cursor-ns-resize { cursor: crosshair !important; }
+    </style>
+  </head>
+  <body>
+    {%app_entry%}
+    <footer>{%config%}{%scripts%}{%renderer%}</footer>
+  </body>
+</html>"""
+
     # Serve the mp4 files to the browser's native <video> player (range requests
     # supported), so playback is decoded/buffered client-side and stays smooth
     # even over a tunnel.
@@ -760,13 +781,15 @@ def create_app(
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
-            # Poll the video's playback time to drive the plot cursor.
-            dcc.Interval(id="sync", interval=150, n_intervals=0),
+            # Poll the video's playback time to drive the plot cursor (fast, so
+            # the red line tracks smoothly).
+            dcc.Interval(id="sync", interval=60, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
             html.Div(id="_dummy", style={"display": "none"}),
             html.Div(id="_dummy2", style={"display": "none"}),
+            html.Div(id="_dummy3", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -1130,43 +1153,66 @@ def create_app(
         prevent_initial_call=True,
     )
 
-    # Click anywhere on either timeseries figure to set the time: map the clicked
-    # x to a global frame and set the slider, which seeks the video and moves the
-    # cursor (the head plot + info follow via the sync loop).
+    # Click ANYWHERE on either timeseries figure to set the time (not just on a
+    # data point): a native listener converts the click's pixel x to a time,
+    # maps it to the nearest frame, and sets the slider (which seeks the video
+    # and moves the cursor). segmap is mirrored to a window global for the
+    # listener; the listener is attached once.
     app.clientside_callback(
         """
-        function(clkTop, clkBot, segmap) {
-            var nou = window.dash_clientside.no_update;
-            if (!segmap || !segmap.length) return nou;
-            var ctx = window.dash_clientside.callback_context;
-            var trig = ctx && ctx.triggered && ctx.triggered[0];
-            if (!trig) return nou;
-            var cd = trig.value;
-            if (!cd || !cd.points || !cd.points.length) return nou;
-            var xs = String(cd.points[0].x);
-            if (xs.indexOf('Z') < 0 && xs.indexOf('+') < 0) {
-                xs = xs.replace(' ', 'T') + 'Z';
+        function(segmap) {
+            window.__segmap = segmap;
+            if (window.__clickAttached) return '';
+            window.__clickAttached = true;
+            function toMs(v) {
+                if (typeof v === 'number') return v;
+                var s = String(v);
+                if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) s = s.replace(' ', 'T') + 'Z';
+                return new Date(s).getTime();
             }
-            var ms = new Date(xs).getTime();
-            if (isNaN(ms)) return nou;
-            var s = null;
-            for (var k = 0; k < segmap.length; k++) {
-                var m = segmap[k];
-                var end = m.startMs + (m.n / m.fps) * 1000;
-                if (ms >= m.startMs && ms < end) { s = m; break; }
-            }
-            if (!s) { s = ms < segmap[0].startMs ? segmap[0] : segmap[segmap.length - 1]; }
-            var localT = (ms - s.startMs) / 1000;
-            if (localT < 0) localT = 0;
-            var maxT = (s.n - 1) / s.fps;
-            if (localT > maxT) localT = maxT;
-            return s.base + Math.round(localT * s.fps);
+            document.addEventListener('click', function (evt) {
+                try {
+                    if (evt.target.closest && evt.target.closest('.modebar')) return;
+                    var container = evt.target.closest &&
+                        evt.target.closest('#ts-top, #ts-bottom');
+                    if (!container) return;
+                    var gd = container.querySelector('.js-plotly-plot');
+                    if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return;
+                    var xa = gd._fullLayout.xaxis;
+                    var rect = gd.getBoundingClientRect();
+                    var px = evt.clientX - rect.left - xa._offset;
+                    if (px < 0 || px > xa._length) return;
+                    var r0 = toMs(xa.range[0]), r1 = toMs(xa.range[1]);
+                    var ms = r0 + (px / xa._length) * (r1 - r0);
+                    var sm = window.__segmap;
+                    if (!sm || !sm.length) return;
+                    var s = null;
+                    for (var k = 0; k < sm.length; k++) {
+                        var m = sm[k];
+                        var end = m.startMs + (m.n / m.fps) * 1000;
+                        if (ms >= m.startMs && ms < end) { s = m; break; }
+                    }
+                    if (!s) { s = ms < sm[0].startMs ? sm[0] : sm[sm.length - 1]; }
+                    var localT = (ms - s.startMs) / 1000;
+                    if (localT < 0) localT = 0;
+                    var maxT = (s.n - 1) / s.fps;
+                    if (localT > maxT) localT = maxT;
+                    var row = s.base + Math.round(localT * s.fps);
+                    var input = document.querySelector('#frame input');
+                    if (input) {
+                        var setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(input, String(row));
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                } catch (e) { /* ignore */ }
+            }, true);
+            return '';
         }
         """,
-        Output("frame", "value", allow_duplicate=True),
-        Input("ts-top", "clickData"),
-        Input("ts-bottom", "clickData"),
-        State("segmap", "data"),
+        Output("_dummy3", "children"),
+        Input("segmap", "data"),
         prevent_initial_call=True,
     )
 
