@@ -991,17 +991,21 @@ def create_app(
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
             if (!v || !seg || !seg.hx) { return [nou, nou]; }
+            var ct = v.currentTime || 0;
             var clearSeek = nou;
+            // Apply a pending seek once the right video is loaded, then consume
+            // it. Only jump if we're not already near the target, so we never
+            // re-pin currentTime every tick (which would stall playback).
             if (seek && seek.seg && v.readyState >= 1 &&
                 v.currentSrc && v.currentSrc.indexOf(seek.seg) >= 0) {
-                v.currentTime = seek.t;
+                if (Math.abs(ct - seek.t) > 0.25) { v.currentTime = seek.t; ct = seek.t; }
                 clearSeek = null;
             }
-            var ct = v.currentTime || 0;
-            // Skip all cursor/head/info work when the playhead hasn't moved (e.g.
-            // paused). This frees the main thread so mouse-wheel zoom is smooth
-            // instead of competing with per-tick relayouts.
-            if (window.__lastCt === ct) { return [clearSeek, nou]; }
+            var moved = ct !== window.__lastCt;
+            // Skip the heavy cursor/head/info work only when paused AND nothing
+            // moved (keeps mouse-wheel zoom smooth). During playback the video is
+            // not paused, so the cursor always advances.
+            if (!moved && v.paused) { return [clearSeek, nou]; }
             window.__lastCt = ct;
             var Plotly = window.Plotly;
             function plotDiv(id) {
@@ -1011,8 +1015,9 @@ def create_app(
             }
 
             // Red time cursor on both timeseries figures.
-            var cursor = new Date(seg.startMs + ct * 1000).toISOString();
-            if (Plotly) {
+            var cursor = (typeof seg.startMs === 'number')
+                ? new Date(seg.startMs + ct * 1000).toISOString() : null;
+            if (Plotly && cursor) {
                 ['ts-top', 'ts-bottom'].forEach(function (gid) {
                     var gd = plotDiv(gid);
                     if (gd) {
