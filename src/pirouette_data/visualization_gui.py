@@ -620,7 +620,7 @@ def create_app(
     dash.Dash
         The configured app. Call ``app.run(...)`` (or :func:`run`) to serve it.
     """
-    from dash import Dash, Input, Output, Patch, State, dcc, html, no_update
+    from dash import Dash, Input, Output, State, dcc, html, no_update
     from flask import abort, send_file
 
     state = AppState(
@@ -829,7 +829,10 @@ def create_app(
         if state.df is None or not seg:
             return no_update, no_update
         base, n, fps = segment_info(state.df, seg)
-        return f"/pirouette-video/{seg}.mp4", {"base": base, "n": n, "fps": fps, "name": seg}
+        start_ms = int(state.df[COL_DATETIME].iloc[base].value // 1_000_000)
+        return f"/pirouette-video/{seg}.mp4", {
+            "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
+        }
 
     @app.callback(
         Output("segment", "value", allow_duplicate=True),
@@ -864,7 +867,26 @@ def create_app(
                 v.currentTime = seek.t;
                 clearSeek = null;
             }
-            var row = seg.base + Math.round((v.currentTime || 0) * seg.fps);
+            var ct = v.currentTime || 0;
+            // Move the red cursor client-side (instant, no server round-trip) so
+            // it stays aligned with the video during playback.
+            if (seg.startMs != null && window.Plotly) {
+                var cursor = new Date(seg.startMs + ct * 1000).toISOString();
+                ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                    var el = document.getElementById(gid);
+                    var gd = el && (el.classList.contains('js-plotly-plot')
+                        ? el : el.querySelector('.js-plotly-plot'));
+                    if (gd) {
+                        try {
+                            window.Plotly.relayout(gd, {
+                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
+                            });
+                        } catch (e) { /* figure not ready yet */ }
+                    }
+                });
+            }
+            // Gated integer row drives the (heavier) server info/head update.
+            var row = seg.base + Math.round(ct * seg.fps);
             var maxr = seg.base + seg.n - 1;
             if (row > maxr) { row = maxr; }
             var out = row;
@@ -920,16 +942,15 @@ def create_app(
     @app.callback(
         Output("frame-info", "children"),
         Output("head", "figure"),
-        Output("ts-top", "figure", allow_duplicate=True),
-        Output("ts-bottom", "figure", allow_duplicate=True),
         Input("vrow", "data"),
         Input("window", "value"),
         prevent_initial_call=True,
     )
     def _sync(row, window_s):
-        # Driven by the video playhead (vrow): move the cursor + update info/head.
+        # Driven by the video playhead (vrow): update the frame info + head plot.
+        # (The red cursor is moved client-side for zero-lag alignment.)
         if state.df is None or row is None:
-            return no_update, no_update, no_update, no_update
+            return no_update, no_update
         row = int(min(max(0, row), len(state.df) - 1))
         src = state.df[COL_SOURCE].iloc[row]
         fidx = frame_index_for_row(state.df, row)
@@ -946,13 +967,7 @@ def create_app(
             state.head_x, state.head_y, state.head_t, row, float(window_s),
             chamber=state.chamber,
         )
-        cursor = pd.Timestamp(dt).isoformat()
-        patch_top, patch_bottom = Patch(), Patch()
-        patch_top["layout"]["shapes"][0]["x0"] = cursor
-        patch_top["layout"]["shapes"][0]["x1"] = cursor
-        patch_bottom["layout"]["shapes"][0]["x0"] = cursor
-        patch_bottom["layout"]["shapes"][0]["x1"] = cursor
-        return info, head_fig, patch_top, patch_bottom
+        return info, head_fig
 
     return app
 
