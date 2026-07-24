@@ -1076,15 +1076,23 @@ def create_app(
                     var curMs = seg.startMs + ct * 1000;
                     if (W > 0 && W < 0.9 * fullSpan
                         && (curMs < r0 || curMs > r0 + 0.5 * W)) {
-                        var nr0 = curMs - 0.5 * W, nr1 = curMs + 0.5 * W;
-                        window.__xsyncKey = JSON.stringify([nr0, nr1]);
+                        // Format endpoints as naive wall-clock date STRINGS -- the
+                        // same coordinate space the axis + cursor use. (A numeric
+                        // ms range is mis-placed on a date axis -> blank plots.)
+                        var _fmt = function (ms) {
+                            return new Date(ms).toISOString()
+                                .replace('T', ' ').replace('Z', '');
+                        };
+                        var rng = [_fmt(curMs - 0.5 * W), _fmt(curMs + 0.5 * W)];
+                        window.__xsyncKey = JSON.stringify(rng);
                         ['ts-top', 'ts-bottom'].forEach(function (gid) {
                             var gd = plotDiv(gid);
                             if (!gd || !gd.layout) return;
                             var upd = {};
-                            ['xaxis', 'xaxis2', 'xaxis3'].forEach(function (ax) {
-                                if (gd.layout[ax]) upd[ax + '.range'] = [nr0, nr1];
-                            });
+                            ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(
+                                function (ax) {
+                                    if (gd.layout[ax]) upd[ax + '.range'] = rng;
+                                });
                             try { Plotly.relayout(gd, upd); } catch (e) {}
                         });
                     }
