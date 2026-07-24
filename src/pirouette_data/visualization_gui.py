@@ -998,6 +998,11 @@ def create_app(
                 clearSeek = null;
             }
             var ct = v.currentTime || 0;
+            // Skip all cursor/head/info work when the playhead hasn't moved (e.g.
+            // paused). This frees the main thread so mouse-wheel zoom is smooth
+            // instead of competing with per-tick relayouts.
+            if (window.__lastCt === ct) { return [clearSeek, nou]; }
+            window.__lastCt = ct;
             var Plotly = window.Plotly;
             function plotDiv(id) {
                 var el = document.getElementById(id);
