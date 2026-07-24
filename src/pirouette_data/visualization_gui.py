@@ -787,9 +787,11 @@ def create_app(
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
+            dcc.Store(id="segspikes"),
             html.Div(id="_dummy", style={"display": "none"}),
             html.Div(id="_dummy2", style={"display": "none"}),
             html.Div(id="_dummy3", style={"display": "none"}),
+            html.Div(id="_dummy4", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -798,7 +800,19 @@ def create_app(
         [
             dcc.Graph(id="ts-top", config=graph_config),
             dcc.Graph(id="head", config=graph_config),
-            dcc.Graph(id="ts-bottom", config=graph_config),
+            html.Div(
+                [
+                    dcc.Checklist(
+                        id="listen",
+                        options=[{"label": " 🔊 listen to spikes", "value": "on"}],
+                        value=[],
+                        style={"whiteSpace": "nowrap", "fontSize": "13px"},
+                    ),
+                    dcc.Graph(id="ts-bottom", config=graph_config,
+                              style={"flex": "1", "minWidth": "0"}),
+                ],
+                style={"display": "flex", "alignItems": "center", "gap": "6px"},
+            ),
         ],
         style={"flex": "1", "padding": "8px"},
     )
@@ -987,7 +1001,7 @@ def create_app(
     # frame-info text. Data for the current segment lives in the `seg` store.
     app.clientside_callback(
         """
-        function(_n, seg, seek, windowS) {
+        function(_n, seg, seek, windowS, listen, segspikes) {
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
             if (!v || !seg || !seg.hx) { return [nou, nou]; }
@@ -1084,6 +1098,28 @@ def create_app(
                 't since start: ' + tss.toFixed(3) + ' s  (' +
                 (tss / 3600).toFixed(3) + ' h)\\n' +
                 'PST: ' + wall;
+
+            // Audible spike monitor: a click for each spike the cursor crosses
+            // since the last tick (forward playback only).
+            var listenOn = listen && listen.indexOf && listen.indexOf('on') >= 0;
+            if (listenOn && window.__audioCtx && window.__pop &&
+                segspikes && segspikes.length && !v.paused) {
+                var prev = window.__lastSpikeCt;
+                if (prev !== undefined && ct >= prev && (ct - prev) <= 1.0) {
+                    // first index with segspikes[idx] > prev (binary search)
+                    var a = 0, b = segspikes.length;
+                    while (a < b) {
+                        var mm = (a + b) >> 1;
+                        if (segspikes[mm] <= prev) a = mm + 1; else b = mm;
+                    }
+                    var cnt = 0;
+                    for (var si = a; si < segspikes.length && segspikes[si] <= ct; si++) {
+                        if (cnt < 8) window.__pop(window.__audioCtx);  // cap per tick
+                        cnt++;
+                    }
+                }
+                window.__lastSpikeCt = ct;
+            }
             return [clearSeek, info];
         }
         """,
@@ -1093,6 +1129,8 @@ def create_app(
         State("seg", "data"),
         State("seek", "data"),
         State("window", "value"),
+        State("listen", "value"),
+        State("segspikes", "data"),
         prevent_initial_call=True,
     )
 
@@ -1107,6 +1145,43 @@ def create_app(
         """,
         Output("_dummy", "children"),
         Input("speed", "value"),
+    )
+
+    # Arm the Web Audio spike monitor when "listen to spikes" is toggled on
+    # (toggling is the user gesture that lets the browser start audio).
+    app.clientside_callback(
+        """
+        function(val) {
+            var on = val && val.indexOf && val.indexOf('on') >= 0;
+            if (on) {
+                if (!window.__audioCtx) {
+                    var AC = window.AudioContext || window.webkitAudioContext;
+                    if (AC) window.__audioCtx = new AC();
+                }
+                if (window.__audioCtx && window.__audioCtx.state === 'suspended') {
+                    window.__audioCtx.resume();
+                }
+                window.__pop = function (ctx) {
+                    try {
+                        var dur = 0.006, sr = ctx.sampleRate, n = Math.floor(sr * dur);
+                        var buf = ctx.createBuffer(1, n, sr);
+                        var d = buf.getChannelData(0);
+                        for (var k = 0; k < n; k++) {
+                            d[k] = (Math.random() * 2 - 1) * Math.pow(1 - k / n, 2);
+                        }
+                        var s = ctx.createBufferSource(); s.buffer = buf;
+                        var g = ctx.createGain(); g.gain.value = 0.35;
+                        s.connect(g); g.connect(ctx.destination); s.start();
+                    } catch (e) { /* ignore */ }
+                };
+                window.__lastSpikeCt = undefined;  // resync on enable
+            }
+            return '';
+        }
+        """,
+        Output("_dummy4", "children"),
+        Input("listen", "value"),
+        prevent_initial_call=True,
     )
 
     # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
@@ -1226,6 +1301,25 @@ def create_app(
         Input("segmap", "data"),
         prevent_initial_call=True,
     )
+
+    @app.callback(
+        Output("segspikes", "data"),
+        Input("seg", "data"),
+        Input("unit", "value"),
+        Input("offset", "value"),
+        prevent_initial_call=True,
+    )
+    def _segment_spikes(seg, unit, offset):
+        # Spike times (seconds from the segment start) for the selected unit
+        # within the current video hour — used by the client-side audio monitor.
+        if state.df is None or not seg or unit is None:
+            return no_update
+        base, n = seg["base"], seg["n"]
+        t0 = float(state.df[COL_TIME].iloc[base])
+        t1 = float(state.df[COL_TIME].iloc[base + n - 1])
+        spikes = unit_spike_times_experiment(state.units, unit, float(offset or 0.0))
+        in_seg = spikes[(spikes >= t0) & (spikes <= t1)] - t0
+        return in_seg.tolist()
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),

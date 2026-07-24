@@ -150,6 +150,16 @@ def test_stride():
     assert viz._stride(10, 50) == 1
 
 
+def test_unit_spike_times_experiment_offset_for_audio():
+    # The audio monitor relies on offset-shifted spike times within a window.
+    units = {3: {"spike_times": np.array([10.0, 20.0, 30.0]), "amp": 1.0}}
+    shifted = viz.unit_spike_times_experiment(units, 3, spike_offset_s=100.0)
+    # spikes that fall in a [105, 125] experiment window -> local seconds from 105
+    t0, t1 = 105.0, 125.0
+    in_seg = shifted[(shifted >= t0) & (shifted <= t1)] - t0
+    np.testing.assert_allclose(in_seg, [5.0, 15.0])  # 110->5, 120->15 (130 excluded)
+
+
 def test_segments_and_segment_info():
     n = 120
     src = np.where(np.arange(n) < 60, "TopCamera_A", "TopCamera_B")
