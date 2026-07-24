@@ -788,9 +788,11 @@ def create_app(
                     value=[],
                     style={"fontSize": "16px", "fontWeight": "bold"},
                 ),
-                html.Label("Audio gain", style={"fontSize": "12px"}),
+                html.Label("Audio gain", style={"fontSize": "15px"}),
                 dcc.Slider(id="gain", min=0, max=1, step=0.05, value=0.35,
                            marks={0: "0", 0.5: "0.5", 1: "1"}),
+                html.Button("Plot Reset", id="plot-reset", n_clicks=0,
+                            style={"marginTop": "12px", "width": "100%"}),
             ], style={"paddingTop": "14px"}),
             # Poll the video's playback time to drive the plot cursor + head plot
             # (fast, so they track the video closely).
@@ -804,6 +806,7 @@ def create_app(
             html.Div(id="_dummy3", style={"display": "none"}),
             html.Div(id="_dummy4", style={"display": "none"}),
             html.Div(id="_dummy5", style={"display": "none"}),
+            html.Div(id="_dummy6", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -1044,6 +1047,50 @@ def create_app(
                 });
             }
 
+            // Auto-follow: when zoomed in, keep the cursor in view by centring the
+            // (fixed-width) window on it once it passes the middle. Only while the
+            // video is actually playing, and only when zoomed past ~90% of the full
+            // span, so full-span (incl. after Plot Reset) and paused views are left
+            // untouched.
+            if (Plotly && typeof seg.startMs === 'number' && !v.paused) {
+                var sm = window.__segmap;
+                var fullSpan = Infinity;
+                if (sm && sm.length) {
+                    var last = sm[sm.length - 1];
+                    fullSpan = last.startMs + (last.n / last.fps) * 1000
+                               - sm[0].startMs;
+                }
+                var tg = plotDiv('ts-top');
+                if (tg && tg._fullLayout && tg._fullLayout.xaxis) {
+                    var _toMs = function (x) {
+                        if (typeof x === 'number') return x;
+                        var s = String(x);
+                        if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) {
+                            s = s.replace(' ', 'T') + 'Z';
+                        }
+                        return new Date(s).getTime();
+                    };
+                    var r0 = _toMs(tg._fullLayout.xaxis.range[0]);
+                    var r1 = _toMs(tg._fullLayout.xaxis.range[1]);
+                    var W = r1 - r0;
+                    var curMs = seg.startMs + ct * 1000;
+                    if (W > 0 && W < 0.9 * fullSpan
+                        && (curMs < r0 || curMs > r0 + 0.5 * W)) {
+                        var nr0 = curMs - 0.5 * W, nr1 = curMs + 0.5 * W;
+                        window.__xsyncKey = JSON.stringify([nr0, nr1]);
+                        ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                            var gd = plotDiv(gid);
+                            if (!gd || !gd.layout) return;
+                            var upd = {};
+                            ['xaxis', 'xaxis2', 'xaxis3'].forEach(function (ax) {
+                                if (gd.layout[ax]) upd[ax + '.range'] = [nr0, nr1];
+                            });
+                            try { Plotly.relayout(gd, upd); } catch (e) {}
+                        });
+                    }
+                }
+            }
+
             // Head-position trail + current marker (windowed).
             var n = seg.hx.length;
             var i = Math.round(ct * seg.fps);
@@ -1203,6 +1250,34 @@ def create_app(
         Output("_dummy5", "children"),
         Input("gain", "value"),
         prevent_initial_call=False,
+    )
+
+    # "Plot Reset": restore both timeseries figures to their full span (original
+    # zoom). Auto-ranging every x-axis reverts pan/zoom; y stays fixed. Clearing
+    # __xsyncKey lets the next real zoom re-sync the two figures.
+    app.clientside_callback(
+        """
+        function(n) {
+            if (!n) return '';
+            ['ts-top', 'ts-bottom'].forEach(function (id) {
+                var el = document.getElementById(id);
+                var gd = el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+                if (gd && window.Plotly && gd.layout) {
+                    var upd = {};
+                    ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(function (ax) {
+                        if (gd.layout[ax]) upd[ax + '.autorange'] = true;
+                    });
+                    try { window.Plotly.relayout(gd, upd); } catch (e) {}
+                }
+            });
+            window.__xsyncKey = null;
+            return '';
+        }
+        """,
+        Output("_dummy6", "children"),
+        Input("plot-reset", "n_clicks"),
+        prevent_initial_call=True,
     )
 
     # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
