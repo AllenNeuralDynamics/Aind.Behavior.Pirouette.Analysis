@@ -364,6 +364,8 @@ class AppState:
     video_dir: Path
     spike_offset_s: float = 0.0
     show_all_spikes: bool = False
+    firing_rate_bin_s: float = 0.05
+    firing_rate_smooth_s: float = 0.2
 
     df: pd.DataFrame | None = None
     units: dict | None = None
@@ -595,6 +597,8 @@ def create_app(
     spike_offset_s: float = 0.0,
     head_window_s: float = 10.0,
     show_all_spikes: bool = False,
+    firing_rate_bin_s: float = 0.05,
+    firing_rate_smooth_s: float = 0.2,
 ):
     """Build the Dash application.
 
@@ -625,6 +629,8 @@ def create_app(
         video_dir=Path(video_dir),
         spike_offset_s=spike_offset_s,
         show_all_spikes=show_all_spikes,
+        firing_rate_bin_s=firing_rate_bin_s,
+        firing_rate_smooth_s=firing_rate_smooth_s,
     )
 
     datasets = _list_files(state.dataset_dir, (".parquet", ".pkl", ".csv"))
@@ -753,7 +759,11 @@ def create_app(
             # Firing rate at full (fine) resolution so the trace stays smooth;
             # downsample the plotted points BEFORE the datetime conversion (that
             # conversion of the full fine grid was the main cost, not the bins).
-            centers, rate = instantaneous_firing_rate(spikes, t0, t1)
+            centers, rate = instantaneous_firing_rate(
+                spikes, t0, t1,
+                bin_s=state.firing_rate_bin_s,
+                smooth_sigma_s=state.firing_rate_smooth_s,
+            )
             rs = _stride(len(centers))
             rate_dt = spikes_to_datetime(centers[::rs], state.exp_start_dt)
             rate_ds = rate[::rs]
@@ -1023,6 +1033,8 @@ def run(
     share: bool = False,
     share_method: str = "cloudflare",
     show_all_spikes: bool = False,
+    firing_rate_bin_s: float = 0.05,
+    firing_rate_smooth_s: float = 0.2,
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -1043,6 +1055,8 @@ def run(
     app = create_app(
         dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s,
         show_all_spikes=show_all_spikes,
+        firing_rate_bin_s=firing_rate_bin_s,
+        firing_rate_smooth_s=firing_rate_smooth_s,
     )
 
     print("\nPirouette explorer — share one of these links:")

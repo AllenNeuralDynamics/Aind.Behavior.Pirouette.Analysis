@@ -47,6 +47,12 @@ def main(argv: list[str] | None = None) -> None:
                    default=os.getenv("SHOW_ALL_SPIKES", "").lower() in ("1", "true", "yes"),
                    help="Render every spike in the raster (slower for busy units) "
                         "instead of a uniform subsample.")
+    p.add_argument("--firing-rate-bin-s", type=float,
+                   default=float(os.getenv("FIRING_RATE_BIN_S", "0.05") or 0.05),
+                   help="Firing-rate histogram bin width in seconds (default 0.05).")
+    p.add_argument("--firing-rate-smooth-s", type=float,
+                   default=float(os.getenv("FIRING_RATE_SMOOTH_S", "0.2") or 0.2),
+                   help="Firing-rate Gaussian smoothing sigma in seconds (default 0.2).")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
 
@@ -65,6 +71,8 @@ def main(argv: list[str] | None = None) -> None:
         share=args.share,
         share_method=args.share_method,
         show_all_spikes=args.show_all_spikes,
+        firing_rate_bin_s=args.firing_rate_bin_s,
+        firing_rate_smooth_s=args.firing_rate_smooth_s,
     )
 
 
