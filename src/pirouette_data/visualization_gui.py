@@ -1315,6 +1315,40 @@ def create_app(
                     }
                 } catch (e) { /* ignore */ }
             }, true);
+
+            // Auto-advance: when an hour finishes, load the next segment and keep
+            // playing. 'ended' jumps the slider to the next hour's first frame
+            // (which seeks/loads the video); 'canplay' resumes playback.
+            var vid = document.getElementById('video');
+            if (vid && !window.__videoAutoAttached) {
+                window.__videoAutoAttached = true;
+                vid.addEventListener('ended', function () {
+                    var sm = window.__segmap;
+                    if (!sm || !sm.length) return;
+                    var src = vid.currentSrc || '';
+                    var idx = -1;
+                    for (var k = 0; k < sm.length; k++) {
+                        if (src.indexOf(sm[k].name) >= 0) { idx = k; break; }
+                    }
+                    if (idx < 0 || idx + 1 >= sm.length) return;  // last / unknown
+                    window.__autoPlayNext = true;
+                    var input = document.querySelector('#frame input');
+                    if (input) {
+                        var setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(input, String(sm[idx + 1].base));
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                });
+                vid.addEventListener('canplay', function () {
+                    if (window.__autoPlayNext) {
+                        window.__autoPlayNext = false;
+                        var p = vid.play();
+                        if (p && p.catch) p.catch(function () {});
+                    }
+                });
+            }
             return '';
         }
         """,
