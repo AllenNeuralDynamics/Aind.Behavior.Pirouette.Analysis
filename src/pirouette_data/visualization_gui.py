@@ -781,15 +781,32 @@ def create_app(
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
-            # Poll the video's playback time to drive the plot cursor (fast, so
-            # the red line tracks smoothly).
-            dcc.Interval(id="sync", interval=60, n_intervals=0),
+            html.Div([
+                dcc.Checklist(
+                    id="listen",
+                    options=[{"label": " 🔊 listen to spikes", "value": "on"}],
+                    value=[],
+                    style={"fontSize": "16px", "fontWeight": "bold"},
+                ),
+                html.Label("Audio gain", style={"fontSize": "15px"}),
+                dcc.Slider(id="gain", min=0, max=1, step=0.05, value=0.35,
+                           marks={0: "0", 0.5: "0.5", 1: "1"}),
+                html.Button("Plot Reset", id="plot-reset", n_clicks=0,
+                            style={"marginTop": "12px", "width": "100%"}),
+            ], style={"paddingTop": "14px"}),
+            # Poll the video's playback time to drive the plot cursor + head plot
+            # (fast, so they track the video closely).
+            dcc.Interval(id="sync", interval=40, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
+            dcc.Store(id="segspikes"),
             html.Div(id="_dummy", style={"display": "none"}),
             html.Div(id="_dummy2", style={"display": "none"}),
             html.Div(id="_dummy3", style={"display": "none"}),
+            html.Div(id="_dummy4", style={"display": "none"}),
+            html.Div(id="_dummy5", style={"display": "none"}),
+            html.Div(id="_dummy6", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -987,21 +1004,25 @@ def create_app(
     # frame-info text. Data for the current segment lives in the `seg` store.
     app.clientside_callback(
         """
-        function(_n, seg, seek, windowS) {
+        function(_n, seg, seek, windowS, listen, segspikes) {
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
             if (!v || !seg || !seg.hx) { return [nou, nou]; }
+            var ct = v.currentTime || 0;
             var clearSeek = nou;
+            // Apply a pending seek once the right video is loaded, then consume
+            // it. Only jump if we're not already near the target, so we never
+            // re-pin currentTime every tick (which would stall playback).
             if (seek && seek.seg && v.readyState >= 1 &&
                 v.currentSrc && v.currentSrc.indexOf(seek.seg) >= 0) {
-                v.currentTime = seek.t;
+                if (Math.abs(ct - seek.t) > 0.25) { v.currentTime = seek.t; ct = seek.t; }
                 clearSeek = null;
             }
-            var ct = v.currentTime || 0;
-            // Skip all cursor/head/info work when the playhead hasn't moved (e.g.
-            // paused). This frees the main thread so mouse-wheel zoom is smooth
-            // instead of competing with per-tick relayouts.
-            if (window.__lastCt === ct) { return [clearSeek, nou]; }
+            var moved = ct !== window.__lastCt;
+            // Skip the heavy cursor/head/info work only when paused AND nothing
+            // moved (keeps mouse-wheel zoom smooth). During playback the video is
+            // not paused, so the cursor always advances.
+            if (!moved && v.paused) { return [clearSeek, nou]; }
             window.__lastCt = ct;
             var Plotly = window.Plotly;
             function plotDiv(id) {
@@ -1011,8 +1032,9 @@ def create_app(
             }
 
             // Red time cursor on both timeseries figures.
-            var cursor = new Date(seg.startMs + ct * 1000).toISOString();
-            if (Plotly) {
+            var cursor = (typeof seg.startMs === 'number')
+                ? new Date(seg.startMs + ct * 1000).toISOString() : null;
+            if (Plotly && cursor) {
                 ['ts-top', 'ts-bottom'].forEach(function (gid) {
                     var gd = plotDiv(gid);
                     if (gd) {
@@ -1025,6 +1047,58 @@ def create_app(
                 });
             }
 
+            // Auto-follow: when zoomed in, keep the cursor in view by centring the
+            // (fixed-width) window on it once it passes the middle. Only while the
+            // video is actually playing, and only when zoomed past ~90% of the full
+            // span, so full-span (incl. after Plot Reset) and paused views are left
+            // untouched.
+            if (Plotly && typeof seg.startMs === 'number' && !v.paused) {
+                var sm = window.__segmap;
+                var fullSpan = Infinity;
+                if (sm && sm.length) {
+                    var last = sm[sm.length - 1];
+                    fullSpan = last.startMs + (last.n / last.fps) * 1000
+                               - sm[0].startMs;
+                }
+                var tg = plotDiv('ts-top');
+                if (tg && tg._fullLayout && tg._fullLayout.xaxis) {
+                    var _toMs = function (x) {
+                        if (typeof x === 'number') return x;
+                        var s = String(x);
+                        if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) {
+                            s = s.replace(' ', 'T') + 'Z';
+                        }
+                        return new Date(s).getTime();
+                    };
+                    var r0 = _toMs(tg._fullLayout.xaxis.range[0]);
+                    var r1 = _toMs(tg._fullLayout.xaxis.range[1]);
+                    var W = r1 - r0;
+                    var curMs = seg.startMs + ct * 1000;
+                    if (W > 0 && W < 0.9 * fullSpan
+                        && (curMs < r0 || curMs > r0 + 0.5 * W)) {
+                        // Format endpoints as naive wall-clock date STRINGS -- the
+                        // same coordinate space the axis + cursor use. (A numeric
+                        // ms range is mis-placed on a date axis -> blank plots.)
+                        var _fmt = function (ms) {
+                            return new Date(ms).toISOString()
+                                .replace('T', ' ').replace('Z', '');
+                        };
+                        var rng = [_fmt(curMs - 0.5 * W), _fmt(curMs + 0.5 * W)];
+                        window.__xsyncKey = JSON.stringify(rng);
+                        ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                            var gd = plotDiv(gid);
+                            if (!gd || !gd.layout) return;
+                            var upd = {};
+                            ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(
+                                function (ax) {
+                                    if (gd.layout[ax]) upd[ax + '.range'] = rng;
+                                });
+                            try { Plotly.relayout(gd, upd); } catch (e) {}
+                        });
+                    }
+                }
+            }
+
             // Head-position trail + current marker (windowed).
             var n = seg.hx.length;
             var i = Math.round(ct * seg.fps);
@@ -1032,39 +1106,40 @@ def create_app(
             if (i > n - 1) { i = n - 1; }
             var win = Math.round((windowS || 10) * seg.fps);
             var lo = Math.max(0, i - win);
-            var hi = i + 1;
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
-                // Colour the trail by wall-clock time (epoch ms) with HH:MM:SS
-                // colorbar ticks, matching the timeseries plots.
-                var color = [];
-                for (var j = lo; j < hi; j++) {
-                    color.push(seg.startMs + (j / seg.fps) * 1000);
-                }
-                var cmin = color.length ? color[0] : 0;
-                var cmax = color.length ? color[color.length - 1] : 1;
-                if (cmax <= cmin) { cmax = cmin + 1; }
-                var tv = [], tt = [], NT = 4;
-                for (var t = 0; t < NT; t++) {
-                    var val = cmin + (cmax - cmin) * t / (NT - 1);
-                    tv.push(val);
-                    tt.push(new Date(val).toISOString().slice(11, 19));
-                }
                 try {
+                    // Current-position marker first (1 point) so it lands promptly.
+                    Plotly.restyle(hgd, {x: [[seg.hx[i]]], y: [[seg.hy[i]]]}, [1]);
+                    // Subsample the trail (cap points) so the restyle stays light
+                    // and renders in sync with the video even for long windows.
+                    var CAP = 200;
+                    var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
+                    var xs = [], ys = [], color = [];
+                    for (var j = lo; j <= i; j += step) {
+                        xs.push(seg.hx[j]); ys.push(seg.hy[j]);
+                        color.push(seg.startMs + (j / seg.fps) * 1000);
+                    }
+                    if ((i - lo) % step !== 0) {  // always include the current point
+                        xs.push(seg.hx[i]); ys.push(seg.hy[i]);
+                        color.push(seg.startMs + (i / seg.fps) * 1000);
+                    }
+                    var cmin = color[0], cmax = color[color.length - 1];
+                    if (cmax <= cmin) { cmax = cmin + 1; }
+                    var tv = [], tt = [], NT = 4;
+                    for (var t = 0; t < NT; t++) {
+                        var val = cmin + (cmax - cmin) * t / (NT - 1);
+                        tv.push(val);
+                        tt.push(new Date(val).toISOString().slice(11, 19));
+                    }
                     Plotly.restyle(hgd, {
-                        x: [seg.hx.slice(lo, hi)],
-                        y: [seg.hy.slice(lo, hi)],
-                        'marker.color': [color],
-                        'marker.cmin': [cmin],
-                        'marker.cmax': [cmax],
+                        x: [xs], y: [ys], 'marker.color': [color],
+                        'marker.cmin': [cmin], 'marker.cmax': [cmax],
                         'marker.cauto': [false],
                         'marker.colorbar.tickmode': ['array'],
                         'marker.colorbar.tickvals': [tv],
                         'marker.colorbar.ticktext': [tt],
                     }, [0]);
-                    Plotly.restyle(hgd, {
-                        x: [[seg.hx[i]]], y: [[seg.hy[i]]],
-                    }, [1]);
                 } catch (e) { /* not ready */ }
             }
 
@@ -1078,6 +1153,39 @@ def create_app(
                 't since start: ' + tss.toFixed(3) + ' s  (' +
                 (tss / 3600).toFixed(3) + ' h)\\n' +
                 'PST: ' + wall;
+
+            // Audible spike monitor: schedule a click for each spike the cursor
+            // crossed since the last tick, spread across the tick's real duration
+            // so it crackles and stays in sync at any playback speed.
+            var listenOn = listen && listen.indexOf && listen.indexOf('on') >= 0;
+            if (listenOn && window.__audioCtx && window.__pop &&
+                segspikes && segspikes.length && !v.paused) {
+                var actx = window.__audioCtx;
+                var nowP = (window.performance && performance.now)
+                    ? performance.now() : Date.now();
+                var realDt = (window.__lastTickPerf !== undefined)
+                    ? (nowP - window.__lastTickPerf) : 40;
+                window.__lastTickPerf = nowP;
+                realDt = Math.min(Math.max(realDt, 5), 500) / 1000;  // seconds
+                var prev = window.__lastSpikeCt;
+                // Play only for a forward advance consistent with playback (not a
+                // seek). 8 s covers even 10x with laggy ticks; seeks are larger.
+                if (prev !== undefined && ct > prev && (ct - prev) <= 8.0) {
+                    var a = 0, b = segspikes.length;
+                    while (a < b) {  // first index with segspikes[idx] > prev
+                        var mm = (a + b) >> 1;
+                        if (segspikes[mm] <= prev) a = mm + 1; else b = mm;
+                    }
+                    var span = ct - prev, base = actx.currentTime, cnt = 0;
+                    for (var si = a; si < segspikes.length && segspikes[si] <= ct; si++) {
+                        if (cnt >= 60) break;  // avoid extreme bursts
+                        var frac = span > 0 ? (segspikes[si] - prev) / span : 0;
+                        window.__pop(actx, base + frac * realDt);
+                        cnt++;
+                    }
+                }
+                window.__lastSpikeCt = ct;
+            }
             return [clearSeek, info];
         }
         """,
@@ -1087,6 +1195,8 @@ def create_app(
         State("seg", "data"),
         State("seek", "data"),
         State("window", "value"),
+        State("listen", "value"),
+        State("segspikes", "data"),
         prevent_initial_call=True,
     )
 
@@ -1101,6 +1211,81 @@ def create_app(
         """,
         Output("_dummy", "children"),
         Input("speed", "value"),
+    )
+
+    # Arm the Web Audio spike monitor when "listen to spikes" is toggled on
+    # (toggling is the user gesture that lets the browser start audio).
+    app.clientside_callback(
+        """
+        function(val) {
+            var on = val && val.indexOf && val.indexOf('on') >= 0;
+            if (on) {
+                if (!window.__audioCtx) {
+                    var AC = window.AudioContext || window.webkitAudioContext;
+                    if (AC) window.__audioCtx = new AC();
+                }
+                if (window.__audioCtx && window.__audioCtx.state === 'suspended') {
+                    window.__audioCtx.resume();
+                }
+                window.__pop = function (ctx, when) {
+                    try {
+                        var dur = 0.006, sr = ctx.sampleRate, n = Math.floor(sr * dur);
+                        var buf = ctx.createBuffer(1, n, sr);
+                        var d = buf.getChannelData(0);
+                        for (var k = 0; k < n; k++) {
+                            d[k] = (Math.random() * 2 - 1) * Math.pow(1 - k / n, 2);
+                        }
+                        var s = ctx.createBufferSource(); s.buffer = buf;
+                        var g = ctx.createGain();
+                        g.gain.value = (window.__audioGain != null) ? window.__audioGain : 0.35;
+                        s.connect(g); g.connect(ctx.destination);
+                        s.start(when || ctx.currentTime);
+                    } catch (e) { /* ignore */ }
+                };
+                window.__lastSpikeCt = undefined;  // resync on enable
+            }
+            return '';
+        }
+        """,
+        Output("_dummy4", "children"),
+        Input("listen", "value"),
+        prevent_initial_call=True,
+    )
+
+    # Audio gain slider -> click volume.
+    app.clientside_callback(
+        "function(g){ window.__audioGain = (g == null) ? 0.35 : g; return ''; }",
+        Output("_dummy5", "children"),
+        Input("gain", "value"),
+        prevent_initial_call=False,
+    )
+
+    # "Plot Reset": restore both timeseries figures to their full span (original
+    # zoom). Auto-ranging every x-axis reverts pan/zoom; y stays fixed. Clearing
+    # __xsyncKey lets the next real zoom re-sync the two figures.
+    app.clientside_callback(
+        """
+        function(n) {
+            if (!n) return '';
+            ['ts-top', 'ts-bottom'].forEach(function (id) {
+                var el = document.getElementById(id);
+                var gd = el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+                if (gd && window.Plotly && gd.layout) {
+                    var upd = {};
+                    ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(function (ax) {
+                        if (gd.layout[ax]) upd[ax + '.autorange'] = true;
+                    });
+                    try { window.Plotly.relayout(gd, upd); } catch (e) {}
+                }
+            });
+            window.__xsyncKey = null;
+            return '';
+        }
+        """,
+        Output("_dummy6", "children"),
+        Input("plot-reset", "n_clicks"),
+        prevent_initial_call=True,
     )
 
     # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
@@ -1213,6 +1398,40 @@ def create_app(
                     }
                 } catch (e) { /* ignore */ }
             }, true);
+
+            // Auto-advance: when an hour finishes, load the next segment and keep
+            // playing. 'ended' jumps the slider to the next hour's first frame
+            // (which seeks/loads the video); 'canplay' resumes playback.
+            var vid = document.getElementById('video');
+            if (vid && !window.__videoAutoAttached) {
+                window.__videoAutoAttached = true;
+                vid.addEventListener('ended', function () {
+                    var sm = window.__segmap;
+                    if (!sm || !sm.length) return;
+                    var src = vid.currentSrc || '';
+                    var idx = -1;
+                    for (var k = 0; k < sm.length; k++) {
+                        if (src.indexOf(sm[k].name) >= 0) { idx = k; break; }
+                    }
+                    if (idx < 0 || idx + 1 >= sm.length) return;  // last / unknown
+                    window.__autoPlayNext = true;
+                    var input = document.querySelector('#frame input');
+                    if (input) {
+                        var setter = Object.getOwnPropertyDescriptor(
+                            window.HTMLInputElement.prototype, 'value').set;
+                        setter.call(input, String(sm[idx + 1].base));
+                        input.dispatchEvent(new Event('input', {bubbles: true}));
+                        input.dispatchEvent(new Event('change', {bubbles: true}));
+                    }
+                });
+                vid.addEventListener('canplay', function () {
+                    if (window.__autoPlayNext) {
+                        window.__autoPlayNext = false;
+                        var p = vid.play();
+                        if (p && p.catch) p.catch(function () {});
+                    }
+                });
+            }
             return '';
         }
         """,
@@ -1220,6 +1439,25 @@ def create_app(
         Input("segmap", "data"),
         prevent_initial_call=True,
     )
+
+    @app.callback(
+        Output("segspikes", "data"),
+        Input("seg", "data"),
+        Input("unit", "value"),
+        Input("offset", "value"),
+        prevent_initial_call=True,
+    )
+    def _segment_spikes(seg, unit, offset):
+        # Spike times (seconds from the segment start) for the selected unit
+        # within the current video hour — used by the client-side audio monitor.
+        if state.df is None or not seg or unit is None:
+            return no_update
+        base, n = seg["base"], seg["n"]
+        t0 = float(state.df[COL_TIME].iloc[base])
+        t1 = float(state.df[COL_TIME].iloc[base + n - 1])
+        spikes = unit_spike_times_experiment(state.units, unit, float(offset or 0.0))
+        in_seg = spikes[(spikes >= t0) & (spikes <= t1)] - t0
+        return in_seg.tolist()
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
