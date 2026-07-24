@@ -781,9 +781,9 @@ def create_app(
                 dcc.Slider(id="window", min=1, max=120, step=1, value=head_window_s,
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
-            # Poll the video's playback time to drive the plot cursor (fast, so
-            # the red line tracks smoothly).
-            dcc.Interval(id="sync", interval=60, n_intervals=0),
+            # Poll the video's playback time to drive the plot cursor + head plot
+            # (fast, so they track the video closely).
+            dcc.Interval(id="sync", interval=40, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
@@ -1037,39 +1037,40 @@ def create_app(
             if (i > n - 1) { i = n - 1; }
             var win = Math.round((windowS || 10) * seg.fps);
             var lo = Math.max(0, i - win);
-            var hi = i + 1;
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
-                // Colour the trail by wall-clock time (epoch ms) with HH:MM:SS
-                // colorbar ticks, matching the timeseries plots.
-                var color = [];
-                for (var j = lo; j < hi; j++) {
-                    color.push(seg.startMs + (j / seg.fps) * 1000);
-                }
-                var cmin = color.length ? color[0] : 0;
-                var cmax = color.length ? color[color.length - 1] : 1;
-                if (cmax <= cmin) { cmax = cmin + 1; }
-                var tv = [], tt = [], NT = 4;
-                for (var t = 0; t < NT; t++) {
-                    var val = cmin + (cmax - cmin) * t / (NT - 1);
-                    tv.push(val);
-                    tt.push(new Date(val).toISOString().slice(11, 19));
-                }
                 try {
+                    // Current-position marker first (1 point) so it lands promptly.
+                    Plotly.restyle(hgd, {x: [[seg.hx[i]]], y: [[seg.hy[i]]]}, [1]);
+                    // Subsample the trail (cap points) so the restyle stays light
+                    // and renders in sync with the video even for long windows.
+                    var CAP = 200;
+                    var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
+                    var xs = [], ys = [], color = [];
+                    for (var j = lo; j <= i; j += step) {
+                        xs.push(seg.hx[j]); ys.push(seg.hy[j]);
+                        color.push(seg.startMs + (j / seg.fps) * 1000);
+                    }
+                    if ((i - lo) % step !== 0) {  // always include the current point
+                        xs.push(seg.hx[i]); ys.push(seg.hy[i]);
+                        color.push(seg.startMs + (i / seg.fps) * 1000);
+                    }
+                    var cmin = color[0], cmax = color[color.length - 1];
+                    if (cmax <= cmin) { cmax = cmin + 1; }
+                    var tv = [], tt = [], NT = 4;
+                    for (var t = 0; t < NT; t++) {
+                        var val = cmin + (cmax - cmin) * t / (NT - 1);
+                        tv.push(val);
+                        tt.push(new Date(val).toISOString().slice(11, 19));
+                    }
                     Plotly.restyle(hgd, {
-                        x: [seg.hx.slice(lo, hi)],
-                        y: [seg.hy.slice(lo, hi)],
-                        'marker.color': [color],
-                        'marker.cmin': [cmin],
-                        'marker.cmax': [cmax],
+                        x: [xs], y: [ys], 'marker.color': [color],
+                        'marker.cmin': [cmin], 'marker.cmax': [cmax],
                         'marker.cauto': [false],
                         'marker.colorbar.tickmode': ['array'],
                         'marker.colorbar.tickvals': [tv],
                         'marker.colorbar.ticktext': [tt],
                     }, [0]);
-                    Plotly.restyle(hgd, {
-                        x: [[seg.hx[i]]], y: [[seg.hy[i]]],
-                    }, [1]);
                 } catch (e) { /* not ready */ }
             }
 
