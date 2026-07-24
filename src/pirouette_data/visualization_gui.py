@@ -26,7 +26,7 @@ from __future__ import annotations
 import base64
 import pickle
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +49,8 @@ MOVE_COLOR = "#fa8072"  # salmon
 CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
+MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
+RATE_MAX_BINS = 60000  # cap firing-rate histogram bins for speed
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,7 @@ def instantaneous_firing_rate(
     t1_s: float,
     bin_s: float = 0.05,
     smooth_sigma_s: float = 0.2,
+    max_bins: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Gaussian-smoothed instantaneous firing rate over ``[t0_s, t1_s]``.
 
@@ -171,9 +174,14 @@ def instantaneous_firing_rate(
     t0_s, t1_s:
         Time window (experiment seconds) over which to compute the rate.
     bin_s:
-        Histogram bin width (seconds).
+        Requested histogram bin width (seconds).
     smooth_sigma_s:
         Gaussian smoothing sigma (seconds).
+    max_bins:
+        Optional cap on the number of bins. Over long windows the ``bin_s``
+        resolution can imply millions of bins that are far finer than the plot
+        can show; capping keeps the computation fast (the effective bin width
+        widens to ``(t1 - t0) / max_bins``).
 
     Returns
     -------
@@ -187,12 +195,15 @@ def instantaneous_firing_rate(
     if t1_s <= t0_s:
         return np.array([]), np.array([])
     n_bins = max(1, int(round((t1_s - t0_s) / bin_s)))
+    if max_bins is not None and n_bins > max_bins:
+        n_bins = max_bins
     edges = np.linspace(t0_s, t1_s, n_bins + 1)
+    width = (t1_s - t0_s) / n_bins
     spikes = np.asarray(spike_exp_s, dtype="float64")
     spikes = spikes[(spikes >= t0_s) & (spikes <= t1_s)]
     counts, _ = np.histogram(spikes, bins=edges)
-    rate = counts / bin_s
-    sigma_bins = max(1e-6, smooth_sigma_s / bin_s)
+    rate = counts / width
+    sigma_bins = max(1e-6, smooth_sigma_s / width)
     rate = gaussian_filter1d(rate, sigma_bins, mode="nearest")
     centers = (edges[:-1] + edges[1:]) / 2.0
     return centers, rate
@@ -363,6 +374,7 @@ class AppState:
     head_t: np.ndarray | None = None  # experiment seconds
     chamber: dict | None = None
     unit_id: object = None
+    bottom_cache: dict = field(default_factory=dict)
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
         """Load a dataset + units file into the state."""
@@ -375,6 +387,7 @@ class AppState:
         self.head_t = self.df[COL_TIME].to_numpy(dtype="float64")
         self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
+        self.bottom_cache = {}
         return self
 
 
@@ -720,17 +733,35 @@ def create_app(
     # ---- helpers bound to state ----
     def _bottom_figure():
         df = state.df
-        spikes = unit_spike_times_experiment(state.units, state.unit_id, state.spike_offset_s)
-        t0, t1 = float(df[COL_TIME].iloc[0]), float(df[COL_TIME].iloc[-1])
-        in_range = spikes[(spikes >= t0) & (spikes <= t1)]
-        spike_dt = spikes_to_datetime(in_range, state.exp_start_dt)
-        centers, rate = instantaneous_firing_rate(spikes, t0, t1)
-        rate_dt = spikes_to_datetime(centers, state.exp_start_dt)
-        rs = _stride(len(centers))
+        key = (state.unit_id, round(float(state.spike_offset_s), 3))
+        cached = state.bottom_cache.get(key)
+        if cached is None:
+            spikes = unit_spike_times_experiment(
+                state.units, state.unit_id, state.spike_offset_s
+            )
+            t0, t1 = float(df[COL_TIME].iloc[0]), float(df[COL_TIME].iloc[-1])
+            in_range = spikes[(spikes >= t0) & (spikes <= t1)]
+            # Cap the raster: converting/rendering hundreds of thousands of ticks
+            # is slow and unreadable; a uniform subsample looks the same.
+            if in_range.size > MAX_RASTER_SPIKES:
+                idx = np.linspace(0, in_range.size - 1, MAX_RASTER_SPIKES).astype("int64")
+                in_range = in_range[idx]
+            spike_dt = spikes_to_datetime(in_range, state.exp_start_dt)
+            # Firing rate: capped bins, and downsample BEFORE the datetime
+            # conversion (converting the full fine grid was the main cost).
+            centers, rate = instantaneous_firing_rate(
+                spikes, t0, t1, max_bins=RATE_MAX_BINS
+            )
+            rs = _stride(len(centers))
+            rate_dt = spikes_to_datetime(centers[::rs], state.exp_start_dt)
+            rate_ds = rate[::rs]
+            cached = (spike_dt, rate_dt, rate_ds)
+            state.bottom_cache[key] = cached
+        spike_dt, rate_dt, rate_ds = cached
         x0 = df[COL_DATETIME].iloc[0]
         x_range = (df[COL_DATETIME].iloc[0], df[COL_DATETIME].iloc[-1])
         return build_timeseries_bottom(
-            spike_dt, rate_dt[::rs], rate[::rs], x0, x_range, str(state.unit_id)
+            spike_dt, rate_dt, rate_ds, x0, x_range, str(state.unit_id)
         )
 
     # ---- callbacks ----
