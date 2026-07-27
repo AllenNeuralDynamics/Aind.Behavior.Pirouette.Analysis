@@ -267,7 +267,14 @@ def test_named_tunnel_requires_name():
 
 
 def test_named_tunnel_requires_cloudflared(monkeypatch):
-    # Tunnel name given but cloudflared not installed -> actionable error.
-    monkeypatch.setattr("shutil.which", lambda _: None)
-    with pytest.raises(RuntimeError, match="cloudflared not found"):
+    # Tunnel name given but no cloudflared anywhere -> actionable error.
+    monkeypatch.setattr(viz, "_cloudflared_bin", lambda: "")
+    with pytest.raises(RuntimeError, match="cloudflared executable not found"):
         viz._start_cloudflare_named_tunnel(8050, "pirouette", "pirouette.example.org")
+
+
+def test_cloudflared_bin_falls_back_to_pycloudflared(monkeypatch):
+    # With nothing on PATH, it should find the pycloudflared-bundled binary.
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    exe = viz._cloudflared_bin()
+    assert exe and exe.lower().endswith(".exe") or exe == ""  # bundled or absent

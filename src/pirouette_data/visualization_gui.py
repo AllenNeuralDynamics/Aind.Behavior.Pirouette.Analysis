@@ -1543,6 +1543,30 @@ def _start_cloudflare_tunnel(port: int) -> str:
 _TUNNEL_PROCS: list = []
 
 
+def _cloudflared_bin() -> str:
+    """Locate a ``cloudflared`` executable.
+
+    Prefer one on ``PATH`` (a proper ``winget`` install), else fall back to the
+    copy ``pycloudflared`` downloads for the quick tunnel — so the named tunnel
+    needs no separate install. Returns ``""`` if none is found.
+    """
+    import os
+    import shutil
+
+    exe = shutil.which("cloudflared")
+    if exe:
+        return exe
+    try:
+        from pycloudflared.util import get_info
+
+        cand = getattr(get_info(), "executable", None)
+        if cand and os.path.exists(cand):
+            return cand
+    except Exception:  # noqa: BLE001 - fallback is best-effort
+        pass
+    return ""
+
+
 def _start_cloudflare_named_tunnel(
     port: int, tunnel: str | None, hostname: str | None = None
 ) -> str:
@@ -1559,7 +1583,6 @@ def _start_cloudflare_named_tunnel(
 
     after which this launches ``cloudflared tunnel run`` pointed at the local app.
     """
-    import shutil
     import subprocess
 
     if not tunnel:
@@ -1567,11 +1590,12 @@ def _start_cloudflare_named_tunnel(
             "cloudflare-named needs a tunnel name (set CLOUDFLARE_TUNNEL or "
             "--cloudflare-tunnel). Create one with `cloudflared tunnel create <name>`."
         )
-    exe = shutil.which("cloudflared")
+    exe = _cloudflared_bin()
     if not exe:
         raise RuntimeError(
-            "cloudflared not found on PATH. Install it "
-            "(`winget install --id Cloudflare.cloudflared`) and complete the "
+            "cloudflared executable not found (neither on PATH nor bundled with "
+            "pycloudflared). Run `uv sync --extra gui`, or install it with "
+            "`winget install --id Cloudflare.cloudflared`, then complete the "
             "one-time tunnel setup (login / create / route dns)."
         )
     cmd = [exe, "tunnel", "--url", f"http://localhost:{port}", "run", tunnel]
