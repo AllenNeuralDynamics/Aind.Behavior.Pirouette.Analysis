@@ -40,9 +40,17 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--share", action="store_true",
                    default=os.getenv("SHARE", "").lower() in ("1", "true", "yes"),
                    help="Open a public tunnel so remote viewers can access it.")
-    p.add_argument("--share-method", choices=("cloudflare", "ngrok"),
+    p.add_argument("--share-method",
+                   choices=("cloudflare", "cloudflare-named", "ngrok"),
                    default=os.getenv("SHARE_METHOD", "cloudflare"),
-                   help="Tunnel backend: cloudflare (default, no account) or ngrok.")
+                   help="Tunnel backend: cloudflare (quick, random URL), "
+                        "cloudflare-named (stable URL lasting weeks; needs setup), "
+                        "or ngrok.")
+    p.add_argument("--cloudflare-tunnel", default=os.getenv("CLOUDFLARE_TUNNEL"),
+                   help="Named-tunnel name for --share-method cloudflare-named.")
+    p.add_argument("--cloudflare-hostname", default=os.getenv("CLOUDFLARE_HOSTNAME"),
+                   help="Routed hostname for the named tunnel "
+                        "(e.g. pirouette.example.org).")
     p.add_argument("--show-all-spikes", action="store_true",
                    default=os.getenv("SHOW_ALL_SPIKES", "").lower() in ("1", "true", "yes"),
                    help="Render every spike in the raster (slower for busy units) "
@@ -73,6 +81,8 @@ def main(argv: list[str] | None = None) -> None:
         debug=args.debug,
         share=args.share,
         share_method=args.share_method,
+        cloudflare_tunnel=args.cloudflare_tunnel,
+        cloudflare_hostname=args.cloudflare_hostname,
         show_all_spikes=args.show_all_spikes,
         firing_rate_bin_s=args.firing_rate_bin_s,
         firing_rate_smooth_s=args.firing_rate_smooth_s,

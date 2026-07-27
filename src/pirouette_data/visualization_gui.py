@@ -1527,14 +1527,57 @@ def _reset_ngrok() -> None:
 
 
 def _start_cloudflare_tunnel(port: int) -> str:
-    """Open a Cloudflare quick tunnel and return the public URL.
+    """Open a Cloudflare *quick* tunnel and return the public URL.
 
-    Needs no account and shows no interstitial. Downloads the ``cloudflared``
-    helper on first use.
+    Needs no account and shows no interstitial, but the URL is random and
+    Cloudflare tears it down after a while — use a *named* tunnel
+    (:func:`_start_cloudflare_named_tunnel`) for a link that lasts weeks.
+    Downloads the ``cloudflared`` helper on first use.
     """
     from pycloudflared import try_cloudflare
 
     return try_cloudflare(port=port).tunnel
+
+
+# Keep tunnel subprocesses alive for the lifetime of the server process.
+_TUNNEL_PROCS: list = []
+
+
+def _start_cloudflare_named_tunnel(
+    port: int, tunnel: str | None, hostname: str | None = None
+) -> str:
+    """Run a *named* Cloudflare tunnel and return its stable public URL.
+
+    A named tunnel keeps the **same** hostname across restarts and stays up as
+    long as the process runs (or as a service — see the README), so the link is
+    good for weeks rather than the minutes/hours of a quick tunnel. It requires a
+    one-time setup with a domain you control on a (free) Cloudflare account::
+
+        cloudflared tunnel login
+        cloudflared tunnel create pirouette
+        cloudflared tunnel route dns pirouette pirouette.<your-domain>
+
+    after which this launches ``cloudflared tunnel run`` pointed at the local app.
+    """
+    import shutil
+    import subprocess
+
+    if not tunnel:
+        raise RuntimeError(
+            "cloudflare-named needs a tunnel name (set CLOUDFLARE_TUNNEL or "
+            "--cloudflare-tunnel). Create one with `cloudflared tunnel create <name>`."
+        )
+    exe = shutil.which("cloudflared")
+    if not exe:
+        raise RuntimeError(
+            "cloudflared not found on PATH. Install it "
+            "(`winget install --id Cloudflare.cloudflared`) and complete the "
+            "one-time tunnel setup (login / create / route dns)."
+        )
+    cmd = [exe, "tunnel", "--url", f"http://localhost:{port}", "run", tunnel]
+    proc = subprocess.Popen(cmd)  # noqa: S603 - args are ours, not user input
+    _TUNNEL_PROCS.append(proc)
+    return f"https://{hostname}" if hostname else f"(named tunnel '{tunnel}' is running)"
 
 
 def _start_ngrok_tunnel(port: int) -> str:
@@ -1560,6 +1603,8 @@ def run(
     debug: bool = False,
     share: bool = False,
     share_method: str = "cloudflare",
+    cloudflare_tunnel: str | None = None,
+    cloudflare_hostname: str | None = None,
     show_all_spikes: bool = False,
     firing_rate_bin_s: float = 0.05,
     firing_rate_smooth_s: float = 0.2,
@@ -1578,8 +1623,15 @@ def run(
         for viewers **anywhere** (data stays on this machine).
     share_method:
         ``"cloudflare"`` (default) uses a Cloudflare quick tunnel — no account,
-        no browser interstitial. ``"ngrok"`` uses ngrok (needs ``NGROK_AUTHTOKEN``
-        and shows a warning page on the free tier).
+        no interstitial, but a random URL that lasts only minutes/hours.
+        ``"cloudflare-named"`` runs a *named* tunnel (needs ``cloudflare_tunnel``
+        + a one-time domain setup) for a **stable URL that lasts weeks**.
+        ``"ngrok"`` uses ngrok (needs ``NGROK_AUTHTOKEN``; free tier shows a
+        warning page).
+    cloudflare_tunnel, cloudflare_hostname:
+        Named-tunnel name and its routed hostname (e.g. ``pirouette`` and
+        ``pirouette.example.org``). Used only when ``share_method`` is
+        ``"cloudflare-named"``.
     """
     app = create_app(
         dataset_dir, units_dir, video_dir, spike_offset_s=spike_offset_s,
@@ -1598,9 +1650,16 @@ def run(
         try:
             if method == "ngrok":
                 public = _start_ngrok_tunnel(port)
+            elif method in ("cloudflare-named", "named"):
+                public = _start_cloudflare_named_tunnel(
+                    port, cloudflare_tunnel, cloudflare_hostname
+                )
             else:
                 public = _start_cloudflare_tunnel(port)
             print(f"  public       : {public}   <-- send this to anyone")
+            if method in ("cloudflare-named", "named"):
+                print("                 (stable URL — keep this process running; "
+                      "see README to run it as a service for weeks)")
         except Exception as exc:  # noqa: BLE001 - report and continue serving
             print(f"  [share] {method} tunnel failed: {exc}")
             print("  [share] run `uv sync --extra gui` to install the tunnel helper.")

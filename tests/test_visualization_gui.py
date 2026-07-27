@@ -258,3 +258,16 @@ def test_chamber_corners_mm():
 def test_frame_to_data_uri_placeholder():
     uri = viz.frame_to_data_uri(None, "no video")
     assert uri.startswith("data:image/jpeg;base64,")
+
+
+def test_named_tunnel_requires_name():
+    # No tunnel name -> a clear error before touching cloudflared.
+    with pytest.raises(RuntimeError, match="tunnel name"):
+        viz._start_cloudflare_named_tunnel(8050, None)
+
+
+def test_named_tunnel_requires_cloudflared(monkeypatch):
+    # Tunnel name given but cloudflared not installed -> actionable error.
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    with pytest.raises(RuntimeError, match="cloudflared not found"):
+        viz._start_cloudflare_named_tunnel(8050, "pirouette", "pirouette.example.org")

@@ -161,11 +161,47 @@ browser** — no local files. On start it prints the links to share:
   the Windows Firewall when prompted.
 - **Anywhere (internet):** `127.0.0.1`/LAN links do **not** work off your network
   (NAT/firewall). Use `--share` to open a public tunnel and share the printed
-  `https://…` URL. Two backends (`--share-method`):
-  - `cloudflare` (default) — a Cloudflare quick tunnel; **no account, no browser
-    interstitial**, `cloudflared` is auto-downloaded on first use.
+  `https://…` URL. Three backends (`--share-method`):
+  - `cloudflare` (default) — a Cloudflare **quick** tunnel; no account, no
+    interstitial, but the URL is **random and short-lived** (minutes–hours). Good
+    for a quick look, not for a link you hand out.
+  - `cloudflare-named` — a **named** tunnel with a **stable URL that lasts weeks**
+    (same URL across restarts, no interstitial). Needs a one-time setup with a
+    domain you control — see [Stable link that lasts weeks](#stable-link-that-lasts-weeks).
   - `ngrok` — needs a free `NGROK_AUTHTOKEN` in `.env`; the free tier shows a
     one-time "Visit Site" warning page.
+
+### Stable link that lasts weeks
+
+The default quick tunnel is deliberately ephemeral. For a link you can hand out
+and rely on for weeks, use a **named Cloudflare tunnel**. One-time setup (needs a
+domain on a free [Cloudflare](https://dash.cloudflare.com) account):
+
+```bash
+winget install --id Cloudflare.cloudflared   # install the cloudflared CLI (once)
+cloudflared tunnel login                      # opens a browser; pick your domain
+cloudflared tunnel create pirouette           # creates the tunnel + credentials
+cloudflared tunnel route dns pirouette pirouette.<your-domain>   # map a hostname
+```
+
+Then set in `.env`:
+
+```env
+SHARE=true
+SHARE_METHOD=cloudflare-named
+CLOUDFLARE_TUNNEL=pirouette
+CLOUDFLARE_HOSTNAME=pirouette.<your-domain>
+```
+
+and run `uv run python scripts/run_gui.py`. It prints your stable
+`https://pirouette.<your-domain>` link, which stays the same every run.
+
+**Keep it up for weeks.** The link is live only while both the app and the tunnel
+run, so start them at logon and auto-restart on failure. Simplest on Windows —
+one Task Scheduler task ("At log on", *Restart the task if it fails*) whose action
+runs `scripts/run_gui.py` (it starts the tunnel itself). The machine must stay
+powered on and logged in. (Alternatively, install the tunnel as its own service
+with `cloudflared service install` and schedule only the app.)
 
 Spike times are shifted by `--spike-offset-s` (env `SPIKE_OFFSET_S`, also editable
 live in the app) so they are referenced to the **experiment start**, matching the
