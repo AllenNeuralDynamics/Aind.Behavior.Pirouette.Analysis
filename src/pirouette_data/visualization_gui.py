@@ -1024,6 +1024,8 @@ def create_app(
             // not paused, so the cursor always advances.
             if (!moved && v.paused) { return [clearSeek, nou]; }
             window.__lastCt = ct;
+            var nowT = (window.performance && performance.now)
+                ? performance.now() : Date.now();
             var Plotly = window.Plotly;
             function plotDiv(id) {
                 var el = document.getElementById(id);
@@ -1074,8 +1076,17 @@ def create_app(
                     var r1 = _toMs(tg._fullLayout.xaxis.range[1]);
                     var W = r1 - r0;
                     var curMs = seg.startMs + ct * 1000;
-                    if (W > 0 && W < 0.9 * fullSpan
-                        && (curMs < r0 || curMs > r0 + 0.5 * W)) {
+                    var outOfView = curMs < r0 || curMs > r1;
+                    var pastMid = curMs > r0 + 0.5 * W;
+                    // Re-centre immediately if the cursor would leave the window;
+                    // otherwise throttle the (heavy) pan to ~16x/s so fast playback
+                    // doesn't pile up relayouts and drag the whole loop behind.
+                    var followOk = outOfView
+                        || window.__lastFollowT === undefined
+                        || (nowT - window.__lastFollowT) >= 60;
+                    if (W > 0 && W < 0.9 * fullSpan && (outOfView || pastMid)
+                        && followOk) {
+                        window.__lastFollowT = nowT;
                         // Format endpoints as naive wall-clock date STRINGS -- the
                         // same coordinate space the axis + cursor use. (A numeric
                         // ms range is mis-placed on a date axis -> blank plots.)
@@ -1109,37 +1120,47 @@ def create_app(
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
                 try {
-                    // Current-position marker first (1 point) so it lands promptly.
+                    // Current-position marker EVERY tick (1 point, cheap) so it
+                    // stays locked to the video frame even at high playback speed.
                     Plotly.restyle(hgd, {x: [[seg.hx[i]]], y: [[seg.hy[i]]]}, [1]);
-                    // Subsample the trail (cap points) so the restyle stays light
-                    // and renders in sync with the video even for long windows.
-                    var CAP = 200;
-                    var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
-                    var xs = [], ys = [], color = [];
-                    for (var j = lo; j <= i; j += step) {
-                        xs.push(seg.hx[j]); ys.push(seg.hy[j]);
-                        color.push(seg.startMs + (j / seg.fps) * 1000);
+
+                    // The trail + colorbar rebuild is much heavier; running it every
+                    // 40 ms tick makes fast playback exceed the tick budget, pile up
+                    // callbacks and drag the marker behind. Rebuild it ~10x/s while
+                    // playing (and every tick when paused, so scrubbing stays fresh).
+                    var freshTrail = v.paused
+                        || window.__lastTrailT === undefined
+                        || (nowT - window.__lastTrailT) >= 100;
+                    if (freshTrail) {
+                        window.__lastTrailT = nowT;
+                        var CAP = 200;
+                        var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
+                        var xs = [], ys = [], color = [];
+                        for (var j = lo; j <= i; j += step) {
+                            xs.push(seg.hx[j]); ys.push(seg.hy[j]);
+                            color.push(seg.startMs + (j / seg.fps) * 1000);
+                        }
+                        if ((i - lo) % step !== 0) {  // always include current point
+                            xs.push(seg.hx[i]); ys.push(seg.hy[i]);
+                            color.push(seg.startMs + (i / seg.fps) * 1000);
+                        }
+                        var cmin = color[0], cmax = color[color.length - 1];
+                        if (cmax <= cmin) { cmax = cmin + 1; }
+                        var tv = [], tt = [], NT = 4;
+                        for (var t = 0; t < NT; t++) {
+                            var val = cmin + (cmax - cmin) * t / (NT - 1);
+                            tv.push(val);
+                            tt.push(new Date(val).toISOString().slice(11, 19));
+                        }
+                        Plotly.restyle(hgd, {
+                            x: [xs], y: [ys], 'marker.color': [color],
+                            'marker.cmin': [cmin], 'marker.cmax': [cmax],
+                            'marker.cauto': [false],
+                            'marker.colorbar.tickmode': ['array'],
+                            'marker.colorbar.tickvals': [tv],
+                            'marker.colorbar.ticktext': [tt],
+                        }, [0]);
                     }
-                    if ((i - lo) % step !== 0) {  // always include the current point
-                        xs.push(seg.hx[i]); ys.push(seg.hy[i]);
-                        color.push(seg.startMs + (i / seg.fps) * 1000);
-                    }
-                    var cmin = color[0], cmax = color[color.length - 1];
-                    if (cmax <= cmin) { cmax = cmin + 1; }
-                    var tv = [], tt = [], NT = 4;
-                    for (var t = 0; t < NT; t++) {
-                        var val = cmin + (cmax - cmin) * t / (NT - 1);
-                        tv.push(val);
-                        tt.push(new Date(val).toISOString().slice(11, 19));
-                    }
-                    Plotly.restyle(hgd, {
-                        x: [xs], y: [ys], 'marker.color': [color],
-                        'marker.cmin': [cmin], 'marker.cmax': [cmax],
-                        'marker.cauto': [false],
-                        'marker.colorbar.tickmode': ['array'],
-                        'marker.colorbar.tickvals': [tv],
-                        'marker.colorbar.ticktext': [tt],
-                    }, [0]);
                 } catch (e) { /* not ready */ }
             }
 
