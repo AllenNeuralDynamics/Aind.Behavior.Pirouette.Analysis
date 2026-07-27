@@ -1567,6 +1567,55 @@ def _cloudflared_bin() -> str:
     return ""
 
 
+def _tunnel_exists(exe: str, tunnel: str) -> bool:
+    """Return True if a named tunnel already exists (requires prior login)."""
+    import json
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [exe, "tunnel", "list", "--output", "json"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            return False
+        return any(t.get("name") == tunnel for t in json.loads(r.stdout or "[]"))
+    except Exception:  # noqa: BLE001 - treat any parse/exec failure as "missing"
+        return False
+
+
+def _ensure_named_tunnel(exe: str, tunnel: str, hostname: str | None) -> None:
+    """Provision the named tunnel on first run so the GUI "just works".
+
+    Idempotent: logs in (once, via browser), creates the tunnel, and routes the
+    hostname only if those steps haven't already been done. The single browser
+    authorization on first ``login`` is unavoidable (Cloudflare OAuth); every run
+    afterwards is fully automatic.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    cert = Path(os.path.expanduser("~")) / ".cloudflared" / "cert.pem"
+    if not cert.exists():
+        print("  [share] first-time Cloudflare login — a browser window will open;"
+              f" authorize the {hostname or 'chosen'} zone to continue...")
+        subprocess.run([exe, "tunnel", "login"], check=True)
+
+    if not _tunnel_exists(exe, tunnel):
+        print(f"  [share] creating named tunnel '{tunnel}' (one-time)...")
+        subprocess.run([exe, "tunnel", "create", tunnel], check=True)
+
+    if hostname:
+        r = subprocess.run(
+            [exe, "tunnel", "route", "dns", tunnel, hostname],
+            capture_output=True, text=True, check=False,
+        )
+        blob = (r.stdout + r.stderr).lower()
+        if r.returncode != 0 and "already" not in blob and "exists" not in blob:
+            print(f"  [share] DNS route warning: {(r.stderr or r.stdout).strip()}")
+
+
 def _start_cloudflare_named_tunnel(
     port: int, tunnel: str | None, hostname: str | None = None
 ) -> str:
@@ -1598,6 +1647,7 @@ def _start_cloudflare_named_tunnel(
             "`winget install --id Cloudflare.cloudflared`, then complete the "
             "one-time tunnel setup (login / create / route dns)."
         )
+    _ensure_named_tunnel(exe, tunnel, hostname)  # provision on first run
     cmd = [exe, "tunnel", "--url", f"http://localhost:{port}", "run", tunnel]
     proc = subprocess.Popen(cmd)  # noqa: S603 - args are ours, not user input
     _TUNNEL_PROCS.append(proc)

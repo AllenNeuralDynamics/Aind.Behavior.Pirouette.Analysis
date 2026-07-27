@@ -176,29 +176,28 @@ browser** — no local files. On start it prints the links to share:
 The default quick tunnel is deliberately ephemeral. For a link you can hand out
 and rely on for weeks, use a **named Cloudflare tunnel**. This project's canonical
 host is **`https://pirouette-viz.org`** (a domain on a free
-[Cloudflare](https://dash.cloudflare.com) account). One-time setup on the machine
-that holds the data:
+[Cloudflare](https://dash.cloudflare.com) account).
 
-```bash
-winget install --id Cloudflare.cloudflared   # install the cloudflared CLI (once)
-cloudflared tunnel login                      # opens a browser; pick pirouette-viz.org
-cloudflared tunnel create pirouette           # creates the tunnel + credentials
-cloudflared tunnel route dns pirouette pirouette-viz.org   # map the hostname
-```
-
-Then set in `.env`:
+Setup is **automatic on first run** — no manual `cloudflared` commands. Just set
+in `.env`:
 
 ```env
 SHARE=true
 SHARE_METHOD=cloudflare-named
-CLOUDFLARE_TUNNEL=pirouette
-CLOUDFLARE_HOSTNAME=pirouette-viz.org
+CLOUDFLARE_TUNNEL=pirouette          # optional; this is the default
+CLOUDFLARE_HOSTNAME=pirouette-viz.org  # optional; this is the default
 ```
 
-and run `uv run python scripts/run_gui.py`. It prints the stable
-`https://pirouette-viz.org` link, which stays the same every run. (Tunnel name and
-hostname default to `pirouette` / `pirouette-viz.org`, so those two `.env` lines
-are optional.)
+and run `uv run python scripts/run_gui.py`. The **first** time, a browser window
+opens once so you can authorize the `pirouette-viz.org` zone (Cloudflare OAuth —
+unavoidable); the app then creates the tunnel and routes the hostname for you.
+`cloudflared` itself needs no separate install — the copy bundled with
+`pycloudflared` (from `uv sync --extra gui`) is used automatically.
+
+Every run **after** that is fully automatic and prints the same stable
+`https://pirouette-viz.org` link. (The provisioning is idempotent: it logs in only
+if `~/.cloudflared/cert.pem` is missing, and creates the tunnel only if it doesn't
+already exist.)
 
 **Keep it up for weeks.** The link is live only while both the app and the tunnel
 run, so start them at logon and auto-restart on failure. Simplest on Windows —

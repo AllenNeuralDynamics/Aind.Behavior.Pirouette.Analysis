@@ -278,3 +278,56 @@ def test_cloudflared_bin_falls_back_to_pycloudflared(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _: None)
     exe = viz._cloudflared_bin()
     assert exe and exe.lower().endswith(".exe") or exe == ""  # bundled or absent
+
+
+def test_tunnel_exists_parses_json(monkeypatch):
+    from types import SimpleNamespace
+
+    def fake_run(cmd, **kw):
+        return SimpleNamespace(returncode=0, stdout='[{"name": "pirouette"}]', stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert viz._tunnel_exists("cf", "pirouette") is True
+    assert viz._tunnel_exists("cf", "other") is False
+
+
+def test_ensure_named_tunnel_creates_when_missing(monkeypatch, tmp_path):
+    # Already logged in (cert.pem present) + tunnel absent -> create + route, no login.
+    from types import SimpleNamespace
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(" ".join(cmd[1:]))
+        stdout = "[]" if "list" in cmd else ""  # list -> tunnel missing
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("os.path.expanduser", lambda _: str(tmp_path))
+    cfdir = tmp_path / ".cloudflared"
+    cfdir.mkdir()
+    (cfdir / "cert.pem").write_text("x")
+
+    viz._ensure_named_tunnel("cf", "pirouette", "pirouette-viz.org")
+    assert any("tunnel create pirouette" in c for c in calls)
+    assert any("route dns pirouette pirouette-viz.org" in c for c in calls)
+    assert not any("tunnel login" in c for c in calls)  # cert present
+
+
+def test_ensure_named_tunnel_logs_in_and_skips_create(monkeypatch, tmp_path):
+    # No cert.pem -> login; tunnel already exists -> no create.
+    from types import SimpleNamespace
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(" ".join(cmd[1:]))
+        stdout = '[{"name": "pirouette"}]' if "list" in cmd else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("os.path.expanduser", lambda _: str(tmp_path))  # no cert.pem
+
+    viz._ensure_named_tunnel("cf", "pirouette", "pirouette-viz.org")
+    assert any("tunnel login" in c for c in calls)
+    assert not any("tunnel create" in c for c in calls)
