@@ -807,6 +807,7 @@ def create_app(
             html.Div(id="_dummy4", style={"display": "none"}),
             html.Div(id="_dummy5", style={"display": "none"}),
             html.Div(id="_dummy6", style={"display": "none"}),
+            html.Div(id="_dummy7", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -1004,9 +1005,10 @@ def create_app(
     # frame-info text. Data for the current segment lives in the `seg` store.
     app.clientside_callback(
         """
-        function(_n, seg, seek, windowS, listen, segspikes) {
+        function(_n, seek, windowS, listen, segspikes) {
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
+            var seg = window.__seg;  // mirrored once per segment (not marshalled/tick)
             if (!v || !seg || !seg.hx) { return [nou, nou]; }
             var ct = v.currentTime || 0;
             var clearSeek = nou;
@@ -1033,21 +1035,9 @@ def create_app(
                     ? el : el.querySelector('.js-plotly-plot'));
             }
 
-            // Red time cursor on both timeseries figures.
-            var cursor = (typeof seg.startMs === 'number')
-                ? new Date(seg.startMs + ct * 1000).toISOString() : null;
-            if (Plotly && cursor) {
-                ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                    var gd = plotDiv(gid);
-                    if (gd) {
-                        try {
-                            Plotly.relayout(gd, {
-                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
-                            });
-                        } catch (e) { /* not ready */ }
-                    }
-                });
-            }
+            // (The red cursor + current head marker are driven on
+            // requestAnimationFrame for frame-accurate video sync -- see the
+            // rAF loop below; this 40 ms loop handles the heavier work.)
 
             // Auto-follow: when zoomed in, keep the cursor in view by centring the
             // (fixed-width) window on it once it passes the middle. Only while the
@@ -1120,14 +1110,10 @@ def create_app(
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
                 try {
-                    // Current-position marker EVERY tick (1 point, cheap) so it
-                    // stays locked to the video frame even at high playback speed.
-                    Plotly.restyle(hgd, {x: [[seg.hx[i]]], y: [[seg.hy[i]]]}, [1]);
-
-                    // The trail + colorbar rebuild is much heavier; running it every
-                    // 40 ms tick makes fast playback exceed the tick budget, pile up
-                    // callbacks and drag the marker behind. Rebuild it ~10x/s while
-                    // playing (and every tick when paused, so scrubbing stays fresh).
+                    // The current-position marker is updated on rAF (below). Here we
+                    // only rebuild the trail + colorbar, which is much heavier -- run
+                    // it ~10x/s while playing (every tick when paused, so scrubbing
+                    // stays fresh) rather than every 40 ms tick.
                     var freshTrail = v.paused
                         || window.__lastTrailT === undefined
                         || (nowT - window.__lastTrailT) >= 100;
@@ -1213,11 +1199,75 @@ def create_app(
         Output("seek", "data", allow_duplicate=True),
         Output("frame-info", "children"),
         Input("sync", "n_intervals"),
-        State("seg", "data"),
         State("seek", "data"),
         State("window", "value"),
         State("listen", "value"),
         State("segspikes", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Mirror the per-segment head data to a window global (once per segment, not
+    # marshalled every tick) and start a requestAnimationFrame loop that drives the
+    # two things that must be frame-accurate with the video: the current head
+    # marker and the red time cursor. rAF fires right before each repaint (~60 Hz)
+    # and reads a fresh currentTime, so these stay locked to the video at any
+    # playback speed -- independent of the 40 ms Dash Interval.
+    app.clientside_callback(
+        """
+        function(seg) {
+            window.__seg = seg;
+            if (window.__headRaf) { return ''; }
+            window.__headRaf = true;
+            function pdiv(id) {
+                var el = document.getElementById(id);
+                return el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+            }
+            function frame() {
+                try {
+                    var v = document.getElementById('video');
+                    var s = window.__seg;
+                    var P = window.Plotly;
+                    if (v && s && s.hx && P) {
+                        var ct = v.currentTime || 0;
+                        if (ct !== window.__rafCt) {
+                            window.__rafCt = ct;
+                            var i = Math.round(ct * s.fps);
+                            if (i < 0) { i = 0; }
+                            if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                            var hgd = pdiv('head');
+                            if (hgd) {
+                                try {
+                                    P.restyle(hgd,
+                                        {x: [[s.hx[i]]], y: [[s.hy[i]]]}, [1]);
+                                } catch (e) {}
+                            }
+                            if (typeof s.startMs === 'number') {
+                                var cur = new Date(s.startMs + ct * 1000)
+                                    .toISOString();
+                                ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                                    var gd = pdiv(gid);
+                                    if (gd) {
+                                        try {
+                                            P.relayout(gd, {
+                                                'shapes[0].x0': cur,
+                                                'shapes[0].x1': cur,
+                                            });
+                                        } catch (e) {}
+                                    }
+                                });
+                            }
+                        }
+                    }
+                } catch (e) {}
+                window.requestAnimationFrame(frame);
+            }
+            window.requestAnimationFrame(frame);
+            return '';
+        }
+        """,
+        Output("_dummy7", "children"),
+        Input("seg", "data"),
         prevent_initial_call=True,
     )
 
