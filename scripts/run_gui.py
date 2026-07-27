@@ -46,11 +46,14 @@ def main(argv: list[str] | None = None) -> None:
                    help="Tunnel backend: cloudflare (quick, random URL), "
                         "cloudflare-named (stable URL lasting weeks; needs setup), "
                         "or ngrok.")
-    p.add_argument("--cloudflare-tunnel", default=os.getenv("CLOUDFLARE_TUNNEL"),
-                   help="Named-tunnel name for --share-method cloudflare-named.")
-    p.add_argument("--cloudflare-hostname", default=os.getenv("CLOUDFLARE_HOSTNAME"),
+    p.add_argument("--cloudflare-tunnel",
+                   default=os.getenv("CLOUDFLARE_TUNNEL", "pirouette"),
+                   help="Named-tunnel name for --share-method cloudflare-named "
+                        "(default 'pirouette').")
+    p.add_argument("--cloudflare-hostname",
+                   default=os.getenv("CLOUDFLARE_HOSTNAME", "pirouette-viz.org"),
                    help="Routed hostname for the named tunnel "
-                        "(e.g. pirouette.example.org).")
+                        "(default 'pirouette-viz.org').")
     p.add_argument("--show-all-spikes", action="store_true",
                    default=os.getenv("SHOW_ALL_SPIKES", "").lower() in ("1", "true", "yes"),
                    help="Render every spike in the raster (slower for busy units) "

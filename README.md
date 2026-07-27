@@ -174,14 +174,16 @@ browser** — no local files. On start it prints the links to share:
 ### Stable link that lasts weeks
 
 The default quick tunnel is deliberately ephemeral. For a link you can hand out
-and rely on for weeks, use a **named Cloudflare tunnel**. One-time setup (needs a
-domain on a free [Cloudflare](https://dash.cloudflare.com) account):
+and rely on for weeks, use a **named Cloudflare tunnel**. This project's canonical
+host is **`https://pirouette-viz.org`** (a domain on a free
+[Cloudflare](https://dash.cloudflare.com) account). One-time setup on the machine
+that holds the data:
 
 ```bash
 winget install --id Cloudflare.cloudflared   # install the cloudflared CLI (once)
-cloudflared tunnel login                      # opens a browser; pick your domain
+cloudflared tunnel login                      # opens a browser; pick pirouette-viz.org
 cloudflared tunnel create pirouette           # creates the tunnel + credentials
-cloudflared tunnel route dns pirouette pirouette.<your-domain>   # map a hostname
+cloudflared tunnel route dns pirouette pirouette-viz.org   # map the hostname
 ```
 
 Then set in `.env`:
@@ -190,11 +192,13 @@ Then set in `.env`:
 SHARE=true
 SHARE_METHOD=cloudflare-named
 CLOUDFLARE_TUNNEL=pirouette
-CLOUDFLARE_HOSTNAME=pirouette.<your-domain>
+CLOUDFLARE_HOSTNAME=pirouette-viz.org
 ```
 
-and run `uv run python scripts/run_gui.py`. It prints your stable
-`https://pirouette.<your-domain>` link, which stays the same every run.
+and run `uv run python scripts/run_gui.py`. It prints the stable
+`https://pirouette-viz.org` link, which stays the same every run. (Tunnel name and
+hostname default to `pirouette` / `pirouette-viz.org`, so those two `.env` lines
+are optional.)
 
 **Keep it up for weeks.** The link is live only while both the app and the tunnel
 run, so start them at logon and auto-restart on failure. Simplest on Windows —
