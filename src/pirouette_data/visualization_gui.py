@@ -968,6 +968,12 @@ def create_app(
             state.head_x, state.head_y, state.head_ms, base,
             float(window_s or 10.0), chamber=state.chamber,
         )
+        # Ship the head plot's home axis ranges so Plot Reset can restore the exact
+        # tight view (its axes aren't auto-ranged).
+        hx_rng = head_fig.layout.xaxis.range
+        hy_rng = head_fig.layout.yaxis.range
+        seg_store["head_xrange"] = list(hx_rng) if hx_rng else None
+        seg_store["head_yrange"] = list(hy_rng) if hy_rng else None
         return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
 
     # Slider drag -> move the red cursor live (client-side, in sync with the
@@ -1136,12 +1142,16 @@ def create_app(
                 }
             }
 
-            // Head-position trail + current marker (windowed).
+            // Head-position trail + current marker (windowed). Use the video's own
+            // frame rate (n/duration) for indexing so the trail + info frame match
+            // the video, consistent with the head dot (see place()).
             var n = seg.hx.length;
-            var i = Math.round(ct * seg.fps);
+            var fpsEff = (v.duration && isFinite(v.duration) && v.duration > 0)
+                ? (n / v.duration) : seg.fps;
+            var i = Math.round(ct * fpsEff);
             if (i < 0) { i = 0; }
             if (i > n - 1) { i = n - 1; }
-            var win = Math.round((windowS || 10) * seg.fps);
+            var win = Math.round((windowS || 10) * fpsEff);
             var lo = Math.max(0, i - win);
             var hgd = plotDiv('head');
             if (hgd && Plotly) {
@@ -1252,6 +1262,10 @@ def create_app(
         """
         function(seg) {
             window.__seg = seg;
+            // Head plot's home ranges for Plot Reset (updated once per segment).
+            if (seg && seg.head_xrange && seg.head_yrange) {
+                window.__headHome = {x: seg.head_xrange, y: seg.head_yrange};
+            }
             if (window.__headSync) { return ''; }
             window.__headSync = true;
             function pdiv(id) {
@@ -1268,9 +1282,18 @@ def create_app(
                 try {
                     var s = window.__seg;
                     if (!s || !s.hx) { return; }
-                    var i = Math.round(mt * s.fps);
+                    // Index off the VIDEO's own frame rate (frames / duration), not
+                    // the data-derived s.fps -- the latter is slightly low here and
+                    // makes the frame index drift behind the video (tens of frames
+                    // deep into an hour). n/duration ties the dot to the frame on
+                    // screen.
+                    var vid = document.getElementById('video');
+                    var n = s.hx.length;
+                    var fpsEff = (vid && vid.duration && isFinite(vid.duration)
+                        && vid.duration > 0) ? (n / vid.duration) : s.fps;
+                    var i = Math.round(mt * fpsEff);
                     if (i < 0) { i = 0; }
-                    if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                    if (i > n - 1) { i = n - 1; }
                     var hgd = pdiv('head');
                     var dot = document.getElementById('head-dot');
                     if (hgd && hgd._fullLayout && dot) {
@@ -1379,17 +1402,20 @@ def create_app(
         prevent_initial_call=False,
     )
 
-    # "Plot Reset": restore both timeseries figures to their full span (original
-    # zoom). Auto-ranging every x-axis reverts pan/zoom; y stays fixed. Clearing
-    # __xsyncKey lets the next real zoom re-sync the two figures.
+    # "Plot Reset": restore the timeseries figures to their full span (auto-range
+    # x; y stays fixed) AND the head plot to its home view. Clearing __xsyncKey
+    # lets the next real zoom re-sync the two timeseries figures.
     app.clientside_callback(
         """
         function(n) {
             if (!n) return '';
-            ['ts-top', 'ts-bottom'].forEach(function (id) {
+            function gdOf(id) {
                 var el = document.getElementById(id);
-                var gd = el && (el.classList.contains('js-plotly-plot')
+                return el && (el.classList.contains('js-plotly-plot')
                     ? el : el.querySelector('.js-plotly-plot'));
+            }
+            ['ts-top', 'ts-bottom'].forEach(function (id) {
+                var gd = gdOf(id);
                 if (gd && window.Plotly && gd.layout) {
                     var upd = {};
                     ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(function (ax) {
@@ -1398,6 +1424,22 @@ def create_app(
                     try { window.Plotly.relayout(gd, upd); } catch (e) {}
                 }
             });
+            // Head plot: restore the tight home ranges captured on load (its axes
+            // aren't auto-ranged, so re-apply the exact original range).
+            var hgd = gdOf('head');
+            if (hgd && window.Plotly) {
+                var home = window.__headHome;
+                try {
+                    if (home && home.x && home.y) {
+                        window.Plotly.relayout(hgd, {
+                            'xaxis.range': home.x, 'yaxis.range': home.y,
+                        });
+                    } else {
+                        window.Plotly.relayout(hgd,
+                            {'xaxis.autorange': true, 'yaxis.autorange': true});
+                    }
+                } catch (e) {}
+            }
             window.__xsyncKey = null;
             return '';
         }
@@ -1406,6 +1448,7 @@ def create_app(
         Input("plot-reset", "n_clicks"),
         prevent_initial_call=True,
     )
+
 
     # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
     # applies the same range to the other. Runs client-side so it's instant and
