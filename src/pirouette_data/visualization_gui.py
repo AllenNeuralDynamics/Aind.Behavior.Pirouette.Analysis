@@ -1062,12 +1062,25 @@ def create_app(
                     ? el : el.querySelector('.js-plotly-plot'));
             }
 
+            // Current frame index off the video's own frame rate (as in place()).
+            // Reference this frame's ACTUAL timestamp for the cursor + info, not a
+            // linear startMs+ct*1000 -- the video duration is slightly longer than
+            // the data span, so linear time drifts ahead of the data samples (and
+            // the head dot) over the hour.
+            var nFrames = seg.hx.length;
+            var fpsEff = (v.duration && isFinite(v.duration) && v.duration > 0)
+                ? (nFrames / v.duration) : seg.fps;
+            var curIdx = Math.round(ct * fpsEff);
+            if (curIdx < 0) { curIdx = 0; }
+            if (curIdx > nFrames - 1) { curIdx = nFrames - 1; }
+            var frameMs = seg.startMs + (seg.ht[curIdx] - seg.ht[0]) * 1000;
+
             // Red time cursor on both timeseries figures. Plotly.relayout is too
             // heavy to run per video frame, so the cursor lives on this 40 ms loop
             // (~25 Hz, smooth enough for a vertical line); the head dot is the
             // thing that needs per-frame updates and is handled on rVFC below.
             var cursor = (typeof seg.startMs === 'number')
-                ? new Date(seg.startMs + ct * 1000).toISOString() : null;
+                ? new Date(frameMs).toISOString() : null;
             if (Plotly && cursor) {
                 ['ts-top', 'ts-bottom'].forEach(function (gid) {
                     var gd = plotDiv(gid);
@@ -1107,7 +1120,7 @@ def create_app(
                     var r0 = _toMs(tg._fullLayout.xaxis.range[0]);
                     var r1 = _toMs(tg._fullLayout.xaxis.range[1]);
                     var W = r1 - r0;
-                    var curMs = seg.startMs + ct * 1000;
+                    var curMs = frameMs;  // same frame-accurate time as the cursor
                     var outOfView = curMs < r0 || curMs > r1;
                     var pastMid = curMs > r0 + 0.5 * W;
                     // Re-centre immediately if the cursor would leave the window;
@@ -1142,15 +1155,10 @@ def create_app(
                 }
             }
 
-            // Head-position trail + current marker (windowed). Use the video's own
-            // frame rate (n/duration) for indexing so the trail + info frame match
-            // the video, consistent with the head dot (see place()).
-            var n = seg.hx.length;
-            var fpsEff = (v.duration && isFinite(v.duration) && v.duration > 0)
-                ? (n / v.duration) : seg.fps;
-            var i = Math.round(ct * fpsEff);
-            if (i < 0) { i = 0; }
-            if (i > n - 1) { i = n - 1; }
+            // Head-position trail + current marker (windowed), using the shared
+            // frame index (video frame rate) computed above.
+            var n = nFrames;
+            var i = curIdx;
             var win = Math.round((windowS || 10) * fpsEff);
             var lo = Math.max(0, i - win);
             var hgd = plotDiv('head');
@@ -1170,11 +1178,11 @@ def create_app(
                         var xs = [], ys = [], color = [];
                         for (var j = lo; j <= i; j += step) {
                             xs.push(seg.hx[j]); ys.push(seg.hy[j]);
-                            color.push(seg.startMs + (j / seg.fps) * 1000);
+                            color.push(seg.startMs + (seg.ht[j] - seg.ht[0]) * 1000);
                         }
                         if ((i - lo) % step !== 0) {  // always include current point
                             xs.push(seg.hx[i]); ys.push(seg.hy[i]);
-                            color.push(seg.startMs + (i / seg.fps) * 1000);
+                            color.push(seg.startMs + (seg.ht[i] - seg.ht[0]) * 1000);
                         }
                         var cmin = color[0], cmax = color[color.length - 1];
                         if (cmax <= cmin) { cmax = cmin + 1; }
@@ -1196,8 +1204,8 @@ def create_app(
                 } catch (e) { /* not ready */ }
             }
 
-            // Frame info (client-side; startMs is Pacific wall-clock).
-            var wall = new Date(seg.startMs + ct * 1000).toISOString()
+            // Frame info (client-side; frameMs is the current frame's wall-clock).
+            var wall = new Date(frameMs).toISOString()
                 .replace('T', ' ').replace('Z', '');
             var row = seg.base + i;
             var tss = seg.ht[i];
