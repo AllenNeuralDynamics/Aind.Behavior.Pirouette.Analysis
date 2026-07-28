@@ -597,6 +597,9 @@ def build_head_position(
                 x=[head_x[current_row]], y=[head_y[current_row]], mode="markers",
                 marker=dict(size=12, color=CURSOR_COLOR, line=dict(color="white", width=1)),
                 name="current", hoverinfo="skip",
+                # Hidden: the live current-position dot is a DOM overlay (#head-dot)
+                # moved by CSS transform each frame, which the video can't outrun.
+                opacity=0,
             )
         )
 
@@ -815,7 +818,25 @@ def create_app(
     right = html.Div(
         [
             dcc.Graph(id="ts-top", config=graph_config),
-            dcc.Graph(id="head", config=graph_config),
+            # The head graph is wrapped so a lightweight DOM dot can be overlaid on
+            # it: the current-position marker is moved by a CSS transform (GPU
+            # compositor) every animation frame, which tracks the video with no lag
+            # -- Plotly.restyle can't keep up at high playback speed.
+            html.Div(
+                [
+                    dcc.Graph(id="head", config=graph_config),
+                    html.Div(id="head-dot", style={
+                        "position": "absolute", "left": "0", "top": "0",
+                        "boxSizing": "border-box",
+                        "width": "13px", "height": "13px", "borderRadius": "50%",
+                        "background": CURSOR_COLOR, "border": "1.5px solid white",
+                        "boxShadow": "0 0 3px rgba(0,0,0,0.6)",
+                        "transform": "translate(-100px,-100px)",
+                        "pointerEvents": "none", "display": "none", "zIndex": "10",
+                    }),
+                ],
+                style={"position": "relative"},
+            ),
             dcc.Graph(id="ts-bottom", config=graph_config),
         ],
         style={"flex": "1", "padding": "8px"},
@@ -1235,12 +1256,24 @@ def create_app(
                             var i = Math.round(ct * s.fps);
                             if (i < 0) { i = 0; }
                             if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                            // Move the DOM overlay dot to the current head position
+                            // via a CSS transform (compositor-only; no Plotly redraw,
+                            // so it never lags the video). Convert data -> pixels with
+                            // the head axes' offset/length/range.
                             var hgd = pdiv('head');
-                            if (hgd) {
-                                try {
-                                    P.restyle(hgd,
-                                        {x: [[s.hx[i]]], y: [[s.hy[i]]]}, [1]);
-                                } catch (e) {}
+                            var dot = document.getElementById('head-dot');
+                            if (hgd && hgd._fullLayout && dot) {
+                                var xa = hgd._fullLayout.xaxis;
+                                var ya = hgd._fullLayout.yaxis;
+                                if (xa && ya && xa._length && ya._length) {
+                                    var px = xa._offset + (s.hx[i] - xa.range[0])
+                                        / (xa.range[1] - xa.range[0]) * xa._length;
+                                    var py = ya._offset + (ya.range[1] - s.hy[i])
+                                        / (ya.range[1] - ya.range[0]) * ya._length;
+                                    dot.style.transform = 'translate('
+                                        + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
+                                    dot.style.display = 'block';
+                                }
                             }
                             if (typeof s.startMs === 'number') {
                                 var cur = new Date(s.startMs + ct * 1000)
