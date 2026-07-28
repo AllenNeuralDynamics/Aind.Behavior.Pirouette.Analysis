@@ -1073,7 +1073,10 @@ def create_app(
             var curIdx = Math.round(ct * fpsEff);
             if (curIdx < 0) { curIdx = 0; }
             if (curIdx > nFrames - 1) { curIdx = nFrames - 1; }
-            var frameMs = seg.startMs + (seg.ht[curIdx] - seg.ht[0]) * 1000;
+            // frameT = current frame's time from segment start in the DATA timeline
+            // (what segspikes are referenced to); frameMs = its wall-clock ms.
+            var frameT = seg.ht[curIdx] - seg.ht[0];
+            var frameMs = seg.startMs + frameT * 1000;
 
             // Red time cursor on both timeseries figures. Plotly.relayout is too
             // heavy to run per video frame, so the cursor lives on this 40 ms loop
@@ -1229,23 +1232,26 @@ def create_app(
                 window.__lastTickPerf = nowP;
                 realDt = Math.min(Math.max(realDt, 5), 500) / 1000;  // seconds
                 var prev = window.__lastSpikeCt;
-                // Play only for a forward advance consistent with playback (not a
-                // seek). 8 s covers even 10x with laggy ticks; seeks are larger.
-                if (prev !== undefined && ct > prev && (ct - prev) <= 8.0) {
+                // Compare against the frame's DATA-timeline time (same reference as
+                // segspikes), not the linear video time, so pops fire exactly when
+                // the cursor crosses each spike. Forward-advance only (not a seek);
+                // 8 s covers even 10x with laggy ticks, seeks are larger.
+                if (prev !== undefined && frameT > prev && (frameT - prev) <= 8.0) {
                     var a = 0, b = segspikes.length;
                     while (a < b) {  // first index with segspikes[idx] > prev
                         var mm = (a + b) >> 1;
                         if (segspikes[mm] <= prev) a = mm + 1; else b = mm;
                     }
-                    var span = ct - prev, base = actx.currentTime, cnt = 0;
-                    for (var si = a; si < segspikes.length && segspikes[si] <= ct; si++) {
+                    var span = frameT - prev, base = actx.currentTime, cnt = 0;
+                    for (var si = a; si < segspikes.length && segspikes[si] <= frameT;
+                         si++) {
                         if (cnt >= 60) break;  // avoid extreme bursts
                         var frac = span > 0 ? (segspikes[si] - prev) / span : 0;
                         window.__pop(actx, base + frac * realDt);
                         cnt++;
                     }
                 }
-                window.__lastSpikeCt = ct;
+                window.__lastSpikeCt = frameT;
             }
             return [clearSeek, info];
         }
