@@ -785,6 +785,15 @@ def create_app(
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
             html.Div([
+                html.Label("Head sync (frames)", style={"marginRight": "8px"}),
+                dcc.Input(id="head-sync-frames", type="number", value=0, step=1,
+                          style={"width": "70px"}),
+                html.Span(" +/- shifts the red dot vs. the video to correct any "
+                          "residual offset", style={"fontSize": "11px",
+                                                     "color": "#666",
+                                                     "marginLeft": "6px"}),
+            ], style={"paddingTop": "8px"}),
+            html.Div([
                 dcc.Checklist(
                     id="listen",
                     options=[{"label": " 🔊 listen to spikes", "value": "on"}],
@@ -811,6 +820,7 @@ def create_app(
             html.Div(id="_dummy5", style={"display": "none"}),
             html.Div(id="_dummy6", style={"display": "none"}),
             html.Div(id="_dummy7", style={"display": "none"}),
+            html.Div(id="_dummy8", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -1228,74 +1238,88 @@ def create_app(
     )
 
     # Mirror the per-segment head data to a window global (once per segment, not
-    # marshalled every tick) and start a requestAnimationFrame loop that drives the
-    # two things that must be frame-accurate with the video: the current head
-    # marker and the red time cursor. rAF fires right before each repaint (~60 Hz)
-    # and reads a fresh currentTime, so these stay locked to the video at any
-    # playback speed -- independent of the 40 ms Dash Interval.
+    # marshalled every tick) and drive the two things that must match the video
+    # frame exactly -- the current head dot and the red time cursor.
+    #
+    # Time source matters: video.currentTime (the media clock) does NOT correspond
+    # to the frame the compositor is actually showing -- they differ by a few
+    # frames, which reads as a constant lag. requestVideoFrameCallback fires once
+    # per *presented* frame and gives that frame's exact mediaTime, so the dot is
+    # placed for the frame literally on screen. rAF+currentTime is the fallback for
+    # browsers without rVFC.
     app.clientside_callback(
         """
         function(seg) {
             window.__seg = seg;
-            if (window.__headRaf) { return ''; }
-            window.__headRaf = true;
+            if (window.__headSync) { return ''; }
+            window.__headSync = true;
             function pdiv(id) {
                 var el = document.getElementById(id);
                 return el && (el.classList.contains('js-plotly-plot')
                     ? el : el.querySelector('.js-plotly-plot'));
             }
-            function frame() {
+            // Position the dot + cursor for a media time `mt` (seconds).
+            function place(mt) {
                 try {
-                    var v = document.getElementById('video');
                     var s = window.__seg;
                     var P = window.Plotly;
-                    if (v && s && s.hx && P) {
-                        var ct = v.currentTime || 0;
-                        if (ct !== window.__rafCt) {
-                            window.__rafCt = ct;
-                            var i = Math.round(ct * s.fps);
-                            if (i < 0) { i = 0; }
-                            if (i > s.hx.length - 1) { i = s.hx.length - 1; }
-                            // Move the DOM overlay dot to the current head position
-                            // via a CSS transform (compositor-only; no Plotly redraw,
-                            // so it never lags the video). Convert data -> pixels with
-                            // the head axes' offset/length/range.
-                            var hgd = pdiv('head');
-                            var dot = document.getElementById('head-dot');
-                            if (hgd && hgd._fullLayout && dot) {
-                                var xa = hgd._fullLayout.xaxis;
-                                var ya = hgd._fullLayout.yaxis;
-                                if (xa && ya && xa._length && ya._length) {
-                                    var px = xa._offset + (s.hx[i] - xa.range[0])
-                                        / (xa.range[1] - xa.range[0]) * xa._length;
-                                    var py = ya._offset + (ya.range[1] - s.hy[i])
-                                        / (ya.range[1] - ya.range[0]) * ya._length;
-                                    dot.style.transform = 'translate('
-                                        + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
-                                    dot.style.display = 'block';
-                                }
-                            }
-                            if (typeof s.startMs === 'number') {
-                                var cur = new Date(s.startMs + ct * 1000)
-                                    .toISOString();
-                                ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                                    var gd = pdiv(gid);
-                                    if (gd) {
-                                        try {
-                                            P.relayout(gd, {
-                                                'shapes[0].x0': cur,
-                                                'shapes[0].x1': cur,
-                                            });
-                                        } catch (e) {}
-                                    }
-                                });
-                            }
+                    if (!s || !s.hx || !P) { return; }
+                    var i = Math.round(mt * s.fps) + (window.__headOffset || 0);
+                    if (i < 0) { i = 0; }
+                    if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                    var hgd = pdiv('head');
+                    var dot = document.getElementById('head-dot');
+                    if (hgd && hgd._fullLayout && dot) {
+                        var xa = hgd._fullLayout.xaxis;
+                        var ya = hgd._fullLayout.yaxis;
+                        if (xa && ya && xa._length && ya._length) {
+                            var px = xa._offset + (s.hx[i] - xa.range[0])
+                                / (xa.range[1] - xa.range[0]) * xa._length;
+                            var py = ya._offset + (ya.range[1] - s.hy[i])
+                                / (ya.range[1] - ya.range[0]) * ya._length;
+                            dot.style.transform = 'translate('
+                                + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
+                            dot.style.display = 'block';
                         }
                     }
+                    if (typeof s.startMs === 'number') {
+                        var cur = new Date(s.startMs + mt * 1000).toISOString();
+                        ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                            var gd = pdiv(gid);
+                            if (gd) {
+                                try {
+                                    P.relayout(gd, {
+                                        'shapes[0].x0': cur, 'shapes[0].x1': cur,
+                                    });
+                                } catch (e) {}
+                            }
+                        });
+                    }
                 } catch (e) {}
-                window.requestAnimationFrame(frame);
             }
-            window.requestAnimationFrame(frame);
+            var v = document.getElementById('video');
+            if (v && typeof v.requestVideoFrameCallback === 'function') {
+                // Frame-accurate: metadata.mediaTime is the presentation time of
+                // the frame now on screen. Fires per presented frame (and once
+                // after any seek/pause), so the dot tracks the visible frame.
+                var vcb = function (now, metadata) {
+                    place(metadata.mediaTime);
+                    var vid = document.getElementById('video');
+                    if (vid) { vid.requestVideoFrameCallback(vcb); }
+                };
+                v.requestVideoFrameCallback(vcb);
+            } else {
+                // Fallback: rAF reading currentTime (a few browsers lack rVFC).
+                var raf = function () {
+                    var vid = document.getElementById('video');
+                    if (vid) {
+                        var t = vid.currentTime || 0;
+                        if (t !== window.__rafCt) { window.__rafCt = t; place(t); }
+                    }
+                    window.requestAnimationFrame(raf);
+                };
+                window.requestAnimationFrame(raf);
+            }
             return '';
         }
         """,
@@ -1361,6 +1385,15 @@ def create_app(
         "function(g){ window.__audioGain = (g == null) ? 0.35 : g; return ''; }",
         Output("_dummy5", "children"),
         Input("gain", "value"),
+        prevent_initial_call=False,
+    )
+
+    # Head-sync frame offset -> shift the red dot vs. the video (default 0).
+    app.clientside_callback(
+        "function(n){ window.__headOffset = (n == null) ? 0 : Math.round(n); "
+        "return ''; }",
+        Output("_dummy8", "children"),
+        Input("head-sync-frames", "value"),
         prevent_initial_call=False,
     )
 
