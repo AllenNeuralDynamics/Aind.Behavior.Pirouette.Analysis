@@ -785,15 +785,6 @@ def create_app(
                            marks={1: "1", 30: "30", 60: "60", 120: "120"}),
             ], style={"paddingTop": "10px"}),
             html.Div([
-                html.Label("Head sync (frames)", style={"marginRight": "8px"}),
-                dcc.Input(id="head-sync-frames", type="number", value=0, step=1,
-                          style={"width": "70px"}),
-                html.Span(" +/- shifts the red dot vs. the video to correct any "
-                          "residual offset", style={"fontSize": "11px",
-                                                     "color": "#666",
-                                                     "marginLeft": "6px"}),
-            ], style={"paddingTop": "8px"}),
-            html.Div([
                 dcc.Checklist(
                     id="listen",
                     options=[{"label": " 🔊 listen to spikes", "value": "on"}],
@@ -820,7 +811,6 @@ def create_app(
             html.Div(id="_dummy5", style={"display": "none"}),
             html.Div(id="_dummy6", style={"display": "none"}),
             html.Div(id="_dummy7", style={"display": "none"}),
-            html.Div(id="_dummy8", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px"},
     )
@@ -1066,9 +1056,24 @@ def create_app(
                     ? el : el.querySelector('.js-plotly-plot'));
             }
 
-            // (The red cursor + current head marker are driven on
-            // requestAnimationFrame for frame-accurate video sync -- see the
-            // rAF loop below; this 40 ms loop handles the heavier work.)
+            // Red time cursor on both timeseries figures. Plotly.relayout is too
+            // heavy to run per video frame, so the cursor lives on this 40 ms loop
+            // (~25 Hz, smooth enough for a vertical line); the head dot is the
+            // thing that needs per-frame updates and is handled on rVFC below.
+            var cursor = (typeof seg.startMs === 'number')
+                ? new Date(seg.startMs + ct * 1000).toISOString() : null;
+            if (Plotly && cursor) {
+                ['ts-top', 'ts-bottom'].forEach(function (gid) {
+                    var gd = plotDiv(gid);
+                    if (gd) {
+                        try {
+                            Plotly.relayout(gd, {
+                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
+                            });
+                        } catch (e) { /* not ready */ }
+                    }
+                });
+            }
 
             // Auto-follow: when zoomed in, keep the cursor in view by centring the
             // (fixed-width) window on it once it passes the middle. Only while the
@@ -1238,15 +1243,11 @@ def create_app(
     )
 
     # Mirror the per-segment head data to a window global (once per segment, not
-    # marshalled every tick) and drive the two things that must match the video
-    # frame exactly -- the current head dot and the red time cursor.
-    #
-    # Time source matters: video.currentTime (the media clock) does NOT correspond
-    # to the frame the compositor is actually showing -- they differ by a few
-    # frames, which reads as a constant lag. requestVideoFrameCallback fires once
-    # per *presented* frame and gives that frame's exact mediaTime, so the dot is
-    # placed for the frame literally on screen. rAF+currentTime is the fallback for
-    # browsers without rVFC.
+    # marshalled every tick) and drive the current head dot -- the one thing that
+    # must update every video frame -- from a per-frame callback. Moving the dot is
+    # a single CSS transform, so it keeps full frame rate without falling behind
+    # (the heavier Plotly cursor/trail live on the 40 ms loop). rVFC fires once per
+    # *presented* frame (fresh mediaTime); rAF+currentTime is the fallback.
     app.clientside_callback(
         """
         function(seg) {
@@ -1258,13 +1259,16 @@ def create_app(
                 return el && (el.classList.contains('js-plotly-plot')
                     ? el : el.querySelector('.js-plotly-plot'));
             }
-            // Position the dot + cursor for a media time `mt` (seconds).
+            // Move ONLY the head dot for a media time `mt` (seconds). This is a
+            // single CSS transform (compositor-only, no Plotly redraw), so it can
+            // run for every presented video frame without falling behind. The
+            // timeseries cursor is a Plotly shape moved on the slower 40 ms loop --
+            // relayout is too heavy to call per frame and would starve this update.
             function place(mt) {
                 try {
                     var s = window.__seg;
-                    var P = window.Plotly;
-                    if (!s || !s.hx || !P) { return; }
-                    var i = Math.round(mt * s.fps) + (window.__headOffset || 0);
+                    if (!s || !s.hx) { return; }
+                    var i = Math.round(mt * s.fps);
                     if (i < 0) { i = 0; }
                     if (i > s.hx.length - 1) { i = s.hx.length - 1; }
                     var hgd = pdiv('head');
@@ -1281,19 +1285,6 @@ def create_app(
                                 + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
                             dot.style.display = 'block';
                         }
-                    }
-                    if (typeof s.startMs === 'number') {
-                        var cur = new Date(s.startMs + mt * 1000).toISOString();
-                        ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                            var gd = pdiv(gid);
-                            if (gd) {
-                                try {
-                                    P.relayout(gd, {
-                                        'shapes[0].x0': cur, 'shapes[0].x1': cur,
-                                    });
-                                } catch (e) {}
-                            }
-                        });
                     }
                 } catch (e) {}
             }
@@ -1385,15 +1376,6 @@ def create_app(
         "function(g){ window.__audioGain = (g == null) ? 0.35 : g; return ''; }",
         Output("_dummy5", "children"),
         Input("gain", "value"),
-        prevent_initial_call=False,
-    )
-
-    # Head-sync frame offset -> shift the red dot vs. the video (default 0).
-    app.clientside_callback(
-        "function(n){ window.__headOffset = (n == null) ? 0 : Math.round(n); "
-        "return ''; }",
-        Output("_dummy8", "children"),
-        Input("head-sync-frames", "value"),
         prevent_initial_call=False,
     )
 
