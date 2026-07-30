@@ -458,6 +458,7 @@ class AppState:
     segtable: list | None = None  # (name, base, n, fps) per segment, computed once
     autoselect_unit: object = None  # unit _load just auto-picked (consumed once)
     load_status_msg: str = ""  # last dataset "Loaded …" summary, to re-show
+    load_counter: int = 0  # nonce so the load-info store always changes
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
         """Load a dataset + units file into the state."""
@@ -939,6 +940,10 @@ def create_app(
             dcc.Store(id="segmap"),
             dcc.Store(id="seek"),
             dcc.Store(id="segspikes"),
+            # Server -> client "load finished" signal ({msg, n}); the visible
+            # status/bar are driven ONLY by client-side JS (Dash can't reliably
+            # share one output between a clientside and a server callback).
+            dcc.Store(id="load-info"),
             html.Div(id="_dummy", style={"display": "none"}),
             html.Div(id="_dummy2", style={"display": "none"}),
             html.Div(id="_dummy3", style={"display": "none"}),
@@ -946,6 +951,8 @@ def create_app(
             html.Div(id="_dummy5", style={"display": "none"}),
             html.Div(id="_dummy6", style={"display": "none"}),
             html.Div(id="_dummy7", style={"display": "none"}),
+            html.Div(id="_dummy8", style={"display": "none"}),
+            html.Div(id="_dummy9", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px",
                "overflowY": "auto", "minHeight": "0"},
@@ -1070,8 +1077,7 @@ def create_app(
         Output("frame", "value"),
         Output("frame", "marks"),
         Output("segmap", "data"),
-        Output("load-status", "children"),
-        Output("load-bar", "style"),
+        Output("load-info", "data"),
         Input("load", "n_clicks"),
         # dataset/units as Inputs -> changing either auto-loads (no Load click).
         Input("dataset", "value"),
@@ -1084,10 +1090,10 @@ def create_app(
         # configured folders (guards against anything outside those folders).
         dataset_path = resolve_in_dir(state.dataset_dir, dataset_name)
         units_path = resolve_in_dir(state.units_dir, units_name)
-        bar_hidden = {"display": "none"}
+        state.load_counter += 1
         if not dataset_path or not units_path:
             msg = "⚠ Select a dataset and a units file, then Load."
-            return (no_update,) * 10 + (msg, bar_hidden)
+            return (no_update,) * 10 + ({"msg": msg, "n": state.load_counter},)
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         top_fig = build_timeseries_top(state.df, heading_mode=state.heading_mode)
@@ -1135,8 +1141,7 @@ def create_app(
             0,
             marks,
             segmap,
-            status,
-            {"display": "none"},  # hide the loading bar
+            {"msg": status, "n": state.load_counter},
         )
 
     # The instant Load is clicked OR the dataset/units/unit is changed, flip to
@@ -1151,16 +1156,40 @@ def create_app(
             var trig = ctx && ctx.triggered && ctx.triggered[0];
             var id = (trig && trig.prop_id) ? trig.prop_id.split('.')[0] : '';
             var msg = (id === 'unit') ? '⏳ Loading unit…' : '⏳ Loading dataset…';
-            return [msg, {marginBottom: '5px'}];
+            // Write the DOM directly (the status/bar are client-owned; the server
+            // signals completion via the load-info store -> the confirm callback).
+            var s = document.getElementById('load-status');
+            if (s) { s.textContent = msg; }
+            var b = document.getElementById('load-bar');
+            if (b) { b.style.display = 'block'; }
+            return '';
         }
         """,
-        Output("load-status", "children", allow_duplicate=True),
-        Output("load-bar", "style", allow_duplicate=True),
+        Output("_dummy8", "children"),
         Input("load", "n_clicks"),
         Input("dataset", "value"),
         Input("unitsfile", "value"),
         Input("unit", "value"),
         prevent_initial_call=True,
+    )
+
+    # When a load finishes (server bumps load-info), write the confirmation text and
+    # hide the bar -- client-side, so it never conflicts with the "Loading" writer.
+    app.clientside_callback(
+        """
+        function(info) {
+            if (info && info.msg) {
+                var s = document.getElementById('load-status');
+                if (s) { s.textContent = info.msg; }
+                var b = document.getElementById('load-bar');
+                if (b) { b.style.display = 'none'; }
+            }
+            return '';
+        }
+        """,
+        Output("_dummy9", "children"),
+        Input("load-info", "data"),
+        prevent_initial_call=False,
     )
 
     def _segment_row(seg):
@@ -1829,17 +1858,19 @@ def create_app(
                 if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) s = s.replace(' ', 'T') + 'Z';
                 return new Date(s).getTime();
             }
-            document.addEventListener('click', function (evt) {
+            // Click-to-seek. We can't rely on the native 'click' event: Plotly's
+            // drag layer swaps in a full-screen "dragcover" as soon as the pointer
+            // moves even slightly, so mouseup lands on a different element and no
+            // 'click' fires (still clicks worked, moved ones didn't). Instead treat
+            // mousedown+mouseup on a plot with < 6px movement as a click; a real
+            // drag (> 6px) is left to Plotly for zoom/pan.
+            function seekFromPoint(container, clientX) {
                 try {
-                    if (evt.target.closest && evt.target.closest('.modebar')) return;
-                    var container = evt.target.closest &&
-                        evt.target.closest('#ts-top, #ts-bottom');
-                    if (!container) return;
                     var gd = container.querySelector('.js-plotly-plot');
                     if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return;
                     var xa = gd._fullLayout.xaxis;
                     var rect = gd.getBoundingClientRect();
-                    var px = evt.clientX - rect.left - xa._offset;
+                    var px = clientX - rect.left - xa._offset;
                     if (px < 0 || px > xa._length) return;
                     var r0 = toMs(xa.range[0]), r1 = toMs(xa.range[1]);
                     var ms = r0 + (px / xa._length) * (r1 - r0);
@@ -1919,6 +1950,22 @@ def create_app(
                         }
                     }
                 } catch (e) { /* ignore */ }
+            }
+            var __mdown = null;
+            document.addEventListener('mousedown', function (evt) {
+                if (evt.target.closest && evt.target.closest('.modebar')) {
+                    __mdown = null; return;
+                }
+                var c = evt.target.closest &&
+                    evt.target.closest('#ts-top, #ts-bottom');
+                __mdown = c ? {x: evt.clientX, y: evt.clientY, c: c} : null;
+            }, true);
+            document.addEventListener('mouseup', function (evt) {
+                var md = __mdown; __mdown = null;
+                if (!md) { return; }
+                if (Math.abs(evt.clientX - md.x) > 6 ||
+                    Math.abs(evt.clientY - md.y) > 6) { return; }  // drag -> zoom
+                seekFromPoint(md.c, evt.clientX);
             }, true);
 
             // Auto-advance: when an hour finishes, load the next segment and keep
@@ -1992,8 +2039,7 @@ def create_app(
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
-        Output("load-status", "children", allow_duplicate=True),
-        Output("load-bar", "style", allow_duplicate=True),
+        Output("load-info", "data", allow_duplicate=True),
         Input("unit", "value"),
         prevent_initial_call=True,
     )
@@ -2001,15 +2047,16 @@ def create_app(
         # Selecting a unit updates the spike + firing-rate plots immediately, with
         # the progress bar shown while it loads (the top/head plots stay as-is).
         if state.df is None or unit_value is None:
-            return no_update, no_update, no_update
+            return no_update, no_update
+        state.load_counter += 1
         if unit_value == state.autoselect_unit:
             # Change came from loading a dataset (auto-picked first unit); _load
-            # already built the bottom plot -- keep the dataset summary + hide bar.
+            # already built the bottom plot -- keep the dataset summary.
             state.autoselect_unit = None  # consume (real unit ids are never None)
-            return no_update, state.load_status_msg, {"display": "none"}
+            return no_update, {"msg": state.load_status_msg, "n": state.load_counter}
         state.unit_id = unit_value
         fig = _bottom_figure()
-        return fig, f"✓ Loaded unit {unit_value}", {"display": "none"}
+        return fig, {"msg": f"✓ Loaded unit {unit_value}", "n": state.load_counter}
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
