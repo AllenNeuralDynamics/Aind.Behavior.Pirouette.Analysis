@@ -2328,6 +2328,11 @@ def run(
     # switching units in the GUI is instant. Cached to a parquet next to each units
     # file; only recomputed when the file or bin/smoothing params change.
     _precompute_firing_rates(units_dir, firing_rate_bin_s, firing_rate_smooth_s)
+    if show_all_spikes:
+        print("  [note] SHOW_ALL_SPIKES=true renders EVERY spike tick -- busy units "
+              "ship tens of MB per unit switch and are slow (especially over the "
+              "public link). Set SHOW_ALL_SPIKES=false for fast switching "
+              f"({MAX_RASTER_SPIKES:,}-tick subsample, visually the same).")
 
     print("\nPirouette explorer — share one of these links:")
     print(f"  this machine : http://127.0.0.1:{port}")
