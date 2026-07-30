@@ -174,6 +174,30 @@ def test_segments_and_segment_info():
     assert fps == pytest.approx(60.0, rel=0.05)
 
 
+def test_build_segment_table_matches_segment_info():
+    n = 120
+    src = np.where(np.arange(n) < 60, "TopCamera_A", "TopCamera_B")
+    df = pd.DataFrame({
+        "source_file": src,
+        "frame": np.concatenate([np.arange(60), np.arange(60)]),
+        "time_since_start": np.arange(n) / 60.0,
+    })
+    table = viz.build_segment_table(df)
+    assert [name for name, _, _, _ in table] == ["TopCamera_A", "TopCamera_B"]
+    # Each table row must agree with the per-segment scan it replaces.
+    for name, base, count, fps in table:
+        b2, c2, f2 = viz.segment_info(df, name)
+        assert (base, count) == (b2, c2)
+        assert fps == pytest.approx(f2, rel=1e-6)
+
+
+def test_gui_columns_includes_essentials():
+    cols = viz.gui_columns()
+    for c in ("datetime_pacific", "time_since_start", "source_file", "behavior",
+              "left_ear_x_mm", "right_ear_y_mm", "ul_champber_x_mm"):
+        assert c in cols
+
+
 # ---------------------------------------------------------------------------
 # figure builders (need plotly) + frame encoding
 # ---------------------------------------------------------------------------

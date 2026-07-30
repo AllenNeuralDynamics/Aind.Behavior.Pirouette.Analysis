@@ -55,13 +55,16 @@ MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
 # ---------------------------------------------------------------------------
 # Data layer (no Dash dependency — unit tested)
 # ---------------------------------------------------------------------------
-def load_dataset(path: str | Path) -> pd.DataFrame:
+def load_dataset(path: str | Path, columns: list[str] | None = None) -> pd.DataFrame:
     """Load a per-frame dataset from ``.parquet``, ``.pkl``, or ``.csv``.
 
     Parameters
     ----------
     path:
         Dataset file path.
+    columns:
+        If given, load only these columns (intersected with those present) for
+        ``.parquet``/``.csv``. ``.pkl`` always loads in full.
 
     Returns
     -------
@@ -76,11 +79,28 @@ def load_dataset(path: str | Path) -> pd.DataFrame:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".parquet":
-        df = pd.read_parquet(path)
+        # Read only the columns the GUI needs -- these datasets are wide (45 cols,
+        # GBs); selecting ~20 columns roughly halves read time and memory.
+        if columns is not None:
+            import pyarrow.parquet as pq
+
+            available = set(pq.ParquetFile(path).schema.names)
+            use = [c for c in columns if c in available]
+            df = pd.read_parquet(path, columns=use or None)
+        else:
+            df = pd.read_parquet(path)
     elif suffix == ".pkl":
-        df = pd.read_pickle(path)
+        df = pd.read_pickle(path)  # pickled frames can't be column-filtered cheaply
     elif suffix == ".csv":
-        df = pd.read_csv(path)
+        if columns is not None:
+            import csv as _csv
+
+            with open(path, newline="") as fh:
+                header = next(_csv.reader(fh))
+            use = [c for c in columns if c in header]
+            df = pd.read_csv(path, usecols=use or None)
+        else:
+            df = pd.read_csv(path)
     else:
         raise ValueError(f"Unsupported dataset format: {suffix} ({path})")
 
@@ -226,6 +246,17 @@ def behavior_bouts(df: pd.DataFrame) -> list[tuple[pd.Timestamp, pd.Timestamp, s
 CHAMBER_CORNERS = ["ul_champber", "ur_champber", "lr_chamber", "ll_chamber"]
 
 
+def gui_columns() -> list[str]:
+    """Columns the GUI actually reads -- used to load wide datasets faster."""
+    cols = [COL_TIME, COL_DATETIME, COL_SOURCE, COL_FRAME, COL_BEHAVIOR,
+            COL_VELOCITY, COL_EAR_HEADING, COL_COMM_HEADING]
+    for ear in (LEFT_EAR, RIGHT_EAR):
+        cols += [f"{ear}_x_mm", f"{ear}_y_mm"]
+    for corner in CHAMBER_CORNERS:
+        cols += [f"{corner}_x_mm", f"{corner}_y_mm"]
+    return cols
+
+
 def chamber_corners_mm(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
     """Median (x, y) mm position of each chamber corner (empty if columns absent)."""
     corners: dict[str, tuple[float, float]] = {}
@@ -283,6 +314,31 @@ def segment_info(df: pd.DataFrame, source_file: str) -> tuple[int, int, float]:
     else:
         fps = 60.0
     return base, n, fps
+
+
+def build_segment_table(df: pd.DataFrame) -> list[tuple[str, int, int, float]]:
+    """Ordered ``(name, base_row, n_frames, fps)`` per segment, in ONE pass.
+
+    Segments are contiguous blocks of ``source_file``; computing them all at once
+    avoids rescanning the (multi-million-row) source column once per segment,
+    which dominated load time on large datasets.
+    """
+    src = df[COL_SOURCE].to_numpy()
+    t = df[COL_TIME].to_numpy(dtype="float64")
+    codes = pd.factorize(df[COL_SOURCE], sort=False)[0]  # int codes: fast compare
+    change = np.flatnonzero(codes[1:] != codes[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [len(df)]))
+    table: list[tuple[str, int, int, float]] = []
+    for a, b in zip(starts, ends):
+        n = int(b - a)
+        if n > 1:
+            dt = float(np.median(np.diff(t[a:b])))
+            fps = 1.0 / dt if dt > 0 else 60.0
+        else:
+            fps = 60.0
+        table.append((str(src[a]), int(a), n, fps))
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +435,11 @@ class AppState:
     chamber: dict | None = None
     unit_id: object = None
     bottom_cache: dict = field(default_factory=dict)
+    segtable: list | None = None  # (name, base, n, fps) per segment, computed once
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
         """Load a dataset + units file into the state."""
-        self.df = load_dataset(dataset_path)
+        self.df = load_dataset(dataset_path, columns=gui_columns())
         self.units = load_units(units_path)
         self.spike_offset_s = float(offset_s)
         self.exp_start_dt = experiment_start_datetime(self.df)
@@ -395,6 +452,7 @@ class AppState:
         self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
         self.bottom_cache = {}
+        self.segtable = build_segment_table(self.df)  # one pass, reused everywhere
         return self
 
 
@@ -493,7 +551,7 @@ def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
     fig.update_yaxes(fixedrange=True)
     fig.update_annotations(font_size=12)  # subplot titles hold the labels
     fig.update_layout(
-        height=460, margin=dict(l=55, r=25, t=30, b=20),
+        autosize=True, margin=dict(l=55, r=25, t=30, b=20),
         showlegend=False, template="plotly_white", uirevision="ts-top",
     )
     return fig
@@ -539,7 +597,7 @@ def build_timeseries_bottom(
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
-        height=320, margin=dict(l=55, r=25, t=30, b=20), showlegend=False,
+        autosize=True, margin=dict(l=55, r=25, t=30, b=20), showlegend=False,
         template="plotly_white", uirevision=f"ts-bottom-{unit_label}",
     )
     return fig
@@ -628,7 +686,7 @@ def build_head_position(
         fig.update_yaxes(autorange="reversed")
 
     fig.update_layout(
-        height=480, margin=dict(l=55, r=20, t=30, b=20), showlegend=False,
+        autosize=True, margin=dict(l=55, r=20, t=30, b=20), showlegend=False,
         template="plotly_white", title="head position (mm), time-coloured",
         uirevision="head",
     )
@@ -750,7 +808,12 @@ def create_app(
                "padding": "8px"},
     )
 
-    graph_config = {"scrollZoom": True, "displaylogo": False}
+    # responsive: figures fill their (viewport-relative) containers and refit on
+    # window resize, so the GUI auto-sizes to whatever screen it's shown on.
+    graph_config = {"scrollZoom": True, "displaylogo": False, "responsive": True}
+    ts_top_style = {"height": "34vh", "minHeight": "220px"}
+    head_style = {"height": "32vh", "minHeight": "220px"}
+    ts_bot_style = {"height": "26vh", "minHeight": "180px"}
 
     # Equal-width columns: the video and the plots share the same horizontal
     # extent. The video sizes naturally to that width (no letterbox); the plots
@@ -760,7 +823,8 @@ def create_app(
             # Native HTML5 player: smooth, browser-buffered playback + scrubbing.
             html.Video(
                 id="video", controls=True, autoPlay=False,
-                style={"width": "100%", "border": "1px solid #ccc", "background": "#000"},
+                style={"width": "100%", "maxHeight": "55vh", "objectFit": "contain",
+                       "border": "1px solid #ccc", "background": "#000"},
             ),
             html.Div(id="frame-info",
                      style={"fontFamily": "monospace", "padding": "6px 0",
@@ -822,7 +886,7 @@ def create_app(
         [
             html.Div(
                 [
-                    dcc.Graph(id="ts-top", config=graph_config),
+                    dcc.Graph(id="ts-top", config=graph_config, style=ts_top_style),
                     html.Div(id="cursor-top", style={
                         "position": "absolute", "left": "0", "top": "0",
                         "width": "2px", "height": "100%", "background": CURSOR_COLOR,
@@ -838,7 +902,7 @@ def create_app(
             # -- Plotly.restyle can't keep up at high playback speed.
             html.Div(
                 [
-                    dcc.Graph(id="head", config=graph_config),
+                    dcc.Graph(id="head", config=graph_config, style=head_style),
                     html.Div(id="head-dot", style={
                         "position": "absolute", "left": "0", "top": "0",
                         "boxSizing": "border-box",
@@ -853,7 +917,7 @@ def create_app(
             ),
             html.Div(
                 [
-                    dcc.Graph(id="ts-bottom", config=graph_config),
+                    dcc.Graph(id="ts-bottom", config=graph_config, style=ts_bot_style),
                     html.Div(id="cursor-bot", style={
                         "position": "absolute", "left": "0", "top": "0",
                         "width": "2px", "height": "100%", "background": CURSOR_COLOR,
@@ -941,17 +1005,25 @@ def create_app(
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         top_fig = build_timeseries_top(state.df, heading_mode=state.heading_mode)
-        segs = segments(state.df)
-        # Slider marks at each segment start (Pacific hour), and a global map of
-        # row -> (segment, fps, start time) so the slider can move the cursor and
-        # seek the right video entirely client-side.
-        marks = {}
+        # Use the precomputed segment table (one pass) instead of rescanning the
+        # source column per segment. Global map: row -> (segment, fps, start time)
+        # so the slider can move the cursor + seek the right video client-side.
+        table = state.segtable or build_segment_table(state.df)
+        dt_col = state.df[COL_DATETIME]
         segmap = []
-        for s in segs:
-            base, n, fps = segment_info(state.df, s)
-            marks[int(base)] = pd.Timestamp(state.df[COL_DATETIME].iloc[base]).strftime("%H:%M")
-            start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
-            segmap.append({"name": s, "base": base, "n": n, "fps": fps, "startMs": start_ms})
+        for name, base, n, fps in table:
+            start_ms = int(dt_col.iloc[base].tz_localize(None).value // 1_000_000)
+            segmap.append({"name": name, "base": base, "n": n, "fps": fps,
+                           "startMs": start_ms})
+        # Thin the tick labels so they never overlap: show at most ~MAX marks,
+        # spaced evenly across the segments (scales with dataset size).
+        MAX_MARKS = 8
+        stepm = max(1, -(-len(table) // MAX_MARKS))  # ceil(len/MAX)
+        marks = {
+            int(base): pd.Timestamp(dt_col.iloc[base]).strftime("%H:%M")
+            for i, (name, base, n, fps) in enumerate(table) if i % stepm == 0
+        }
+        segs = [name for name, _, _, _ in table]
         return (
             top_fig,
             _bottom_figure(),
@@ -965,8 +1037,27 @@ def create_app(
             segmap,
         )
 
+    def _segment_row(seg):
+        """(base, n, fps) for a segment from the cached table (O(1)-ish)."""
+        for name, base, n, fps in (state.segtable or []):
+            if name == seg:
+                return base, n, fps
+        return segment_info(state.df, seg)  # fallback
+
     @app.callback(
         Output("video", "src"),
+        Input("segment", "value"),
+        prevent_initial_call=True,
+    )
+    def _load_video(seg):
+        # Tiny, instant response: point the <video> at the chosen hour so it starts
+        # loading immediately, WITHOUT waiting on the multi-MB head-data payload
+        # (which ships from the separate callback below).
+        if not seg:
+            return no_update
+        return f"/pirouette-video/{seg}.mp4"
+
+    @app.callback(
         Output("seg", "data"),
         Output("head", "figure"),
         Input("segment", "value"),
@@ -974,19 +1065,20 @@ def create_app(
         prevent_initial_call=True,
     )
     def _load_segment(seg, window_s):
-        # Point the <video> at the chosen hour, ship this segment's head-position
-        # data to the browser (so the head plot can update client-side during
-        # playback), and build the initial head figure.
+        # Ship this segment's head-position data to the browser (so the head plot +
+        # dot update client-side during playback) and build the initial head figure.
         if state.df is None or not seg:
-            return no_update, no_update, no_update
-        base, n, fps = segment_info(state.df, seg)
+            return no_update, no_update
+        base, n, fps = _segment_row(seg)
         # tz-naive wall-clock ms so the client-side cursor aligns with the axis.
         start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
         sl = slice(base, base + n)
         seg_store = {
             "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
-            "hx": np.round(state.head_x[sl], 2).tolist(),
-            "hy": np.round(state.head_y[sl], 2).tolist(),
+            # 0.1 mm precision is plenty for the trail and roughly halves the
+            # payload vs 2 decimals (this ships on every segment switch).
+            "hx": np.round(state.head_x[sl], 1).tolist(),
+            "hy": np.round(state.head_y[sl], 1).tolist(),
             "ht": np.round(state.head_t[sl], 3).tolist(),
         }
         head_fig = build_head_position(
@@ -999,7 +1091,7 @@ def create_app(
         hy_rng = head_fig.layout.yaxis.range
         seg_store["head_xrange"] = list(hx_rng) if hx_rng else None
         seg_store["head_yrange"] = list(hy_rng) if hy_rng else None
-        return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
+        return seg_store, head_fig
 
     # Slider drag -> move the red cursor live (client-side, in sync with the
     # handle) and seek the video. Within the current hour the seek is client-side
