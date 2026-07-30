@@ -32,6 +32,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import ephys
+
+# Firing rate lives in the ephys module now; re-exported for backwards-compat.
+from .ephys import instantaneous_firing_rate
+
 # --- Column names produced by the build pipeline ---
 COL_TIME = "time_since_start"
 COL_DATETIME = "datetime_pacific"
@@ -50,6 +55,10 @@ CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
 MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
+# Precomputed firing-rate cache resolution over each unit's RAW spike range. Kept
+# well above MAX_PLOT_POINTS so that a pose-window slice (often a fraction of the
+# raw range) still has >= MAX_PLOT_POINTS points to downsample from for display.
+FR_CACHE_POINTS = 60000
 
 
 # ---------------------------------------------------------------------------
@@ -174,58 +183,6 @@ def spikes_to_datetime(
 ) -> pd.DatetimeIndex:
     """Convert experiment-referenced spike seconds to Pacific datetimes."""
     return exp_start_dt + pd.to_timedelta(np.asarray(spike_exp_s), unit="s")
-
-
-def instantaneous_firing_rate(
-    spike_exp_s: np.ndarray,
-    t0_s: float,
-    t1_s: float,
-    bin_s: float = 0.05,
-    smooth_sigma_s: float = 0.2,
-    max_bins: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Gaussian-smoothed instantaneous firing rate over ``[t0_s, t1_s]``.
-
-    Parameters
-    ----------
-    spike_exp_s:
-        Experiment-referenced spike times (seconds).
-    t0_s, t1_s:
-        Time window (experiment seconds) over which to compute the rate.
-    bin_s:
-        Requested histogram bin width (seconds).
-    smooth_sigma_s:
-        Gaussian smoothing sigma (seconds).
-    max_bins:
-        Optional cap on the number of bins. Over long windows the ``bin_s``
-        resolution can imply millions of bins that are far finer than the plot
-        can show; capping keeps the computation fast (the effective bin width
-        widens to ``(t1 - t0) / max_bins``).
-
-    Returns
-    -------
-    centers_s : numpy.ndarray
-        Bin-centre times (experiment seconds).
-    rate : numpy.ndarray
-        Firing rate in Hz at each bin centre.
-    """
-    from scipy.ndimage import gaussian_filter1d
-
-    if t1_s <= t0_s:
-        return np.array([]), np.array([])
-    n_bins = max(1, int(round((t1_s - t0_s) / bin_s)))
-    if max_bins is not None and n_bins > max_bins:
-        n_bins = max_bins
-    edges = np.linspace(t0_s, t1_s, n_bins + 1)
-    width = (t1_s - t0_s) / n_bins
-    spikes = np.asarray(spike_exp_s, dtype="float64")
-    spikes = spikes[(spikes >= t0_s) & (spikes <= t1_s)]
-    counts, _ = np.histogram(spikes, bins=edges)
-    rate = counts / width
-    sigma_bins = max(1e-6, smooth_sigma_s / width)
-    rate = gaussian_filter1d(rate, sigma_bins, mode="nearest")
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    return centers, rate
 
 
 def behavior_bouts(df: pd.DataFrame) -> list[tuple[pd.Timestamp, pd.Timestamp, str]]:
@@ -456,6 +413,7 @@ class AppState:
     unit_id: object = None
     bottom_cache: dict = field(default_factory=dict)
     segtable: list | None = None  # (name, base, n, fps) per segment, computed once
+    fr_cache: dict | None = None  # precomputed firing rates for the loaded units
     autoselect_unit: object = None  # unit _load just auto-picked (consumed once)
     load_status_msg: str = ""  # last dataset "Loaded …" summary, to re-show
     load_counter: int = 0  # nonce so the load-info store always changes
@@ -476,6 +434,12 @@ class AppState:
         self.unit_id = unit_ids(self.units)[0]
         self.bottom_cache = {}
         self.segtable = build_segment_table(self.df)  # one pass, reused everywhere
+        # Precomputed firing rates (built before launch; recomputed here only if the
+        # cache is missing/stale). Makes switching units near-instant.
+        self.fr_cache = ephys.ensure_firing_rates(
+            self.units, units_path, self.firing_rate_bin_s,
+            self.firing_rate_smooth_s, FR_CACHE_POINTS,
+        )
         return self
 
 
@@ -1022,6 +986,33 @@ def create_app(
     ])
 
     # ---- helpers bound to state ----
+    def _rate_window(t0, t1, offset):
+        """Precomputed firing-rate points within ``[t0, t1]`` (experiment secs).
+
+        The cache holds the rate over raw spike seconds; shift the shared bin
+        centres by ``offset`` and slice to the window. Falls back to an on-the-fly
+        compute if the cache is somehow missing.
+        """
+        fr = state.fr_cache
+        rate = fr["rates"].get(str(state.unit_id)) if fr else None
+        if fr is None or rate is None:
+            spikes = unit_spike_times_experiment(state.units, state.unit_id, offset)
+            centers, r = instantaneous_firing_rate(
+                spikes, t0, t1, bin_s=state.firing_rate_bin_s,
+                smooth_sigma_s=state.firing_rate_smooth_s,
+            )
+            rs = _stride(len(centers))
+            return (spikes_to_datetime(centers[::rs], state.exp_start_dt)
+                    .tz_localize(None), r[::rs])
+        centers_exp = fr["centers_s"] + float(offset)
+        mask = (centers_exp >= t0) & (centers_exp <= t1)
+        cw, rw = centers_exp[mask], rate[mask]
+        # The cache is finer than the display; downsample the window to the plot
+        # target (matches the old shipped resolution).
+        rs = _stride(len(cw))
+        rate_dt = spikes_to_datetime(cw[::rs], state.exp_start_dt).tz_localize(None)
+        return rate_dt, rw[::rs]
+
     def _bottom_figure():
         df = state.df
         key = (state.unit_id, round(float(state.spike_offset_s), 3))
@@ -1040,19 +1031,10 @@ def create_app(
                 in_range = in_range[idx]
             # tz-naive wall-clock so the client-side cursor lines up exactly.
             spike_dt = spikes_to_datetime(in_range, state.exp_start_dt).tz_localize(None)
-            # Firing rate at full (fine) resolution so the trace stays smooth;
-            # downsample the plotted points BEFORE the datetime conversion (that
-            # conversion of the full fine grid was the main cost, not the bins).
-            centers, rate = instantaneous_firing_rate(
-                spikes, t0, t1,
-                bin_s=state.firing_rate_bin_s,
-                smooth_sigma_s=state.firing_rate_smooth_s,
-            )
-            rs = _stride(len(centers))
-            rate_dt = spikes_to_datetime(
-                centers[::rs], state.exp_start_dt
-            ).tz_localize(None)
-            rate_ds = rate[::rs]
+            # Firing rate from the PRECOMPUTED cache: shift the shared raw-spike bin
+            # centres by the current offset and slice to the visible window -- no
+            # per-unit recompute (that ~1 s histogram+smooth was the bottleneck).
+            rate_dt, rate_ds = _rate_window(t0, t1, state.spike_offset_s)
             cached = (spike_dt, rate_dt, rate_ds)
             state.bottom_cache[key] = cached
         spike_dt, rate_dt, rate_ds = cached
@@ -2262,6 +2244,38 @@ def _start_ngrok_tunnel(port: int) -> str:
     return ngrok.connect(port, "http").public_url
 
 
+def _precompute_firing_rates(units_dir, bin_s: float, smooth_s: float) -> None:
+    """Ensure every units file in *units_dir* has a firing-rate cache on disk.
+
+    Runs once before serving; a matching cache is reused (fast), otherwise it is
+    computed and saved. Progress is printed so the operator sees the one-time cost.
+    """
+    files = _list_files(units_dir, (".pkl",))
+    if not files:
+        return
+    for uf in files:
+        name = Path(uf).name
+        parq, js = ephys.cache_paths(uf)
+        if parq.exists() and js.exists():
+            print(f"  [firing-rate] {name}: cached")
+            continue
+        try:
+            units = load_units(uf)
+        except Exception as exc:  # noqa: BLE001 - skip unreadable units files
+            print(f"  [firing-rate] {name}: skipped ({exc})")
+            continue
+        n = len(units)
+        print(f"  [firing-rate] {name}: computing for {n} units (one-time)...")
+
+        def _progress(done, total, _name=name):
+            if done == total or done % 25 == 0:
+                print(f"      {_name}: {done}/{total}")
+
+        ephys.ensure_firing_rates(units, uf, bin_s, smooth_s, FR_CACHE_POINTS,
+                                  progress=_progress)
+        print(f"  [firing-rate] {name}: done")
+
+
 def run(
     dataset_dir: str | Path,
     units_dir: str | Path,
@@ -2309,6 +2323,11 @@ def run(
         firing_rate_smooth_s=firing_rate_smooth_s,
         heading_mode=heading_mode,
     )
+
+    # Precompute the instantaneous firing rate for every spiking (units) file so
+    # switching units in the GUI is instant. Cached to a parquet next to each units
+    # file; only recomputed when the file or bin/smoothing params change.
+    _precompute_firing_rates(units_dir, firing_rate_bin_s, firing_rate_smooth_s)
 
     print("\nPirouette explorer — share one of these links:")
     print(f"  this machine : http://127.0.0.1:{port}")

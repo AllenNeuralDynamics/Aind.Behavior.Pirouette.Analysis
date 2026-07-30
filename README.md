@@ -211,6 +211,16 @@ live in the app) so they are referenced to the **experiment start**, matching th
 dataset's `time_since_start`. GUI paths come from `.env`: `DATASET_DIR`,
 `UNITS_DIR`, `VIDEO_DIR`, plus `GUI_HOST` / `GUI_PORT`.
 
+**Firing-rate cache.** The instantaneous firing rate (`pirouette_data.ephys`) is
+precomputed for every units file **before the GUI starts serving** and cached to a
+`<units_file>.firing_rate.parquet` next to it, so switching units is near-instant
+(a per-unit lookup instead of a ~1 s recompute). The cache is offset- and
+dataset-independent (rates are stored over the raw spike range and shifted/sliced
+at view time), so it survives offset tuning and pairing with different pose
+datasets; it is recomputed only when the units file, `FIRING_RATE_BIN_S`, or
+`FIRING_RATE_SMOOTH_S` change. The first run prints per-file progress (a one-time
+cost of a few minutes for a large multi-hundred-unit file).
+
 ## Methods notes
 
 - **Harp time → datetime** uses the [Aeon API](https://github.com/SainsburyWellcomeCentre/aeon_api)
