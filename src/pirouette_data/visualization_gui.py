@@ -808,12 +808,15 @@ def create_app(
                "padding": "8px"},
     )
 
-    # responsive: figures fill their (viewport-relative) containers and refit on
-    # window resize, so the GUI auto-sizes to whatever screen it's shown on.
+    # responsive: figures fill their flex cells and refit on window resize, so the
+    # GUI auto-sizes to whatever screen it's shown on. The right column is a flex
+    # column that fills the viewport height; the three plots share it by flex-grow
+    # (so none gets clipped), each graph filling its cell at height 100%.
     graph_config = {"scrollZoom": True, "displaylogo": False, "responsive": True}
-    ts_top_style = {"height": "34vh", "minHeight": "220px"}
-    head_style = {"height": "32vh", "minHeight": "220px"}
-    ts_bot_style = {"height": "26vh", "minHeight": "180px"}
+    graph_fill = {"height": "100%", "width": "100%"}
+    wrap_top = {"position": "relative", "flex": "1.15 1 0", "minHeight": "0"}
+    wrap_head = {"position": "relative", "flex": "1 1 0", "minHeight": "0"}
+    wrap_bot = {"position": "relative", "flex": "1.1 1 0", "minHeight": "0"}
 
     # Equal-width columns: the video and the plots share the same horizontal
     # extent. The video sizes naturally to that width (no letterbox); the plots
@@ -879,14 +882,15 @@ def create_app(
             html.Div(id="_dummy6", style={"display": "none"}),
             html.Div(id="_dummy7", style={"display": "none"}),
         ],
-        style={"flex": "1", "minWidth": "560px", "padding": "8px"},
+        style={"flex": "1", "minWidth": "560px", "padding": "8px",
+               "overflowY": "auto", "minHeight": "0"},
     )
 
     right = html.Div(
         [
             html.Div(
                 [
-                    dcc.Graph(id="ts-top", config=graph_config, style=ts_top_style),
+                    dcc.Graph(id="ts-top", config=graph_config, style=graph_fill),
                     html.Div(id="cursor-top", style={
                         "position": "absolute", "left": "0", "top": "0",
                         "width": "2px", "height": "100%", "background": CURSOR_COLOR,
@@ -894,7 +898,7 @@ def create_app(
                         "display": "none", "zIndex": "10",
                     }),
                 ],
-                style={"position": "relative"},
+                style=wrap_top,
             ),
             # The head graph is wrapped so a lightweight DOM dot can be overlaid on
             # it: the current-position marker is moved by a CSS transform (GPU
@@ -902,7 +906,7 @@ def create_app(
             # -- Plotly.restyle can't keep up at high playback speed.
             html.Div(
                 [
-                    dcc.Graph(id="head", config=graph_config, style=head_style),
+                    dcc.Graph(id="head", config=graph_config, style=graph_fill),
                     html.Div(id="head-dot", style={
                         "position": "absolute", "left": "0", "top": "0",
                         "boxSizing": "border-box",
@@ -913,11 +917,11 @@ def create_app(
                         "pointerEvents": "none", "display": "none", "zIndex": "10",
                     }),
                 ],
-                style={"position": "relative"},
+                style=wrap_head,
             ),
             html.Div(
                 [
-                    dcc.Graph(id="ts-bottom", config=graph_config, style=ts_bot_style),
+                    dcc.Graph(id="ts-bottom", config=graph_config, style=graph_fill),
                     html.Div(id="cursor-bot", style={
                         "position": "absolute", "left": "0", "top": "0",
                         "width": "2px", "height": "100%", "background": CURSOR_COLOR,
@@ -925,16 +929,24 @@ def create_app(
                         "display": "none", "zIndex": "10",
                     }),
                 ],
-                style={"position": "relative"},
+                style=wrap_bot,
             ),
         ],
-        style={"flex": "1", "padding": "8px"},
+        style={"flex": "1", "padding": "8px", "display": "flex",
+               "flexDirection": "column", "minWidth": "0", "minHeight": "0"},
     )
 
     app.layout = html.Div([
-        html.H3("Pirouette dataset explorer", style={"padding": "0 8px"}),
+        html.H3("Pirouette dataset explorer", style={"padding": "0 8px", "margin": "6px 0"}),
         controls,
-        html.Div([left, right], style={"display": "flex"}),
+        # Fill the viewport below the title + controls; the right column's plots
+        # flex to share this height (so the firing-rate plot is never clipped), and
+        # the left column scrolls internally on short screens.
+        html.Div(
+            [left, right],
+            style={"display": "flex", "gap": "8px", "alignItems": "stretch",
+                   "height": "calc(100vh - 96px)", "minHeight": "420px"},
+        ),
     ])
 
     # ---- helpers bound to state ----
@@ -1191,12 +1203,16 @@ def create_app(
                 window.__placeCursor(frameMs);
             }
 
-            // Auto-follow: when zoomed in, keep the cursor in view by centring the
-            // (fixed-width) window on it once it passes the middle. Only while the
-            // video is actually playing, and only when zoomed past ~90% of the full
-            // span, so full-span (incl. after Plot Reset) and paused views are left
-            // untouched.
-            if (Plotly && typeof seg.startMs === 'number' && !v.paused) {
+            // Auto-follow: when zoomed in and playing, PAGE the window forward only
+            // when the cursor reaches the right edge (or lands outside after a
+            // seek). This replaces the old centre-every-tick behaviour, which ran a
+            // slow relayout ~16x/s and fought the user's own zoom/click. It's also
+            // suppressed briefly after a manual zoom/pan/click so it doesn't yank
+            // the view the user just set.
+            var suppressed = window.__suppressFollowUntil
+                && nowT < window.__suppressFollowUntil;
+            if (Plotly && typeof seg.startMs === 'number' && !v.paused
+                && !suppressed) {
                 var sm = window.__segmap;
                 var fullSpan = Infinity;
                 if (sm && sm.length) {
@@ -1218,25 +1234,18 @@ def create_app(
                     var r1 = _toMs(tg._fullLayout.xaxis.range[1]);
                     var W = r1 - r0;
                     var curMs = frameMs;  // same frame-accurate time as the cursor
-                    var outOfView = curMs < r0 || curMs > r1;
-                    var pastMid = curMs > r0 + 0.5 * W;
-                    // Re-centre immediately if the cursor would leave the window;
-                    // otherwise throttle the (heavy) pan to ~16x/s so fast playback
-                    // doesn't pile up relayouts and drag the whole loop behind.
-                    var followOk = outOfView
-                        || window.__lastFollowT === undefined
-                        || (nowT - window.__lastFollowT) >= 60;
-                    if (W > 0 && W < 0.9 * fullSpan && (outOfView || pastMid)
-                        && followOk) {
-                        window.__lastFollowT = nowT;
-                        // Format endpoints as naive wall-clock date STRINGS -- the
-                        // same coordinate space the axis + cursor use. (A numeric
-                        // ms range is mis-placed on a date axis -> blank plots.)
+                    // Page only when the cursor nears/passes the right edge or is
+                    // behind the window (after a seek) -- not while it's comfortably
+                    // in view. New window puts the cursor ~10% from the left so most
+                    // of the window shows what's coming.
+                    if (W > 0 && W < 0.9 * fullSpan
+                        && (curMs > r0 + 0.9 * W || curMs < r0)) {
                         var _fmt = function (ms) {
                             return new Date(ms).toISOString()
                                 .replace('T', ' ').replace('Z', '');
                         };
-                        var rng = [_fmt(curMs - 0.5 * W), _fmt(curMs + 0.5 * W)];
+                        var nr0 = curMs - 0.1 * W;
+                        var rng = [_fmt(nr0), _fmt(nr0 + W)];
                         window.__xsyncKey = JSON.stringify(rng);
                         ['ts-top', 'ts-bottom'].forEach(function (gid) {
                             var gd = plotDiv(gid);
@@ -1655,6 +1664,12 @@ def create_app(
             if (window.__xsyncKey === key) return '';
             window.__xsyncKey = key;
             apply(src === 'ts-top' ? 'ts-bottom' : 'ts-top', rng);
+            // This is a user zoom/pan (follow's own relayouts are caught by the
+            // __xsyncKey guard above): pause auto-follow briefly so it doesn't yank
+            // the view the user just set.
+            var nowP = (window.performance && performance.now)
+                ? performance.now() : Date.now();
+            window.__suppressFollowUntil = nowP + 2500;
             // Keep the cursor overlay aligned with the new (zoomed/panned) x-range.
             if (window.__placeCursor && window.__cursorMs != null) {
                 window.__placeCursor(window.__cursorMs);
@@ -1717,13 +1732,22 @@ def create_app(
                     var wasPlaying = !!(v && !v.paused);
                     var curName = window.__seg && window.__seg.name;
 
+                    var nowP = (window.performance && performance.now)
+                        ? performance.now() : Date.now();
+                    // Don't let auto-follow yank the view right after a click.
+                    window.__suppressFollowUntil = nowP + 2500;
                     if (v && s.name === curName) {
                         // Same hour: seek natively RIGHT NOW (no Dash round-trip,
                         // which is the bulk of the click latency) and keep playing
-                        // if it was playing. Move the cursor immediately for
-                        // instant feedback -- the slider isn't touched (it doesn't
-                        // track playback anyway).
-                        try { v.currentTime = localT; } catch (e) {}
+                        // if it was playing. Coalesce rapid clicks: if a seek is
+                        // already in flight, remember the latest target and apply it
+                        // when the current seek finishes -- setting currentTime on
+                        // every click thrashes the decoder and stutters.
+                        if (v.seeking) {
+                            window.__pendingSeek = localT;
+                        } else {
+                            try { v.currentTime = localT; } catch (e) {}
+                        }
                         if (wasPlaying) {
                             var pp = v.play();
                             if (pp && pp.catch) { pp.catch(function () {}); }
@@ -1780,6 +1804,15 @@ def create_app(
                         window.__autoPlayNext = false;
                         var p = vid.play();
                         if (p && p.catch) p.catch(function () {});
+                    }
+                });
+                // Apply the latest coalesced click target once the in-flight seek
+                // finishes, so a burst of rapid clicks resolves to one final seek.
+                vid.addEventListener('seeked', function () {
+                    if (window.__pendingSeek != null) {
+                        var t = window.__pendingSeek;
+                        window.__pendingSeek = null;
+                        try { vid.currentTime = t; } catch (e) {}
                     }
                 });
             }
