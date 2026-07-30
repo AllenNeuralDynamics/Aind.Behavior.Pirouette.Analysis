@@ -1079,9 +1079,9 @@ def create_app(
         Output("segmap", "data"),
         Output("load-info", "data"),
         Input("load", "n_clicks"),
-        # dataset/units as Inputs -> changing either auto-loads (no Load click).
-        Input("dataset", "value"),
-        Input("unitsfile", "value"),
+        # dataset/units are State -> they load only when the Load button is pressed.
+        State("dataset", "value"),
+        State("unitsfile", "value"),
         State("offset", "value"),
         prevent_initial_call=False,
     )
@@ -1151,13 +1151,15 @@ def create_app(
     # progress.
     app.clientside_callback(
         """
-        function(n, ds, uf, unit) {
+        function(n, unit) {
             var ctx = window.dash_clientside.callback_context;
             var trig = ctx && ctx.triggered && ctx.triggered[0];
             var id = (trig && trig.prop_id) ? trig.prop_id.split('.')[0] : '';
             var msg = (id === 'unit') ? '⏳ Loading unit…' : '⏳ Loading dataset…';
             // Write the DOM directly (the status/bar are client-owned; the server
             // signals completion via the load-info store -> the confirm callback).
+            // Triggers: the Load button (dataset) and the unit dropdown -- NOT the
+            // dataset/units file dropdowns (those load only on Load press).
             var s = document.getElementById('load-status');
             if (s) { s.textContent = msg; }
             var b = document.getElementById('load-bar');
@@ -1167,8 +1169,6 @@ def create_app(
         """,
         Output("_dummy8", "children"),
         Input("load", "n_clicks"),
-        Input("dataset", "value"),
-        Input("unitsfile", "value"),
         Input("unit", "value"),
         prevent_initial_call=True,
     )
