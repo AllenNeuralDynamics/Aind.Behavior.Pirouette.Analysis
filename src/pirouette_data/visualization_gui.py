@@ -479,9 +479,12 @@ def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
         )
 
     x0 = x.iloc[0]
+    # Hidden Plotly cursor (kept so the figure/tests still carry it); the VISIBLE
+    # red cursor is a DOM overlay moved by CSS transform -- Plotly.relayout is far
+    # too slow (100-200 ms) on these heavy figures to move a shape per frame.
     fig.add_shape(
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
-        line=dict(color=CURSOR_COLOR, width=2.5),
+        line=dict(color=CURSOR_COLOR, width=2.5), opacity=0,
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="mm/s", row=2, col=1)
@@ -525,9 +528,9 @@ def build_timeseries_bottom(
         go.Scattergl(x=rate_dt, y=rate, line=dict(color="#1565c0", width=1), name="rate"),
         row=2, col=1,
     )
-    fig.add_shape(
+    fig.add_shape(  # hidden; visible cursor is the DOM overlay (see build_layout)
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
-        line=dict(color=CURSOR_COLOR, width=2.5),
+        line=dict(color=CURSOR_COLOR, width=2.5), opacity=0,
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="Hz", row=2, col=1)
@@ -817,7 +820,18 @@ def create_app(
 
     right = html.Div(
         [
-            dcc.Graph(id="ts-top", config=graph_config),
+            html.Div(
+                [
+                    dcc.Graph(id="ts-top", config=graph_config),
+                    html.Div(id="cursor-top", style={
+                        "position": "absolute", "left": "0", "top": "0",
+                        "width": "2px", "height": "100%", "background": CURSOR_COLOR,
+                        "transform": "translateX(-100px)", "pointerEvents": "none",
+                        "display": "none", "zIndex": "10",
+                    }),
+                ],
+                style={"position": "relative"},
+            ),
             # The head graph is wrapped so a lightweight DOM dot can be overlaid on
             # it: the current-position marker is moved by a CSS transform (GPU
             # compositor) every animation frame, which tracks the video with no lag
@@ -837,7 +851,18 @@ def create_app(
                 ],
                 style={"position": "relative"},
             ),
-            dcc.Graph(id="ts-bottom", config=graph_config),
+            html.Div(
+                [
+                    dcc.Graph(id="ts-bottom", config=graph_config),
+                    html.Div(id="cursor-bot", style={
+                        "position": "absolute", "left": "0", "top": "0",
+                        "width": "2px", "height": "100%", "background": CURSOR_COLOR,
+                        "transform": "translateX(-100px)", "pointerEvents": "none",
+                        "display": "none", "zIndex": "10",
+                    }),
+                ],
+                style={"position": "relative"},
+            ),
         ],
         style={"flex": "1", "padding": "8px"},
     )
@@ -991,21 +1016,9 @@ def create_app(
             }
             var localT = (row - s.base) / s.fps;
             if (localT < 0) { localT = 0; }
-            // Move the cursor immediately so it tracks the slider handle.
-            var cursor = new Date(s.startMs + localT * 1000).toISOString();
-            if (window.Plotly) {
-                ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                    var el = document.getElementById(gid);
-                    var gd = el && (el.classList.contains('js-plotly-plot')
-                        ? el : el.querySelector('.js-plotly-plot'));
-                    if (gd) {
-                        try {
-                            window.Plotly.relayout(gd, {
-                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
-                            });
-                        } catch (e) { /* not ready */ }
-                    }
-                });
+            // Move the cursor immediately (DOM overlay) so it tracks the handle.
+            if (window.__placeCursor) {
+                window.__placeCursor(s.startMs + localT * 1000);
             }
             var curName = seg && seg.name;
             var v = document.getElementById('video');
@@ -1078,23 +1091,12 @@ def create_app(
             var frameT = seg.ht[curIdx] - seg.ht[0];
             var frameMs = seg.startMs + frameT * 1000;
 
-            // Red time cursor on both timeseries figures. Plotly.relayout is too
-            // heavy to run per video frame, so the cursor lives on this 40 ms loop
-            // (~25 Hz, smooth enough for a vertical line); the head dot is the
-            // thing that needs per-frame updates and is handled on rVFC below.
-            var cursor = (typeof seg.startMs === 'number')
-                ? new Date(frameMs).toISOString() : null;
-            if (Plotly && cursor) {
-                ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                    var gd = plotDiv(gid);
-                    if (gd) {
-                        try {
-                            Plotly.relayout(gd, {
-                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
-                            });
-                        } catch (e) { /* not ready */ }
-                    }
-                });
+            // Red time cursor: move the DOM overlay (cheap CSS transform, not a
+            // 100-200 ms Plotly.relayout) to this frame's wall-clock time. rVFC
+            // moves it per frame during playback; this 40 ms loop covers paused
+            // seeks and is the fallback where rVFC is unavailable.
+            if (window.__placeCursor && typeof seg.startMs === 'number') {
+                window.__placeCursor(frameMs);
             }
 
             // Auto-follow: when zoomed in, keep the cursor in view by centring the
@@ -1287,6 +1289,48 @@ def create_app(
                 return el && (el.classList.contains('js-plotly-plot')
                     ? el : el.querySelector('.js-plotly-plot'));
             }
+            // Move the red time cursor on both timeseries figures to wall-clock
+            // `ms` by translating a DOM overlay line (compositor-only). This
+            // replaces Plotly.relayout of a shape, which costs 100-200 ms on these
+            // heavy figures and was the bulk of the click/playback latency. Hides
+            // the line when the time is outside the current (zoomed) x-view.
+            window.__placeCursor = function (ms) {
+                try {
+                    window.__cursorMs = ms;
+                    var pairs = [['ts-top', 'cursor-top'], ['ts-bottom', 'cursor-bot']];
+                    for (var pi = 0; pi < pairs.length; pi++) {
+                        var g = pdiv(pairs[pi][0]);
+                        var line = document.getElementById(pairs[pi][1]);
+                        if (!g || !g._fullLayout || !g._fullLayout.xaxis || !line) {
+                            continue;
+                        }
+                        var xa = g._fullLayout.xaxis, lay = g._fullLayout;
+                        var toMs = function (x) {
+                            if (typeof x === 'number') { return x; }
+                            var t = String(x);
+                            if (t.indexOf('Z') < 0 && t.indexOf('+') < 0) {
+                                t = t.replace(' ', 'T') + 'Z';  // naive == UTC here
+                            }
+                            return new Date(t).getTime();
+                        };
+                        var r0 = toMs(xa.range[0]), r1 = toMs(xa.range[1]);
+                        if (!(r1 > r0)) { continue; }
+                        var frac = (ms - r0) / (r1 - r0);
+                        if (frac < -0.002 || frac > 1.002) {
+                            line.style.display = 'none';
+                            continue;
+                        }
+                        var top = lay.margin ? lay.margin.t : 0;
+                        var h = lay.height - (lay.margin
+                            ? (lay.margin.t + lay.margin.b) : 0);
+                        line.style.top = top + 'px';
+                        line.style.height = h + 'px';
+                        line.style.transform = 'translateX('
+                            + (xa._offset + frac * xa._length) + 'px)';
+                        line.style.display = 'block';
+                    }
+                } catch (e) {}
+            };
             // Move ONLY the head dot for a media time `mt` (seconds). This is a
             // single CSS transform (compositor-only, no Plotly redraw), so it can
             // run for every presented video frame without falling behind. The
@@ -1322,6 +1366,11 @@ def create_app(
                                 + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
                             dot.style.display = 'block';
                         }
+                    }
+                    // Cursor at this frame's wall-clock time (aligns with the data
+                    // and spike ticks, same as the head dot).
+                    if (window.__placeCursor) {
+                        window.__placeCursor(s.startMs + (s.ht[i] - s.ht[0]) * 1000);
                     }
                 } catch (e) {}
             }
@@ -1455,6 +1504,10 @@ def create_app(
                 } catch (e) {}
             }
             window.__xsyncKey = null;
+            // Re-place the cursor overlay for the restored x-ranges.
+            if (window.__placeCursor && window.__cursorMs != null) {
+                setTimeout(function () { window.__placeCursor(window.__cursorMs); }, 0);
+            }
             return '';
         }
         """,
@@ -1510,6 +1563,10 @@ def create_app(
             if (window.__xsyncKey === key) return '';
             window.__xsyncKey = key;
             apply(src === 'ts-top' ? 'ts-bottom' : 'ts-top', rng);
+            // Keep the cursor overlay aligned with the new (zoomed/panned) x-range.
+            if (window.__placeCursor && window.__cursorMs != null) {
+                window.__placeCursor(window.__cursorMs);
+            }
             return '';
         }
         """,
@@ -1563,14 +1620,40 @@ def create_app(
                     if (localT < 0) localT = 0;
                     var maxT = (s.n - 1) / s.fps;
                     if (localT > maxT) localT = maxT;
-                    var row = s.base + Math.round(localT * s.fps);
-                    var input = document.querySelector('#frame input');
-                    if (input) {
-                        var setter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value').set;
-                        setter.call(input, String(row));
-                        input.dispatchEvent(new Event('input', {bubbles: true}));
-                        input.dispatchEvent(new Event('change', {bubbles: true}));
+
+                    var v = document.getElementById('video');
+                    var wasPlaying = !!(v && !v.paused);
+                    var curName = window.__seg && window.__seg.name;
+
+                    if (v && s.name === curName) {
+                        // Same hour: seek natively RIGHT NOW (no Dash round-trip,
+                        // which is the bulk of the click latency) and keep playing
+                        // if it was playing. Move the cursor immediately for
+                        // instant feedback -- the slider isn't touched (it doesn't
+                        // track playback anyway).
+                        try { v.currentTime = localT; } catch (e) {}
+                        if (wasPlaying) {
+                            var pp = v.play();
+                            if (pp && pp.catch) { pp.catch(function () {}); }
+                        }
+                        // Instant cursor feedback via the DOM overlay (cheap).
+                        if (window.__placeCursor) {
+                            window.__placeCursor(s.startMs + localT * 1000);
+                        }
+                    } else {
+                        // Different hour: switch the video via the slider -> _drag
+                        // -> server load, and resume playback once it's ready if it
+                        // was playing (the 'canplay' handler honours __autoPlayNext).
+                        window.__autoPlayNext = wasPlaying;
+                        var row = s.base + Math.round(localT * s.fps);
+                        var input = document.querySelector('#frame input');
+                        if (input) {
+                            var setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            setter.call(input, String(row));
+                            input.dispatchEvent(new Event('input', {bubbles: true}));
+                            input.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
                     }
                 } catch (e) { /* ignore */ }
             }, true);
