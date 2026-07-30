@@ -485,6 +485,30 @@ def _list_files(directory: Path, suffixes: tuple[str, ...]) -> list[str]:
     )
 
 
+def file_options(directory: Path, suffixes: tuple[str, ...]) -> list[dict]:
+    """Dropdown options for files in *directory*, showing/sending only the file
+    NAME (never the full path, which would leak the server's directory layout to
+    viewers)."""
+    return [{"label": Path(p).name, "value": Path(p).name}
+            for p in _list_files(directory, suffixes)]
+
+
+def resolve_in_dir(directory: Path, name: str | None) -> str | None:
+    """Resolve a bare file *name* to a full path inside *directory*.
+
+    Returns ``None`` unless the name is a real file directly in *directory* (so a
+    dropdown value can only ever load a file from the configured folder -- no path
+    traversal, and the client never sees or sends an absolute path).
+    """
+    if not name:
+        return None
+    base = Path(directory).resolve()
+    path = (base / Path(name).name).resolve()
+    if path.parent != base or not path.is_file():
+        return None
+    return str(path)
+
+
 # ---------------------------------------------------------------------------
 # Figure builders (Plotly)
 # ---------------------------------------------------------------------------
@@ -761,8 +785,10 @@ def create_app(
         heading_mode=heading_mode,
     )
 
-    datasets = _list_files(state.dataset_dir, (".parquet", ".pkl", ".csv"))
-    unit_files = _list_files(state.units_dir, (".pkl",))
+    # Show only file NAMES in the dropdowns (values are names too) so the server's
+    # absolute paths are never exposed to viewers.
+    dataset_opts = file_options(state.dataset_dir, (".parquet", ".pkl", ".csv"))
+    unit_opts = file_options(state.units_dir, (".pkl",))
 
     app = Dash(__name__, title="Pirouette explorer")
 
@@ -802,13 +828,15 @@ def create_app(
         [
             html.Div([
                 html.Label("Dataset"),
-                dcc.Dropdown(id="dataset", options=datasets,
-                             value=datasets[0] if datasets else None, clearable=False),
+                dcc.Dropdown(id="dataset", options=dataset_opts,
+                             value=dataset_opts[0]["value"] if dataset_opts else None,
+                             clearable=False),
             ], style={"flex": "3"}),
             html.Div([
                 html.Label("Spike units"),
-                dcc.Dropdown(id="unitsfile", options=unit_files,
-                             value=unit_files[0] if unit_files else None, clearable=False),
+                dcc.Dropdown(id="unitsfile", options=unit_opts,
+                             value=unit_opts[0]["value"] if unit_opts else None,
+                             clearable=False),
             ], style={"flex": "3"}),
             html.Div([
                 html.Label("Spike offset (s)"),
@@ -1033,7 +1061,11 @@ def create_app(
         State("offset", "value"),
         prevent_initial_call=False,
     )
-    def _load(_clicks, dataset_path, units_path, offset):
+    def _load(_clicks, dataset_name, units_name, offset):
+        # Dropdown values are bare file names; resolve them to paths inside the
+        # configured folders (guards against anything outside those folders).
+        dataset_path = resolve_in_dir(state.dataset_dir, dataset_name)
+        units_path = resolve_in_dir(state.units_dir, units_name)
         if not dataset_path or not units_path:
             return (no_update,) * 10
         state.load(dataset_path, units_path, offset or 0.0)

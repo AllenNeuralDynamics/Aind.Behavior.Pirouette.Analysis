@@ -191,6 +191,27 @@ def test_build_segment_table_matches_segment_info():
         assert fps == pytest.approx(f2, rel=1e-6)
 
 
+def test_file_options_show_only_names(tmp_path):
+    (tmp_path / "a.parquet").write_bytes(b"x")
+    (tmp_path / "b.csv").write_text("x")
+    opts = viz.file_options(tmp_path, (".parquet", ".pkl", ".csv"))
+    # Labels and values are bare names -- never the absolute path.
+    for o in opts:
+        assert o["label"] == o["value"]
+        assert "/" not in o["value"] and "\\" not in o["value"]
+    assert {o["value"] for o in opts} == {"a.parquet", "b.csv"}
+
+
+def test_resolve_in_dir_confines_to_folder(tmp_path):
+    (tmp_path / "data.parquet").write_bytes(b"x")
+    resolved = viz.resolve_in_dir(tmp_path, "data.parquet")
+    assert resolved is not None and resolved.endswith("data.parquet")
+    # Traversal / outside names are rejected.
+    assert viz.resolve_in_dir(tmp_path, "../secret.parquet") is None
+    assert viz.resolve_in_dir(tmp_path, "missing.parquet") is None
+    assert viz.resolve_in_dir(tmp_path, None) is None
+
+
 def test_segment_options_flags_missing_videos(tmp_path):
     segs = ["TopCamera_A", "TopCamera_B", "TopCamera_C"]
     (tmp_path / "TopCamera_B.mp4").write_bytes(b"x")  # only B has a video
