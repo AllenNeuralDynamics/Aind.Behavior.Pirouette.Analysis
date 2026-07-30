@@ -191,6 +191,19 @@ def test_build_segment_table_matches_segment_info():
         assert fps == pytest.approx(f2, rel=1e-6)
 
 
+def test_clear_firing_rate_caches(tmp_path):
+    import pickle
+    uf = tmp_path / "u.pkl"
+    with open(uf, "wb") as f:
+        pickle.dump({1: {"spike_times": np.array([1.0])}}, f)
+    parq, js = viz.ephys.cache_paths(uf)
+    parq.write_bytes(b"x")
+    js.write_text("{}")
+    viz._clear_firing_rate_caches(tmp_path)
+    assert not parq.exists() and not js.exists()  # caches removed
+    assert uf.exists()  # the units file itself is kept
+
+
 def test_file_options_show_only_names(tmp_path):
     (tmp_path / "a.parquet").write_bytes(b"x")
     (tmp_path / "b.csv").write_text("x")

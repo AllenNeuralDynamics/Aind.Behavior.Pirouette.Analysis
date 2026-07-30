@@ -54,8 +54,10 @@ MOVE_COLOR = "#fa8072"  # salmon
 CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
-MAX_RASTER_SPIKES = 40000  # overview raster cap (full-recording view; ticks are
-#                            sub-pixel there, so a subsample looks identical)
+MAX_RASTER_SPIKES = 15000  # overview raster cap (full-recording view; ticks are
+#                            sub-pixel there, so a subsample looks identical) -- kept
+#                            small so switching units ships a light figure (~1 MB);
+#                            zoom refetches every tick in the window (below)
 RASTER_ZOOM_CAP = 100000  # cap when a zoomed window is refetched at full detail
 #                           (a window with more ticks than this is denser than the
 #                           pixels can resolve, so a subsample is visually identical
@@ -2066,13 +2068,20 @@ def create_app(
         Input("seg", "data"),
         Input("unit", "value"),
         Input("offset", "value"),
+        Input("listen", "value"),
         prevent_initial_call=True,
     )
-    def _segment_spikes(seg, unit, offset):
-        # Spike times (seconds from the segment start) for the selected unit
-        # within the current video hour — used by the client-side audio monitor.
-        if state.df is None or not seg or unit is None:
-            return no_update
+    def _segment_spikes(seg, unit, offset, listen):
+        # EVERY spike (uncapped) of the unit within the current video hour, in
+        # seconds from the hour start -- the audible monitor pops on every one,
+        # regardless of the raster's display cap or the zoom window.
+        #
+        # Only shipped when "listen to spikes" is on: this array is several MB for
+        # a busy unit, and shipping it on every unit switch (audio off) was the main
+        # source of switch latency. Off -> empty (nothing to play, nothing to send).
+        listen_on = bool(listen) and "on" in listen
+        if not listen_on or state.df is None or not seg or unit is None:
+            return []
         base, n = seg["base"], seg["n"]
         t0 = float(state.df[COL_TIME].iloc[base])
         t1 = float(state.df[COL_TIME].iloc[base + n - 1])
@@ -2329,6 +2338,20 @@ def _precompute_firing_rates(units_dir, bin_s: float, smooth_s: float) -> None:
         print(f"  [firing-rate] {name}: done")
 
 
+def _clear_firing_rate_caches(units_dir) -> None:
+    """Delete every firing-rate cache file under *units_dir* (on GUI exit)."""
+    removed = 0
+    for uf in _list_files(units_dir, (".pkl",)):
+        for f in ephys.cache_paths(uf):
+            try:
+                if Path(f).exists():
+                    Path(f).unlink()
+                    removed += 1
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+    print(f"\n  [firing-rate] cleared {removed} cache file(s) on exit.")
+
+
 def run(
     dataset_dir: str | Path,
     units_dir: str | Path,
@@ -2345,6 +2368,7 @@ def run(
     firing_rate_bin_s: float = 0.05,
     firing_rate_smooth_s: float = 0.2,
     heading_mode: str = "vector",
+    clear_cache_on_exit: bool = False,
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -2413,7 +2437,14 @@ def run(
         "\nNote: for the LAN link, allow Python through the Windows Firewall when "
         "prompted.\n"
     )
+    if clear_cache_on_exit:
+        print("  [firing-rate] caches will be deleted when the GUI is closed "
+              "(CLEAR_CACHE_ON_EXIT=true).")
     # threaded=True so video range requests are served concurrently with the app's
     # other requests/callbacks -- a single-threaded server blocks during a video
     # chunk, which shows up as playback buffering/stalls.
-    app.run(host=host, port=port, debug=debug, threaded=True)
+    try:
+        app.run(host=host, port=port, debug=debug, threaded=True)
+    finally:
+        if clear_cache_on_exit:
+            _clear_firing_rate_caches(units_dir)
