@@ -456,6 +456,8 @@ class AppState:
     unit_id: object = None
     bottom_cache: dict = field(default_factory=dict)
     segtable: list | None = None  # (name, base, n, fps) per segment, computed once
+    autoselect_unit: object = None  # unit _load just auto-picked (consumed once)
+    load_status_msg: str = ""  # last dataset "Loaded …" summary, to re-show
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
         """Load a dataset + units file into the state."""
@@ -1071,8 +1073,9 @@ def create_app(
         Output("load-status", "children"),
         Output("load-bar", "style"),
         Input("load", "n_clicks"),
-        State("dataset", "value"),
-        State("unitsfile", "value"),
+        # dataset/units as Inputs -> changing either auto-loads (no Load click).
+        Input("dataset", "value"),
+        Input("unitsfile", "value"),
         State("offset", "value"),
         prevent_initial_call=False,
     )
@@ -1116,6 +1119,11 @@ def create_app(
         n_avail = sum(1 for o in seg_options if not o["disabled"])
         status = (f"✓ Loaded · {len(segs)} hr ({n_avail} with video) · "
                   f"{frames_txt} frames")
+        # The unit dropdown value changes here too, which fires _select_unit; mark
+        # that auto-selection so it keeps this dataset summary rather than replacing
+        # it with a "Loaded unit X" message.
+        state.autoselect_unit = state.unit_id
+        state.load_status_msg = status
         return (
             top_fig,
             _bottom_figure(),
@@ -1131,20 +1139,27 @@ def create_app(
             {"display": "none"},  # hide the loading bar
         )
 
-    # The instant Load is clicked, flip to "Loading…" + show the bar (client-side,
-    # so it appears before the server _load callback runs; _load then replaces it
-    # with the "Loaded" confirmation and hides the bar).
+    # The instant Load is clicked OR the dataset/units/unit is changed, flip to
+    # "Loading…" + show the bar (client-side, so it appears before the server
+    # callback runs; the server callback then writes the "Loaded" confirmation and
+    # hides the bar). This is what makes changing a file/unit auto-load with visible
+    # progress.
     app.clientside_callback(
         """
-        function(n) {
-            var nu = window.dash_clientside.no_update;
-            if (!n) { return [nu, nu]; }
-            return ['⏳ Loading dataset…', {marginBottom: '5px'}];
+        function(n, ds, uf, unit) {
+            var ctx = window.dash_clientside.callback_context;
+            var trig = ctx && ctx.triggered && ctx.triggered[0];
+            var id = (trig && trig.prop_id) ? trig.prop_id.split('.')[0] : '';
+            var msg = (id === 'unit') ? '⏳ Loading unit…' : '⏳ Loading dataset…';
+            return [msg, {marginBottom: '5px'}];
         }
         """,
         Output("load-status", "children", allow_duplicate=True),
         Output("load-bar", "style", allow_duplicate=True),
         Input("load", "n_clicks"),
+        Input("dataset", "value"),
+        Input("unitsfile", "value"),
+        Input("unit", "value"),
         prevent_initial_call=True,
     )
 
@@ -1298,9 +1313,24 @@ def create_app(
             // 100-200 ms Plotly.relayout) to this frame's wall-clock time. rVFC
             // moves it per frame during playback; this 40 ms loop covers paused
             // seeks and is the fallback where rVFC is unavailable.
-            if (window.__placeCursor && typeof seg.startMs === 'number') {
-                window.__placeCursor(frameMs);
+            //
+            // Seek hold: right after a click the video's currentTime lags (it's
+            // still seeking, and rapid clicks coalesce), so tracking ct would snap
+            // the cursor back to the old spot. While a seek target is pending and ct
+            // hasn't reached it, pin the cursor to the clicked point instead; clear
+            // the hold once ct arrives.
+            if (window.__seekTarget != null) {
+                if (Math.abs(ct - window.__seekTarget) <= 0.2) {
+                    window.__seekTarget = null;
+                }
             }
+            var cursorAt = (window.__seekTarget != null
+                            && window.__cursorHoldMs != null)
+                ? window.__cursorHoldMs : frameMs;
+            if (window.__placeCursor && typeof seg.startMs === 'number') {
+                window.__placeCursor(cursorAt);
+            }
+            window.__cursorMs = cursorAt;
 
             // Auto-follow: when zoomed in and playing, PAGE the window forward only
             // when the cursor reaches the right edge (or lands outside after a
@@ -1836,6 +1866,24 @@ def create_app(
                     // Don't let auto-follow yank the view right after a click.
                     window.__suppressFollowUntil = nowP + 2500;
                     if (v && s.name === curName) {
+                        // Compute the clicked frame's wall-clock time (same coord as
+                        // the moving cursor) so the hold matches where it'll settle.
+                        var segNow = window.__seg;
+                        var holdMs = s.startMs + localT * 1000;  // fallback
+                        if (segNow && segNow.ht && segNow.hx && v.duration) {
+                            var fpsE = segNow.hx.length / v.duration;
+                            var fi = Math.round(localT * fpsE);
+                            if (fi < 0) { fi = 0; }
+                            if (fi > segNow.ht.length - 1) { fi = segNow.ht.length - 1; }
+                            holdMs = segNow.startMs
+                                + (segNow.ht[fi] - segNow.ht[0]) * 1000;
+                        }
+                        // Pin the cursor to this click until the video's currentTime
+                        // actually reaches it (see the sync loop) -- so rapid clicks
+                        // move the line to the exact click and it never freezes on a
+                        // stale, still-seeking currentTime.
+                        window.__seekTarget = localT;
+                        window.__cursorHoldMs = holdMs;
                         // Same hour: seek natively RIGHT NOW (no Dash round-trip,
                         // which is the bulk of the click latency) and keep playing
                         // if it was playing. Coalesce rapid clicks: if a seek is
@@ -1853,7 +1901,7 @@ def create_app(
                         }
                         // Instant cursor feedback via the DOM overlay (cheap).
                         if (window.__placeCursor) {
-                            window.__placeCursor(s.startMs + localT * 1000);
+                            window.__placeCursor(holdMs);
                         }
                     } else {
                         // Different hour: switch the video via the slider -> _drag
@@ -1944,15 +1992,24 @@ def create_app(
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
+        Output("load-status", "children", allow_duplicate=True),
+        Output("load-bar", "style", allow_duplicate=True),
         Input("unit", "value"),
         prevent_initial_call=True,
     )
     def _select_unit(unit_value):
-        # Selecting a unit updates the spike + firing-rate plots immediately.
+        # Selecting a unit updates the spike + firing-rate plots immediately, with
+        # the progress bar shown while it loads (the top/head plots stay as-is).
         if state.df is None or unit_value is None:
-            return no_update
+            return no_update, no_update, no_update
+        if unit_value == state.autoselect_unit:
+            # Change came from loading a dataset (auto-picked first unit); _load
+            # already built the bottom plot -- keep the dataset summary + hide bar.
+            state.autoselect_unit = None  # consume (real unit ids are never None)
+            return no_update, state.load_status_msg, {"display": "none"}
         state.unit_id = unit_value
-        return _bottom_figure()
+        fig = _bottom_figure()
+        return fig, f"✓ Loaded unit {unit_value}", {"display": "none"}
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
