@@ -316,6 +316,26 @@ def segment_info(df: pd.DataFrame, source_file: str) -> tuple[int, int, float]:
     return base, n, fps
 
 
+def segment_options(
+    segs: list[str], video_dir: str | Path
+) -> tuple[list[dict], str | None]:
+    """Dropdown options for the hour segments + the default selection.
+
+    Hours whose ``<name>.mp4`` is missing from ``video_dir`` are labelled
+    ``"<name> — Not Available"`` and disabled; the default is the first hour that
+    does have a video (so playback works out of the box).
+    """
+    video_dir = Path(video_dir)
+    have = {s: (video_dir / f"{s}.mp4").exists() for s in segs}
+    options = [
+        {"label": s if have[s] else f"{s} — Not Available",
+         "value": s, "disabled": not have[s]}
+        for s in segs
+    ]
+    default = next((s for s in segs if have[s]), segs[0] if segs else None)
+    return options, default
+
+
 def build_segment_table(df: pd.DataFrame) -> list[tuple[str, int, int, float]]:
     """Ordered ``(name, base_row, n_frames, fps)`` per segment, in ONE pass.
 
@@ -824,8 +844,10 @@ def create_app(
     left = html.Div(
         [
             # Native HTML5 player: smooth, browser-buffered playback + scrubbing.
+            # preload="auto" tells the browser to buffer ahead aggressively so
+            # playback doesn't stall waiting on the next chunk.
             html.Video(
-                id="video", controls=True, autoPlay=False,
+                id="video", controls=True, autoPlay=False, preload="auto",
                 style={"width": "100%", "maxHeight": "55vh", "objectFit": "contain",
                        "border": "1px solid #ccc", "background": "#000"},
             ),
@@ -1036,13 +1058,16 @@ def create_app(
             for i, (name, base, n, fps) in enumerate(table) if i % stepm == 0
         }
         segs = [name for name, _, _, _ in table]
+        # Flag hours whose video file is missing (disabled + "Not Available") and
+        # default to the first hour that has a video.
+        seg_options, default_seg = segment_options(segs, state.video_dir)
         return (
             top_fig,
             _bottom_figure(),
             options,
             state.unit_id,
-            [{"label": s, "value": s} for s in segs],
-            segs[0],
+            seg_options,
+            default_seg,
             len(state.df) - 1,
             0,
             marks,
@@ -2125,4 +2150,7 @@ def run(
         "\nNote: for the LAN link, allow Python through the Windows Firewall when "
         "prompted.\n"
     )
-    app.run(host=host, port=port, debug=debug)
+    # threaded=True so video range requests are served concurrently with the app's
+    # other requests/callbacks -- a single-threaded server blocks during a video
+    # chunk, which shows up as playback buffering/stalls.
+    app.run(host=host, port=port, debug=debug, threaded=True)

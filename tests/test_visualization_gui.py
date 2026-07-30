@@ -191,6 +191,18 @@ def test_build_segment_table_matches_segment_info():
         assert fps == pytest.approx(f2, rel=1e-6)
 
 
+def test_segment_options_flags_missing_videos(tmp_path):
+    segs = ["TopCamera_A", "TopCamera_B", "TopCamera_C"]
+    (tmp_path / "TopCamera_B.mp4").write_bytes(b"x")  # only B has a video
+    options, default = viz.segment_options(segs, tmp_path)
+    labels = {o["value"]: o["label"] for o in options}
+    disabled = {o["value"]: o["disabled"] for o in options}
+    assert labels["TopCamera_B"] == "TopCamera_B"
+    assert labels["TopCamera_A"] == "TopCamera_A — Not Available"
+    assert disabled == {"TopCamera_A": True, "TopCamera_B": False, "TopCamera_C": True}
+    assert default == "TopCamera_B"  # first (only) available
+
+
 def test_gui_columns_includes_essentials():
     cols = viz.gui_columns()
     for c in ("datetime_pacific", "time_since_start", "source_file", "behavior",
