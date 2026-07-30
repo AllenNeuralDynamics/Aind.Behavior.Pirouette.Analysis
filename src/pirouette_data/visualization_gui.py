@@ -805,6 +805,13 @@ def create_app(
       .js-plotly-plot .nsewdrag,
       .js-plotly-plot .nsewdrag.cursor-ew-resize,
       .js-plotly-plot .nsewdrag.cursor-ns-resize { cursor: crosshair !important; }
+      /* Indeterminate loading bar (we can't get true % from the sync read). */
+      .load-bar-track { position: relative; height: 8px; width: 100%;
+        background: #e0e0e0; border-radius: 4px; overflow: hidden; }
+      .load-bar-track .fill { position: absolute; top: 0; height: 100%;
+        width: 40%; background: #1565c0; border-radius: 4px;
+        animation: loadslide 1.1s ease-in-out infinite; }
+      @keyframes loadslide { 0% { left: -40%; } 100% { left: 100%; } }
     </style>
   </head>
   <body>
@@ -848,9 +855,15 @@ def create_app(
                 dcc.Dropdown(id="unit", options=[], clearable=False),
             ], style={"flex": "1"}),
             html.Div([
-                html.Label(" "),
+                # Status + progress bar sit directly above the Load button.
+                html.Div(id="load-status", children="⏳ Loading…",
+                         style={"fontSize": "11px", "color": "#555",
+                                "minHeight": "14px", "marginBottom": "3px",
+                                "lineHeight": "1.2"}),
+                html.Div(html.Div(className="fill"), id="load-bar",
+                         className="load-bar-track", style={"marginBottom": "5px"}),
                 html.Button("Load", id="load", n_clicks=0, style={"width": "100%"}),
-            ], style={"flex": "1"}),
+            ], style={"flex": "2"}),
         ],
         style={"display": "flex", "gap": "10px", "alignItems": "flex-end",
                "padding": "8px"},
@@ -1055,6 +1068,8 @@ def create_app(
         Output("frame", "value"),
         Output("frame", "marks"),
         Output("segmap", "data"),
+        Output("load-status", "children"),
+        Output("load-bar", "style"),
         Input("load", "n_clicks"),
         State("dataset", "value"),
         State("unitsfile", "value"),
@@ -1066,8 +1081,10 @@ def create_app(
         # configured folders (guards against anything outside those folders).
         dataset_path = resolve_in_dir(state.dataset_dir, dataset_name)
         units_path = resolve_in_dir(state.units_dir, units_name)
+        bar_hidden = {"display": "none"}
         if not dataset_path or not units_path:
-            return (no_update,) * 10
+            msg = "⚠ Select a dataset and a units file, then Load."
+            return (no_update,) * 10 + (msg, bar_hidden)
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         top_fig = build_timeseries_top(state.df, heading_mode=state.heading_mode)
@@ -1093,6 +1110,12 @@ def create_app(
         # Flag hours whose video file is missing (disabled + "Not Available") and
         # default to the first hour that has a video.
         seg_options, default_seg = segment_options(segs, state.video_dir)
+        n_frames = len(state.df)
+        frames_txt = (f"{n_frames / 1e6:.1f}M" if n_frames >= 1e6
+                      else f"{n_frames:,}")
+        n_avail = sum(1 for o in seg_options if not o["disabled"])
+        status = (f"✓ Loaded · {len(segs)} hr ({n_avail} with video) · "
+                  f"{frames_txt} frames")
         return (
             top_fig,
             _bottom_figure(),
@@ -1104,7 +1127,26 @@ def create_app(
             0,
             marks,
             segmap,
+            status,
+            {"display": "none"},  # hide the loading bar
         )
+
+    # The instant Load is clicked, flip to "Loading…" + show the bar (client-side,
+    # so it appears before the server _load callback runs; _load then replaces it
+    # with the "Loaded" confirmation and hides the bar).
+    app.clientside_callback(
+        """
+        function(n) {
+            var nu = window.dash_clientside.no_update;
+            if (!n) { return [nu, nu]; }
+            return ['⏳ Loading dataset…', {marginBottom: '5px'}];
+        }
+        """,
+        Output("load-status", "children", allow_duplicate=True),
+        Output("load-bar", "style", allow_duplicate=True),
+        Input("load", "n_clicks"),
+        prevent_initial_call=True,
+    )
 
     def _segment_row(seg):
         """(base, n, fps) for a segment from the cached table (O(1)-ish)."""
