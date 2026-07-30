@@ -54,7 +54,12 @@ MOVE_COLOR = "#fa8072"  # salmon
 CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
-MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
+MAX_RASTER_SPIKES = 40000  # overview raster cap (full-recording view; ticks are
+#                            sub-pixel there, so a subsample looks identical)
+RASTER_ZOOM_CAP = 100000  # cap when a zoomed window is refetched at full detail
+#                           (a window with more ticks than this is denser than the
+#                           pixels can resolve, so a subsample is visually identical
+#                           -- zoom in further to individuate them). ~4.5 MB.
 # Precomputed firing-rate cache resolution over each unit's RAW spike range. Kept
 # well above MAX_PLOT_POINTS so that a pose-window slice (often a fraction of the
 # raw range) still has >= MAX_PLOT_POINTS points to downsample from for display.
@@ -738,7 +743,7 @@ def create_app(
     dash.Dash
         The configured app. Call ``app.run(...)`` (or :func:`run`) to serve it.
     """
-    from dash import Dash, Input, Output, State, dcc, html, no_update
+    from dash import Dash, Input, Output, Patch, State, dcc, html, no_update
     from flask import abort, send_file
 
     state = AppState(
@@ -902,6 +907,7 @@ def create_app(
             dcc.Interval(id="sync", interval=40, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
+            dcc.Store(id="rasterwin"),  # visible x-window -> refetch full raster
             dcc.Store(id="seek"),
             dcc.Store(id="segspikes"),
             # Server -> client "load finished" signal ({msg, n}); the visible
@@ -1800,14 +1806,21 @@ def create_app(
                 });
                 try { window.Plotly.relayout(gd, upd); } catch (e) {}
             }
+            function toMs(x) {
+                if (typeof x === 'number') return x;
+                var s = String(x);
+                if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) s = s.replace(' ', 'T') + 'Z';
+                return new Date(s).getTime();
+            }
+            var nou = window.dash_clientside.no_update;
             var ctx = window.dash_clientside.callback_context;
             var trig = ctx && ctx.triggered && ctx.triggered[0];
-            if (!trig || !trig.prop_id) return '';
+            if (!trig || !trig.prop_id) return [nou, nou];
             var src = trig.prop_id.split('.')[0];
             var rng = extractX(src === 'ts-top' ? rdTop : rdBot);
-            if (rng === null) return '';
+            if (rng === null) return [nou, nou];
             var key = JSON.stringify(rng);
-            if (window.__xsyncKey === key) return '';
+            if (window.__xsyncKey === key) return [nou, nou];
             window.__xsyncKey = key;
             apply(src === 'ts-top' ? 'ts-bottom' : 'ts-top', rng);
             // This is a user zoom/pan (follow's own relayouts are caught by the
@@ -1820,14 +1833,54 @@ def create_app(
             if (window.__placeCursor && window.__cursorMs != null) {
                 window.__placeCursor(window.__cursorMs);
             }
-            return '';
+            // Tell the server the visible window so it can refetch EVERY spike in
+            // it at full detail (nonce `k` so identical windows still fire).
+            var rw = (rng === 'auto')
+                ? {overview: true, k: nowP}
+                : {lo: toMs(rng[0]), hi: toMs(rng[1]), k: nowP};
+            return ['', rw];
         }
         """,
         Output("_dummy2", "children"),
+        Output("rasterwin", "data"),
         Input("ts-top", "relayoutData"),
         Input("ts-bottom", "relayoutData"),
         prevent_initial_call=True,
     )
+
+    # Refetch the spike raster at FULL resolution for the visible window whenever
+    # the user zooms/pans (the overview ships a fast subsample; zooming in fetches
+    # every tick in the window -- few enough to send once you can actually see
+    # them). Patches only the raster trace, so it's cheap.
+    @app.callback(
+        Output("ts-bottom", "figure", allow_duplicate=True),
+        Input("rasterwin", "data"),
+        prevent_initial_call=True,
+    )
+    def _raster_zoom(win):
+        if state.df is None or state.unit_id is None or not win:
+            return no_update
+        spikes = unit_spike_times_experiment(
+            state.units, state.unit_id, state.spike_offset_s
+        )
+        if win.get("overview"):
+            t0e = float(state.df[COL_TIME].iloc[0])
+            t1e = float(state.df[COL_TIME].iloc[-1])
+            cap = MAX_RASTER_SPIKES
+        else:
+            exp_ms = int(state.exp_start_dt.tz_localize(None).value // 1_000_000)
+            t0e = (float(win["lo"]) - exp_ms) / 1000.0
+            t1e = (float(win["hi"]) - exp_ms) / 1000.0
+            cap = RASTER_ZOOM_CAP
+        inwin = spikes[(spikes >= t0e) & (spikes <= t1e)]
+        if inwin.size > cap:  # still sub-pixel dense -> a subsample looks the same
+            idx = np.linspace(0, inwin.size - 1, cap).astype("int64")
+            inwin = inwin[idx]
+        spike_dt = spikes_to_datetime(inwin, state.exp_start_dt).tz_localize(None)
+        patch = Patch()
+        patch["data"][0]["x"] = spike_dt
+        patch["data"][0]["y"] = np.zeros(len(spike_dt))
+        return patch
 
     # Click ANYWHERE on either timeseries figure to set the time (not just on a
     # data point): a native listener converts the click's pixel x to a time,

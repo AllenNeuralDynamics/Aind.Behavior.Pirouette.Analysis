@@ -211,6 +211,13 @@ live in the app) so they are referenced to the **experiment start**, matching th
 dataset's `time_since_start`. GUI paths come from `.env`: `DATASET_DIR`,
 `UNITS_DIR`, `VIDEO_DIR`, plus `GUI_HOST` / `GUI_PORT`.
 
+**Spike raster (every tick, fast).** Rendering millions of ticks per unit is slow
+to ship, but at the full-recording zoom they are sub-pixel anyway, so the overview
+shows a fast subsample (`MAX_RASTER_SPIKES`). **Zoom in** and the raster refetches
+**every** spike in the visible window at full resolution (`RASTER_ZOOM_CAP`) — a
+zoomed window has few enough spikes to send instantly — so no individual event is
+lost when you investigate. Only the raster trace is patched, so it stays cheap.
+
 **Firing-rate cache.** The instantaneous firing rate (`pirouette_data.ephys`) is
 precomputed for every units file **before the GUI starts serving** and cached to a
 `<units_file>.firing_rate.parquet` next to it, so switching units is near-instant
