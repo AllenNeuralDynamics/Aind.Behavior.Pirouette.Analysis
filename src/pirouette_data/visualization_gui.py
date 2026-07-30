@@ -1968,6 +1968,21 @@ def create_app(
                 seekFromPoint(md.c, evt.clientX);
             }, true);
 
+            // Load button: show the progress bar on the REAL click, synchronously,
+            // before Dash even dispatches -- a Dash clientside can't be relied on to
+            // paint before the heavy server _load runs. The confirm callback (on the
+            // load-info store) writes "Loaded" and hides the bar when done.
+            var loadBtn = document.getElementById('load');
+            if (loadBtn && !window.__loadBtnAttached) {
+                window.__loadBtnAttached = true;
+                loadBtn.addEventListener('click', function () {
+                    var s = document.getElementById('load-status');
+                    if (s) { s.textContent = '⏳ Loading dataset…'; }
+                    var b = document.getElementById('load-bar');
+                    if (b) { b.style.display = 'block'; }
+                });
+            }
+
             // Auto-advance: when an hour finishes, load the next segment and keep
             // playing. 'ended' jumps the slider to the next hour's first frame
             // (which seeks/loads the video); 'canplay' resumes playback.
