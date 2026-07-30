@@ -1343,18 +1343,22 @@ def create_app(
             // moves it per frame during playback; this 40 ms loop covers paused
             // seeks and is the fallback where rVFC is unavailable.
             //
-            // Seek hold: right after a click the video's currentTime lags (it's
-            // still seeking, and rapid clicks coalesce), so tracking ct would snap
-            // the cursor back to the old spot. While a seek target is pending and ct
-            // hasn't reached it, pin the cursor to the clicked point instead; clear
-            // the hold once ct arrives.
-            if (window.__seekTarget != null) {
-                if (Math.abs(ct - window.__seekTarget) <= 0.2) {
-                    window.__seekTarget = null;
+            // Seek hold: right after a click the video's frame lags (it's still
+            // seeking; a cross-segment click is also loading a new hour + buffering),
+            // so tracking frameMs would snap the cursor back to the old/stale spot.
+            // Pin the cursor to the clicked wall-clock time until the REAL frame time
+            // (segment-aware -- frameMs uses the loaded segment's startMs) reaches it,
+            // then resume tracking. A safety timeout clears a hold that never lands.
+            if (window.__cursorHoldMs != null) {
+                var reached = Math.abs(frameMs - window.__cursorHoldMs) <= 500;
+                var tooLong = window.__cursorHoldT != null
+                    && (nowT - window.__cursorHoldT) > 6000;
+                if (reached || tooLong) {
+                    window.__cursorHoldMs = null;
+                    window.__cursorHoldT = null;
                 }
             }
-            var cursorAt = (window.__seekTarget != null
-                            && window.__cursorHoldMs != null)
+            var cursorAt = (window.__cursorHoldMs != null)
                 ? window.__cursorHoldMs : frameMs;
             if (window.__placeCursor && typeof seg.startMs === 'number') {
                 window.__placeCursor(cursorAt);
@@ -1627,8 +1631,10 @@ def create_app(
                         }
                     }
                     // Cursor at this frame's wall-clock time (aligns with the data
-                    // and spike ticks, same as the head dot).
-                    if (window.__placeCursor) {
+                    // and spike ticks, same as the head dot) -- but NOT while a click
+                    // hold is active (the 40 ms sync loop pins the cursor to the click
+                    // and clears the hold once the frame reaches it).
+                    if (window.__placeCursor && window.__cursorHoldMs == null) {
                         window.__placeCursor(s.startMs + (s.ht[i] - s.ht[0]) * 1000);
                     }
                 } catch (e) {}
@@ -1896,31 +1902,22 @@ def create_app(
                         ? performance.now() : Date.now();
                     // Don't let auto-follow yank the view right after a click.
                     window.__suppressFollowUntil = nowP + 2500;
+                    // Pin the cursor to the clicked wall-clock time immediately (it's
+                    // valid on the full-session x-axis regardless of which hour is
+                    // loaded) and HOLD it there until the video -- including a newly
+                    // loaded segment -- actually reaches it. This makes the line land
+                    // on the click across hours and through buffering, instead of
+                    // snapping back to the old/stale position. The hold clears in the
+                    // sync loop when the real frame time reaches it (segment-aware).
+                    window.__cursorHoldMs = ms;
+                    window.__cursorHoldT = nowP;
+                    if (window.__placeCursor) { window.__placeCursor(ms); }
                     if (v && s.name === curName) {
-                        // Compute the clicked frame's wall-clock time (same coord as
-                        // the moving cursor) so the hold matches where it'll settle.
-                        var segNow = window.__seg;
-                        var holdMs = s.startMs + localT * 1000;  // fallback
-                        if (segNow && segNow.ht && segNow.hx && v.duration) {
-                            var fpsE = segNow.hx.length / v.duration;
-                            var fi = Math.round(localT * fpsE);
-                            if (fi < 0) { fi = 0; }
-                            if (fi > segNow.ht.length - 1) { fi = segNow.ht.length - 1; }
-                            holdMs = segNow.startMs
-                                + (segNow.ht[fi] - segNow.ht[0]) * 1000;
-                        }
-                        // Pin the cursor to this click until the video's currentTime
-                        // actually reaches it (see the sync loop) -- so rapid clicks
-                        // move the line to the exact click and it never freezes on a
-                        // stale, still-seeking currentTime.
-                        window.__seekTarget = localT;
-                        window.__cursorHoldMs = holdMs;
-                        // Same hour: seek natively RIGHT NOW (no Dash round-trip,
-                        // which is the bulk of the click latency) and keep playing
-                        // if it was playing. Coalesce rapid clicks: if a seek is
+                        // Same hour: seek natively RIGHT NOW (no Dash round-trip) and
+                        // keep playing if it was. Coalesce rapid clicks: if a seek is
                         // already in flight, remember the latest target and apply it
-                        // when the current seek finishes -- setting currentTime on
-                        // every click thrashes the decoder and stutters.
+                        // when the current seek finishes (setting currentTime on every
+                        // click thrashes the decoder).
                         if (v.seeking) {
                             window.__pendingSeek = localT;
                         } else {
@@ -1929,10 +1926,6 @@ def create_app(
                         if (wasPlaying) {
                             var pp = v.play();
                             if (pp && pp.catch) { pp.catch(function () {}); }
-                        }
-                        // Instant cursor feedback via the DOM overlay (cheap).
-                        if (window.__placeCursor) {
-                            window.__placeCursor(holdMs);
                         }
                     } else {
                         // Different hour: switch the video via the slider -> _drag
