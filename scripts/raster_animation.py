@@ -52,8 +52,8 @@ def main(argv: list[str] | None = None) -> None:
                             if os.getenv("RASTER_CENTER_S") else None),
                    help="Time the zoom centres on (default: middle of the recording).")
     p.add_argument("--window-start-s", type=float,
-                   default=float(os.getenv("RASTER_WINDOW_START_S", "70")),
-                   help="Initial window width in seconds (default 70).")
+                   default=float(os.getenv("RASTER_WINDOW_START_S", "0.01")),
+                   help="Initial window width in seconds (default 0.01 = 10 ms).")
     p.add_argument("--window-end-s", type=float,
                    default=(float(os.getenv("RASTER_WINDOW_END_S"))
                             if os.getenv("RASTER_WINDOW_END_S") else None),
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--invert-depth", action="store_true",
                    default=os.getenv("RASTER_INVERT_DEPTH", "").lower()
                    in ("1", "true", "yes"),
-                   help="Flip depth ordering if 'highest at top' is upside-down.")
+                   help="Put the deepest units at the TOP (default: bottom).")
     args = p.parse_args(argv)
 
     if not args.units_file:

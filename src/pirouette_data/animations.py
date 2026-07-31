@@ -25,7 +25,7 @@ SCALE_STEPS: list[tuple[float, str]] = [
     (1.0, "1 s"),
     (60.0, "1 min"),
     (3600.0, "1 hour"),
-    (43200.0, "12 hours"),
+    (36000.0, "10 hours"),
 ]
 
 
@@ -118,6 +118,29 @@ def window_label(width_s: float) -> str:
     return f"{width_s / 3600:.0f} hours"
 
 
+def x_axis_unit(width_s: float) -> tuple[float, str]:
+    """(seconds-per-unit, unit name) for the x-axis at a given window width, so the
+    axis reads in ms / s / min / hours as the view zooms out."""
+    if width_s < 1:
+        return 0.001, "ms"
+    if width_s < 100:
+        return 1.0, "s"
+    if width_s < 6000:
+        return 60.0, "min"
+    return 3600.0, "hours"
+
+
+def _nice_step(raw: float) -> float:
+    """Round *raw* up to the next 1 / 2 / 5 x 10**k (for tidy tick spacing)."""
+    if raw <= 0:
+        return 1.0
+    mag = 10.0 ** np.floor(np.log10(raw))
+    for m in (1.0, 2.0, 5.0):
+        if m * mag >= raw:
+            return m * mag
+    return 10.0 * mag
+
+
 def pick_scale_bar(window_s: float) -> tuple[float, str]:
     """Largest ``SCALE_STEPS`` entry that fits within *window_s* (>= smallest)."""
     chosen = SCALE_STEPS[0]
@@ -187,7 +210,7 @@ def make_animation(
     units_path: str | Path,
     out_path: str | Path,
     center_s: float | None = None,
-    window_start_s: float = 70.0,
+    window_start_s: float = 0.01,
     window_end_s: float | None = None,
     duration_s: float = 20.0,
     hold_s: float = 3.0,
@@ -209,13 +232,14 @@ def make_animation(
     center_s:
         Time the zoom stays centred on (default: middle of the recording).
     window_start_s, window_end_s:
-        Initial (70 s) and final window widths (default final: full recording).
+        Initial (10 ms) and final window widths (default final: full recording).
     duration_s, hold_s, fps:
         Zoom-out length, closing-card hold, and frame rate.
     cap:
         Max spikes drawn per frame (subsampled; a wide view is sub-pixel dense).
     invert_depth:
-        Flip the depth ordering if "highest at top" comes out upside-down.
+        By default the deepest units are at the BOTTOM; set this to put them at
+        the top.
     palette:
         Colour palette (``"muted"`` default; ``"rainbow"``, or any Matplotlib
         colormap name). See :func:`unit_colors`.
@@ -229,7 +253,8 @@ def make_animation(
     from matplotlib import animation
     from matplotlib.transforms import blended_transform_factory
 
-    per_unit = prepare_units(load_units_with_depth(units_path), invert_depth=invert_depth)
+    # Colours follow ascending depth; top/bottom orientation is set on the axis.
+    per_unit = prepare_units(load_units_with_depth(units_path))
     n_units = len(per_unit)
     _ = seed  # jitter is deterministic in x (see draw); seed kept for API stability
 
@@ -256,10 +281,14 @@ def make_animation(
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
     scat = ax.scatter([], [], s=3, c=[], edgecolors="none", rasterized=True)
-    # Y = depth, ordered so the deepest unit is at the top (flip via invert_depth).
-    ax.set_ylim(d_lo - d_pad, d_hi + d_pad)
-    ax.set_xlabel("time (s)")
-    ax.set_ylabel("depth (top → bottom)")
+    # Y = depth. Default: deepest at the BOTTOM (axis runs low->high downward);
+    # invert_depth puts the deepest at the top.
+    if invert_depth:
+        ax.set_ylim(d_lo - d_pad, d_hi + d_pad)
+    else:
+        ax.set_ylim(d_hi + d_pad, d_lo - d_pad)
+    ax.set_xlabel("time (ms)")
+    ax.set_ylabel("unit depth")
     ax.set_title(title)
 
     blend = blended_transform_factory(ax.transData, ax.transAxes)
@@ -283,6 +312,16 @@ def make_animation(
             scat.set_offsets(np.empty((0, 2)))
         ax.set_xlim(lo, hi)
         width = hi - lo
+        # X-axis units change with the zoom (ms -> s -> min -> hours); ticks are
+        # round values in that unit, relative to the zoom centre.
+        scale, uname = x_axis_unit(width)
+        step = _nice_step(width / scale / 6.0) * scale
+        ks = np.arange(-4, 5)
+        ticks = center_s + ks * step
+        ticks = ticks[(ticks >= lo) & (ticks <= hi)]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{(tk - center_s) / scale:g}" for tk in ticks])
+        ax.set_xlabel(f"time ({uname})")
         dur, label = pick_scale_bar(width)
         x0 = lo + 0.05 * width
         bar_line.set_data([x0, x0 + dur], [0.05, 0.05])
@@ -306,15 +345,22 @@ def make_animation(
             )
         return scat, bar_line, bar_text, end_text
 
+    total = n_zoom + n_hold
     anim = animation.FuncAnimation(
-        fig, update, frames=n_zoom + n_hold, interval=1000 / fps, blit=False
+        fig, update, frames=total, interval=1000 / fps, blit=False
     )
+
+    def _progress(i, n):
+        pct = (i + 1) / n
+        bar = "#" * int(pct * 40)
+        print(f"\r  rendering [{bar:<40}] {pct * 100:3.0f}%  ({i + 1}/{n})",
+              end="", flush=True)
+
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.suffix.lower() == ".gif":
-        anim.save(str(out_path), writer=animation.PillowWriter(fps=fps), dpi=dpi)
-    else:
-        anim.save(str(out_path), writer=animation.FFMpegWriter(fps=fps, bitrate=4000),
-                  dpi=dpi)
+    writer = (animation.PillowWriter(fps=fps) if out_path.suffix.lower() == ".gif"
+              else animation.FFMpegWriter(fps=fps, bitrate=4000))
+    anim.save(str(out_path), writer=writer, dpi=dpi, progress_callback=_progress)
+    print()  # newline after the progress bar
     plt.close(fig)
     return out_path

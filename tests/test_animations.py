@@ -96,7 +96,21 @@ def test_pick_scale_bar():
     assert anim.pick_scale_bar(5.0) == (1.0, "1 s")
     assert anim.pick_scale_bar(120.0) == (60.0, "1 min")
     assert anim.pick_scale_bar(7200.0) == (3600.0, "1 hour")
-    assert anim.pick_scale_bar(129600.0) == (43200.0, "12 hours")
+    assert anim.pick_scale_bar(129600.0) == (36000.0, "10 hours")
+
+
+def test_x_axis_unit_changes_with_zoom():
+    assert anim.x_axis_unit(0.01) == (0.001, "ms")     # 10 ms view -> ms axis
+    assert anim.x_axis_unit(10.0) == (1.0, "s")
+    assert anim.x_axis_unit(600.0) == (60.0, "min")
+    assert anim.x_axis_unit(129600.0) == (3600.0, "hours")
+
+
+def test_nice_step():
+    assert anim._nice_step(0.9) == 1.0
+    assert anim._nice_step(1.1) == 2.0
+    assert anim._nice_step(3.0) == 5.0
+    assert anim._nice_step(30.0) == 50.0
 
 
 def test_orders_of_magnitude():
