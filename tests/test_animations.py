@@ -50,12 +50,39 @@ def test_load_ok(tmp_path):
 
 def test_prepare_units_orders_by_depth():
     per = anim.prepare_units(_units())
-    # rank 0 = shallowest (depth 200), deepest (800) is the top rank
+    # ordered by depth; colour index follows depth order
     assert [pu["depth"] for pu in per] == [200.0, 500.0, 800.0]
-    assert [pu["rank"] for pu in per] == [0, 1, 2]
+    assert [pu["cidx"] for pu in per] == [0, 1, 2]
     # times are sorted
     for pu in per:
         assert np.all(np.diff(pu["times"]) >= 0)
+
+
+def test_unit_colors():
+    muted = anim.unit_colors(6, "muted")
+    assert muted.shape == (6, 4)
+    # muted is desaturated relative to the vivid rainbow
+    from matplotlib.colors import rgb_to_hsv
+    vivid = anim.unit_colors(6, "rainbow")
+    assert rgb_to_hsv(muted[:, :3])[:, 1].mean() < rgb_to_hsv(vivid[:, :3])[:, 1].mean()
+    # arbitrary matplotlib colormap name works; bad name falls back
+    assert anim.unit_colors(4, "viridis").shape == (4, 4)
+    assert anim.unit_colors(4, "not_a_cmap").shape == (4, 4)
+
+
+def test_window_label():
+    assert anim.window_label(0.01) == "10 ms"
+    assert anim.window_label(70) == "70 s"
+    assert anim.window_label(120) == "2 min"
+    assert anim.window_label(129600) == "36 hours"
+
+
+def test_frame_points_returns_depth_as_y():
+    per = anim.prepare_units(_units())
+    x, y, c = anim.frame_points(per, 0.0, 1.05, cap=100)
+    # y is the unit's depth (200/500/800), not a rank index
+    assert set(np.unique(y).tolist()) <= {200.0, 500.0, 800.0}
+    assert set(c.tolist()) <= {0, 1, 2}
 
 
 def test_prepare_units_invert_depth():

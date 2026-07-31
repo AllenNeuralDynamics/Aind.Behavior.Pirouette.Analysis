@@ -58,16 +58,64 @@ def load_units_with_depth(path: str | Path) -> dict:
 def prepare_units(units: dict, invert_depth: bool = False) -> list[dict]:
     """Per-unit records ordered by depth, with sorted spike times.
 
-    Returns a list of ``{"id", "depth", "rank", "times"}`` sorted so ``rank`` 0 is
-    at the bottom and the deepest unit is at the top (flip with *invert_depth*).
+    Returns a list of ``{"id", "depth", "cidx", "times"}`` ordered by depth. The Y
+    position of each unit is its ``depth`` (deepest at the top by default; units
+    that share a depth are spread apart by the animation's band jitter). ``cidx``
+    is the colour index in depth order. *invert_depth* flips top/bottom.
     """
     ids = sorted(units.keys(), key=lambda u: float(units[u]["depth"]), reverse=invert_depth)
     out = []
-    for rank, u in enumerate(ids):
+    for cidx, u in enumerate(ids):
         t = np.asarray(units[u]["spike_times"], dtype="float64")
-        out.append({"id": u, "depth": float(units[u]["depth"]), "rank": rank,
+        out.append({"id": u, "depth": float(units[u]["depth"]), "cidx": cidx,
                     "times": np.sort(t)})
     return out
+
+
+def _depth_jitter_amp(per_unit: list[dict], band_spread: float) -> float:
+    """A slight y offset (in depth units) so units at the same/close depth split
+    into a band rather than sitting on one line."""
+    depths = np.array(sorted({pu["depth"] for pu in per_unit}))
+    gaps = np.diff(depths)
+    med_gap = float(np.median(gaps)) if gaps.size else 10.0
+    return band_spread * (med_gap if med_gap > 0 else 10.0)
+
+
+def unit_colors(n: int, palette: str = "muted") -> np.ndarray:
+    """``n`` RGBA colours (one per unit, in depth order) for a named palette.
+
+    ``"muted"`` (default) is a desaturated rainbow; ``"rainbow"``/``"vivid"`` is
+    the full gist_rainbow; any other value is treated as a Matplotlib colormap
+    name (e.g. ``"turbo"``, ``"viridis"``, ``"Spectral"``, ``"tab20"``).
+    """
+    import matplotlib
+    from matplotlib.colors import hsv_to_rgb, rgb_to_hsv
+
+    p = (palette or "muted").lower()
+    if p == "muted":
+        base = matplotlib.colormaps["gist_rainbow"].resampled(n)(np.arange(n))[:, :3]
+        hsv = rgb_to_hsv(base)
+        hsv[:, 1] *= 0.5                      # desaturate
+        hsv[:, 2] = 0.55 + 0.30 * hsv[:, 2]   # avoid too dark / too bright
+        return np.column_stack([hsv_to_rgb(hsv), np.ones(n)])
+    if p in ("rainbow", "vivid"):
+        p = "gist_rainbow"
+    try:
+        cmap = matplotlib.colormaps[p]
+    except KeyError:
+        cmap = matplotlib.colormaps["gist_rainbow"]
+    return cmap.resampled(n)(np.arange(n))
+
+
+def window_label(width_s: float) -> str:
+    """Human-readable label for a window width (e.g. ``"70 s"``, ``"36 hours"``)."""
+    if width_s < 1:
+        return f"{width_s * 1000:.0f} ms"
+    if width_s < 100:
+        return f"{width_s:.0f} s"
+    if width_s < 6000:
+        return f"{width_s / 60:.0f} min"
+    return f"{width_s / 3600:.0f} hours"
 
 
 def pick_scale_bar(window_s: float) -> tuple[float, str]:
@@ -102,10 +150,10 @@ def frame_points(per_unit: list[dict], lo: float, hi: float, cap: int
                  ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Spikes within ``[lo, hi]`` across units, subsampled to ~*cap* total.
 
-    Returns ``(times, ranks, rank_ints)`` -- x, jittered-y base (the unit rank),
-    and the integer rank for colour lookup. Subsampling is proportional per unit,
-    so relative firing density (and each unit's colour) is preserved; a narrow
-    window keeps every spike (full resolution where you can see them).
+    Returns ``(times, depths, colour_index)`` -- x, the unit's depth (y base), and
+    its colour index. Subsampling is proportional per unit, so relative firing
+    density (and each unit's colour) is preserved; a narrow window keeps every
+    spike (full resolution where you can see them).
     """
     slices = []
     total = 0
@@ -115,7 +163,7 @@ def frame_points(per_unit: list[dict], lo: float, hi: float, cap: int
         slices.append((a, b))
         total += b - a
     frac = 1.0 if total <= cap or total == 0 else cap / total
-    xs, ranks = [], []
+    xs, ys, cs = [], [], []
     for pu, (a, b) in zip(per_unit, slices):
         m = b - a
         if m == 0:
@@ -127,20 +175,19 @@ def frame_points(per_unit: list[dict], lo: float, hi: float, cap: int
         else:
             tt = pu["times"][a:b]
         xs.append(tt)
-        ranks.append(np.full(len(tt), pu["rank"], dtype="int64"))
+        ys.append(np.full(len(tt), pu["depth"], dtype="float64"))
+        cs.append(np.full(len(tt), pu["cidx"], dtype="int64"))
     if not xs:
         empty = np.array([], dtype="float64")
         return empty, empty, np.array([], dtype="int64")
-    x = np.concatenate(xs)
-    r = np.concatenate(ranks)
-    return x, r.astype("float64"), r
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(cs)
 
 
 def make_animation(
     units_path: str | Path,
     out_path: str | Path,
     center_s: float | None = None,
-    window_start_s: float = 0.01,
+    window_start_s: float = 70.0,
     window_end_s: float | None = None,
     duration_s: float = 20.0,
     hold_s: float = 3.0,
@@ -148,6 +195,8 @@ def make_animation(
     cap: int = 60000,
     dpi: int = 120,
     invert_depth: bool = False,
+    palette: str = "muted",
+    band_spread: float = 0.4,
     seed: int = 0,
     title: str = "Manually curated spike output",
 ) -> Path:
@@ -160,13 +209,19 @@ def make_animation(
     center_s:
         Time the zoom stays centred on (default: middle of the recording).
     window_start_s, window_end_s:
-        Initial (10 ms) and final window widths (default final: full recording).
+        Initial (70 s) and final window widths (default final: full recording).
     duration_s, hold_s, fps:
         Zoom-out length, closing-card hold, and frame rate.
     cap:
         Max spikes drawn per frame (subsampled; a wide view is sub-pixel dense).
     invert_depth:
         Flip the depth ordering if "highest at top" comes out upside-down.
+    palette:
+        Colour palette (``"muted"`` default; ``"rainbow"``, or any Matplotlib
+        colormap name). See :func:`unit_colors`.
+    band_spread:
+        Fraction of the median depth gap used to jitter spikes into a band, so
+        units at the same/close depth are slightly offset.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -185,7 +240,11 @@ def make_animation(
     if window_end_s is None:
         window_end_s = max(window_start_s * 10, t_hi - t_lo)
 
-    colors = matplotlib.colormaps["gist_rainbow"].resampled(n_units)(np.arange(n_units))
+    colors = unit_colors(n_units, palette)
+    depths = np.array([pu["depth"] for pu in per_unit])
+    d_lo, d_hi = float(depths.min()), float(depths.max())
+    jit_amp = _depth_jitter_amp(per_unit, band_spread)
+    d_pad = jit_amp + 0.03 * (d_hi - d_lo + 1)
 
     n_zoom = max(2, int(round(duration_s * fps)))
     n_hold = max(1, int(round(hold_s * fps)))
@@ -197,10 +256,10 @@ def make_animation(
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
     scat = ax.scatter([], [], s=3, c=[], edgecolors="none", rasterized=True)
-    ax.set_ylim(-1, n_units)
-    ax.set_yticks([])
+    # Y = depth, ordered so the deepest unit is at the top (flip via invert_depth).
+    ax.set_ylim(d_lo - d_pad, d_hi + d_pad)
     ax.set_xlabel("time (s)")
-    ax.set_ylabel("unit #  (deep → top)")
+    ax.set_ylabel("depth (top → bottom)")
     ax.set_title(title)
 
     blend = blended_transform_factory(ax.transData, ax.transAxes)
@@ -213,12 +272,13 @@ def make_animation(
                        bbox=dict(boxstyle="round", fc="white", ec="0.6"))
 
     def draw(lo, hi):
-        x, y, r = frame_points(per_unit, lo, hi, cap)
+        x, y, c = frame_points(per_unit, lo, hi, cap)
         if len(x):
-            # Small band spread, deterministic in x so it's stable across frames.
-            yj = y + 0.42 * np.sin(x * 997.0)
+            # Slight band spread (in depth units) so units at the same/close depth
+            # split into a band; deterministic in x so it's stable across frames.
+            yj = y + jit_amp * np.sin(x * 997.0)
             scat.set_offsets(np.column_stack([x, yj]))
-            scat.set_color(colors[r])
+            scat.set_color(colors[c])
         else:
             scat.set_offsets(np.empty((0, 2)))
         ax.set_xlim(lo, hi)
@@ -242,7 +302,7 @@ def make_animation(
             end_text.set_alpha(a)
             end_text.set_text(
                 f"Spanned {n_oom:.1f} orders of magnitude in time\n"
-                f"(10 ms → {window_end_s / 3600:.0f} hours)"
+                f"({window_label(window_start_s)} → {window_label(window_end_s)})"
             )
         return scat, bar_line, bar_text, end_text
 

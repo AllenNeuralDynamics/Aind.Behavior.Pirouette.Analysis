@@ -41,15 +41,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--units-file", default=_default_units(),
                    help="Units pickle with per-unit 'spike_times' and 'depth' "
                         "(env RASTER_UNITS_FILE, or UNITS_DIR/good_units.pkl).")
+    p.add_argument("--save-dir", default=os.getenv("RASTER_SAVE_DIR"),
+                   help="Directory to write the animation into (env RASTER_SAVE_DIR). "
+                        "Ignored if --out is an absolute path.")
     p.add_argument("--out", default=os.getenv("RASTER_OUT", "raster_animation.mp4"),
-                   help="Output .mp4 or .gif (env RASTER_OUT).")
+                   help="Output file name or path, .mp4/.gif (env RASTER_OUT). "
+                        "A bare name is written under --save-dir.")
     p.add_argument("--center-s", type=float,
                    default=(float(os.getenv("RASTER_CENTER_S"))
                             if os.getenv("RASTER_CENTER_S") else None),
                    help="Time the zoom centres on (default: middle of the recording).")
     p.add_argument("--window-start-s", type=float,
-                   default=float(os.getenv("RASTER_WINDOW_START_S", "0.01")),
-                   help="Initial window width in seconds (default 0.01 = 10 ms).")
+                   default=float(os.getenv("RASTER_WINDOW_START_S", "70")),
+                   help="Initial window width in seconds (default 70).")
     p.add_argument("--window-end-s", type=float,
                    default=(float(os.getenv("RASTER_WINDOW_END_S"))
                             if os.getenv("RASTER_WINDOW_END_S") else None),
@@ -64,6 +68,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--cap", type=int, default=int(os.getenv("RASTER_CAP", "60000")),
                    help="Max spikes drawn per frame (subsampled; default 60000).")
     p.add_argument("--dpi", type=int, default=int(os.getenv("RASTER_DPI", "120")))
+    p.add_argument("--palette", default=os.getenv("RASTER_CMAP", "muted"),
+                   help="Colour palette: 'muted' (default), 'rainbow', or any "
+                        "Matplotlib colormap name (env RASTER_CMAP).")
+    p.add_argument("--band-spread", type=float,
+                   default=float(os.getenv("RASTER_BAND_SPREAD", "0.4")),
+                   help="Band jitter as a fraction of the median depth gap "
+                        "(slight offset for overlapping units; env RASTER_BAND_SPREAD).")
     p.add_argument("--invert-depth", action="store_true",
                    default=os.getenv("RASTER_INVERT_DEPTH", "").lower()
                    in ("1", "true", "yes"),
@@ -76,9 +87,14 @@ def main(argv: list[str] | None = None) -> None:
             "in .env (expects a good_units.pkl with per-unit 'depth')."
         )
 
-    print(f"Rendering raster animation from {args.units_file} -> {args.out} ...")
-    out = make_animation(
-        args.units_file, args.out,
+    # Resolve output: a bare name goes under --save-dir (if set).
+    out = Path(args.out)
+    if not out.is_absolute() and args.save_dir:
+        out = Path(args.save_dir) / out
+
+    print(f"Rendering raster animation from {args.units_file} -> {out} ...")
+    saved = make_animation(
+        args.units_file, out,
         center_s=args.center_s,
         window_start_s=args.window_start_s,
         window_end_s=args.window_end_s,
@@ -88,8 +104,10 @@ def main(argv: list[str] | None = None) -> None:
         cap=args.cap,
         dpi=args.dpi,
         invert_depth=args.invert_depth,
+        palette=args.palette,
+        band_spread=args.band_spread,
     )
-    print(f"Saved {out}")
+    print(f"Saved {saved}")
 
 
 if __name__ == "__main__":
