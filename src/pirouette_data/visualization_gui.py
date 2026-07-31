@@ -1218,13 +1218,22 @@ def create_app(
         # tz-naive wall-clock ms so the client-side cursor aligns with the axis.
         start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
         sl = slice(base, base + n)
+        # Ship head x/y as int16 (0.1 mm units) and per-frame time as int32 ms
+        # relative to the segment start, base64-encoded. This is ~2.3 MB vs ~5.3 MB
+        # of JSON number arrays and much faster to parse -- the head plot was slow
+        # to appear because of that payload. The client decodes it back to arrays.
+        import base64
+        hx_i16 = np.clip(np.round(state.head_x[sl] * 10), -32000, 32000).astype("int16")
+        hy_i16 = np.clip(np.round(state.head_y[sl] * 10), -32000, 32000).astype("int16")
+        ht_arr = state.head_t[sl]
+        ht0 = float(ht_arr[0]) if ht_arr.size else 0.0
+        ht_rel_ms = np.round((ht_arr - ht0) * 1000.0).astype("int32")
         seg_store = {
             "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
-            # 0.1 mm precision is plenty for the trail and roughly halves the
-            # payload vs 2 decimals (this ships on every segment switch).
-            "hx": np.round(state.head_x[sl], 1).tolist(),
-            "hy": np.round(state.head_y[sl], 1).tolist(),
-            "ht": np.round(state.head_t[sl], 3).tolist(),
+            "ht0": ht0,
+            "hx_i16": base64.b64encode(hx_i16.tobytes()).decode("ascii"),
+            "hy_i16": base64.b64encode(hy_i16.tobytes()).decode("ascii"),
+            "ht_rel_ms_i32": base64.b64encode(ht_rel_ms.tobytes()).decode("ascii"),
         }
         head_fig = build_head_position(
             state.head_x, state.head_y, state.head_ms, base,
@@ -1535,7 +1544,53 @@ def create_app(
     app.clientside_callback(
         """
         function(seg) {
+            // Decode the compact head payload (int16 0.1 mm x/y, int32 ms relative
+            // time) back into arrays. Much faster to transfer + parse than JSON
+            // number arrays, which made the head plot slow to appear.
+            if (seg && seg.hx_i16 && !seg.hx) {
+                try {
+                    var b64ToArr = function (b64, Ctor) {
+                        var bin = atob(b64), len = bin.length;
+                        var bytes = new Uint8Array(len);
+                        for (var k = 0; k < len; k++) { bytes[k] = bin.charCodeAt(k); }
+                        return new Ctor(bytes.buffer);
+                    };
+                    var hxi = b64ToArr(seg.hx_i16, Int16Array);
+                    var hyi = b64ToArr(seg.hy_i16, Int16Array);
+                    var htr = b64ToArr(seg.ht_rel_ms_i32, Int32Array);
+                    var m = hxi.length, ht0 = seg.ht0 || 0;
+                    var hx = new Float64Array(m), hy = new Float64Array(m);
+                    var ht = new Float64Array(m);
+                    for (var j = 0; j < m; j++) {
+                        hx[j] = hxi[j] / 10; hy[j] = hyi[j] / 10;
+                        ht[j] = ht0 + htr[j] / 1000;
+                    }
+                    seg.hx = hx; seg.hy = hy; seg.ht = ht;
+                } catch (e) {}
+            }
             window.__seg = seg;
+            // Position the head dot for the current frame as soon as this segment's
+            // data AND its rebuilt figure are laid out (retry briefly). Fixes the
+            // head marker not updating after a click/seek until playback -- a race
+            // with the data/layout being ready.
+            (function () {
+                var tries = 0;
+                function pos() {
+                    var vv = document.getElementById('video');
+                    var hgd = document.getElementById('head');
+                    hgd = hgd && (hgd.classList.contains('js-plotly-plot')
+                        ? hgd : hgd.querySelector('.js-plotly-plot'));
+                    if (window.__placeHeadDot && window.__seg && window.__seg.hx
+                        && vv && vv.duration && hgd && hgd._fullLayout
+                        && hgd._fullLayout.xaxis && hgd._fullLayout.xaxis._length) {
+                        var fe = window.__seg.hx.length / vv.duration;
+                        window.__placeHeadDot(Math.round((vv.currentTime || 0) * fe));
+                        return;
+                    }
+                    if (tries++ < 60) { setTimeout(pos, 50); }
+                }
+                pos();
+            })();
             // Head plot's home ranges for Plot Reset (updated once per segment).
             if (seg && seg.head_xrange && seg.head_yrange) {
                 window.__headHome = {x: seg.head_xrange, y: seg.head_yrange};
