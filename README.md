@@ -228,6 +228,25 @@ datasets; it is recomputed only when the units file, `FIRING_RATE_BIN_S`, or
 `FIRING_RATE_SMOOTH_S` change. The first run prints per-file progress (a one-time
 cost of a few minutes for a large multi-hundred-unit file).
 
+## Spike-raster "Powers of Ten" animation
+
+`pirouette_data.animations` renders a manually-curated spike raster (X = time,
+Y = unit ordered by depth — deepest at top — each unit its own colour) and zooms
+smoothly **out from a 10 ms window to the full ~36 h recording**, like the *Powers
+of Ten* film. A dynamic scale bar switches through 1 ms / 1 s / 1 min / 1 hour /
+12 hours as the view widens, and a closing card reports the orders of magnitude in
+time spanned (~7.1). The units file must carry a per-unit `depth`.
+
+```bash
+uv run python scripts/raster_animation.py            # -> raster_animation.mp4
+uv run python scripts/raster_animation.py --duration-s 30 --fps 60 --out raster.mp4
+```
+
+Inputs come from CLI flags or `.env` (`RASTER_UNITS_FILE` — defaults to
+`UNITS_DIR/good_units.pkl` — `RASTER_OUT`, `RASTER_DURATION_S`, `RASTER_FPS`,
+`RASTER_CAP`, `RASTER_CENTER_S`, `RASTER_INVERT_DEPTH`, …). Requires `ffmpeg` for
+`.mp4` (use a `.gif` output otherwise).
+
 ## Methods notes
 
 - **Harp time → datetime** uses the [Aeon API](https://github.com/SainsburyWellcomeCentre/aeon_api)
