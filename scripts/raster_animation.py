@@ -71,10 +71,6 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--palette", default=os.getenv("RASTER_CMAP", "muted"),
                    help="Colour palette: 'muted' (default), 'rainbow', or any "
                         "Matplotlib colormap name (env RASTER_CMAP).")
-    p.add_argument("--band-spread", type=float,
-                   default=float(os.getenv("RASTER_BAND_SPREAD", "0.4")),
-                   help="Band jitter as a fraction of the median depth gap "
-                        "(slight offset for overlapping units; env RASTER_BAND_SPREAD).")
     p.add_argument("--invert-depth", action="store_true",
                    default=os.getenv("RASTER_INVERT_DEPTH", "").lower()
                    in ("1", "true", "yes"),
@@ -105,7 +101,6 @@ def main(argv: list[str] | None = None) -> None:
         dpi=args.dpi,
         invert_depth=args.invert_depth,
         palette=args.palette,
-        band_spread=args.band_spread,
     )
     print(f"Saved {saved}")
 

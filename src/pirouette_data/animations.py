@@ -1,14 +1,15 @@
 """Spike-raster "Powers of Ten" zoom animation.
 
-Renders a manually-curated spike raster (X = time, Y = unit ordered by depth, each
-unit its own colour) and smoothly zooms OUT from a 10 ms window to the full ~36 h
-recording -- like the *Powers of Ten* film. A dynamic scale bar at the bottom
-switches through 1 ms / 1 s / 1 min / 1 hour / 12 hours as the view widens, and a
-closing card reports how many orders of magnitude in time were spanned.
+Renders a manually-curated spike raster (X = time, Y = each unit's true depth,
+each unit its own colour) and smoothly zooms OUT from a 10 ms window to the full
+~36 h recording -- like the *Powers of Ten* film. The X-axis units switch
+ms -> s -> min -> hours as it widens, a dynamic scale bar switches through
+1 ms / 1 s / 1 min / 1 hour / 10 hours, and a closing card reports how many orders
+of magnitude in time were spanned.
 
 The units file (a ``good_units.pkl``: ``{unit_id: {"spike_times", "depth", ...}}``)
-must provide a ``depth`` per unit so rows can be ordered "highest relative to the
-probe at the top". Build an animation with :func:`make_animation`.
+must provide a ``depth`` per unit; the deepest units are drawn at the bottom (flip
+with ``invert_depth``). Build an animation with :func:`make_animation`.
 """
 
 from __future__ import annotations
@@ -59,9 +60,8 @@ def prepare_units(units: dict, invert_depth: bool = False) -> list[dict]:
     """Per-unit records ordered by depth, with sorted spike times.
 
     Returns a list of ``{"id", "depth", "cidx", "times"}`` ordered by depth. The Y
-    position of each unit is its ``depth`` (deepest at the top by default; units
-    that share a depth are spread apart by the animation's band jitter). ``cidx``
-    is the colour index in depth order. *invert_depth* flips top/bottom.
+    position of each unit is its true ``depth``; ``cidx`` is the colour index in
+    depth order. *invert_depth* reverses the colour order.
     """
     ids = sorted(units.keys(), key=lambda u: float(units[u]["depth"]), reverse=invert_depth)
     out = []
@@ -70,15 +70,6 @@ def prepare_units(units: dict, invert_depth: bool = False) -> list[dict]:
         out.append({"id": u, "depth": float(units[u]["depth"]), "cidx": cidx,
                     "times": np.sort(t)})
     return out
-
-
-def _depth_jitter_amp(per_unit: list[dict], band_spread: float) -> float:
-    """A slight y offset (in depth units) so units at the same/close depth split
-    into a band rather than sitting on one line."""
-    depths = np.array(sorted({pu["depth"] for pu in per_unit}))
-    gaps = np.diff(depths)
-    med_gap = float(np.median(gaps)) if gaps.size else 10.0
-    return band_spread * (med_gap if med_gap > 0 else 10.0)
 
 
 def unit_colors(n: int, palette: str = "muted") -> np.ndarray:
@@ -215,11 +206,10 @@ def make_animation(
     duration_s: float = 20.0,
     hold_s: float = 3.0,
     fps: int = 30,
-    cap: int = 60000,
+    cap: int = 20000,
     dpi: int = 120,
     invert_depth: bool = False,
     palette: str = "muted",
-    band_spread: float = 0.4,
     seed: int = 0,
     title: str = "Manually curated spike output",
 ) -> Path:
@@ -243,9 +233,6 @@ def make_animation(
     palette:
         Colour palette (``"muted"`` default; ``"rainbow"``, or any Matplotlib
         colormap name). See :func:`unit_colors`.
-    band_spread:
-        Fraction of the median depth gap used to jitter spikes into a band, so
-        units at the same/close depth are slightly offset.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -268,8 +255,7 @@ def make_animation(
     colors = unit_colors(n_units, palette)
     depths = np.array([pu["depth"] for pu in per_unit])
     d_lo, d_hi = float(depths.min()), float(depths.max())
-    jit_amp = _depth_jitter_amp(per_unit, band_spread)
-    d_pad = jit_amp + 0.03 * (d_hi - d_lo + 1)
+    d_pad = 0.04 * (d_hi - d_lo) + 5.0
 
     n_zoom = max(2, int(round(duration_s * fps)))
     n_hold = max(1, int(round(hold_s * fps)))
@@ -280,7 +266,10 @@ def make_animation(
     fig, ax = plt.subplots(figsize=(9, 9))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("white")
-    scat = ax.scatter([], [], s=3, c=[], edgecolors="none", rasterized=True)
+    # Square markers with anti-aliasing off render markedly faster than the
+    # default circles (the per-frame bottleneck), with no visible difference here.
+    scat = ax.scatter([], [], s=4, c=[], marker="s", edgecolors="none",
+                      antialiased=False)
     # Y = depth. Default: deepest at the BOTTOM (axis runs low->high downward);
     # invert_depth puts the deepest at the top.
     if invert_depth:
@@ -303,10 +292,8 @@ def make_animation(
     def draw(lo, hi):
         x, y, c = frame_points(per_unit, lo, hi, cap)
         if len(x):
-            # Slight band spread (in depth units) so units at the same/close depth
-            # split into a band; deterministic in x so it's stable across frames.
-            yj = y + jit_amp * np.sin(x * 997.0)
-            scat.set_offsets(np.column_stack([x, yj]))
+            # Y is the true depth (no jitter): every spike sits on its unit's depth.
+            scat.set_offsets(np.column_stack([x, y]))
             scat.set_color(colors[c])
         else:
             scat.set_offsets(np.empty((0, 2)))
@@ -358,8 +345,15 @@ def make_animation(
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = (animation.PillowWriter(fps=fps) if out_path.suffix.lower() == ".gif"
-              else animation.FFMpegWriter(fps=fps, bitrate=4000))
+    if out_path.suffix.lower() == ".gif":
+        writer = animation.PillowWriter(fps=fps)
+    else:
+        # -preset veryfast keeps x264 from being the bottleneck (the default preset
+        # falls behind at 1080p and stalls the render); crf gives good quality.
+        writer = animation.FFMpegWriter(
+            fps=fps, codec="libx264",
+            extra_args=["-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"],
+        )
     anim.save(str(out_path), writer=writer, dpi=dpi, progress_callback=_progress)
     print()  # newline after the progress bar
     plt.close(fig)
