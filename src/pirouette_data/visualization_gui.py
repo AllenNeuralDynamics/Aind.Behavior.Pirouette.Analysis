@@ -1967,6 +1967,15 @@ def create_app(
                     window.__cursorHoldT = nowP;
                     if (window.__placeCursor) { window.__placeCursor(ms); }
                     if (v && s.name === curName) {
+                        // Move the head dot to the clicked frame RIGHT NOW -- don't
+                        // wait for the sync loop or rVFC (which often doesn't fire on
+                        // a paused seek), so the head plot lands on the clicked spot
+                        // immediately instead of only after pressing play.
+                        if (window.__placeHeadDot && window.__seg && window.__seg.hx
+                            && v.duration) {
+                            var fpsE = window.__seg.hx.length / v.duration;
+                            window.__placeHeadDot(Math.round(localT * fpsE));
+                        }
                         // Same hour: seek natively RIGHT NOW (no Dash round-trip) and
                         // keep playing if it was. Coalesce rapid clicks: if a seek is
                         // already in flight, remember the latest target and apply it
