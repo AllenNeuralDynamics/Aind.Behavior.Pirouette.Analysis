@@ -1462,6 +1462,11 @@ def create_app(
                 } catch (e) { /* not ready */ }
             }
 
+            // Head dot: rVFC drives it smoothly during playback, but often doesn't
+            // fire on a PAUSED seek/scrub -- so update it here too when paused, so
+            // the head plot lands on the clicked spot immediately (not only on play).
+            if (v.paused && window.__placeHeadDot) { window.__placeHeadDot(i); }
+
             // Frame info (client-side; frameMs is the current frame's wall-clock).
             var wall = new Date(frameMs).toISOString()
                 .replace('T', ' ').replace('Z', '');
@@ -1584,11 +1589,37 @@ def create_app(
                     }
                 } catch (e) {}
             };
-            // Move ONLY the head dot for a media time `mt` (seconds). This is a
-            // single CSS transform (compositor-only, no Plotly redraw), so it can
-            // run for every presented video frame without falling behind. The
-            // timeseries cursor is a Plotly shape moved on the slower 40 ms loop --
-            // relayout is too heavy to call per frame and would starve this update.
+            // Position the head dot at frame index `i` via a CSS transform. Exposed
+            // as a global so the 40 ms sync loop can also call it on a PAUSED seek
+            // (rVFC often doesn't fire while paused, which left the head plot stale
+            // until playback resumed).
+            window.__placeHeadDot = function (i) {
+                try {
+                    var s = window.__seg;
+                    if (!s || !s.hx) { return; }
+                    if (i < 0) { i = 0; }
+                    if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                    var hgd = pdiv('head');
+                    var dot = document.getElementById('head-dot');
+                    if (hgd && hgd._fullLayout && dot) {
+                        var xa = hgd._fullLayout.xaxis, ya = hgd._fullLayout.yaxis;
+                        if (xa && ya && xa._length && ya._length) {
+                            var px = xa._offset + (s.hx[i] - xa.range[0])
+                                / (xa.range[1] - xa.range[0]) * xa._length;
+                            var py = ya._offset + (ya.range[1] - s.hy[i])
+                                / (ya.range[1] - ya.range[0]) * ya._length;
+                            dot.style.transform = 'translate('
+                                + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
+                            dot.style.display = 'block';
+                        }
+                    }
+                } catch (e) {}
+            };
+            // Move the head dot for a media time `mt` (seconds). This is a single
+            // CSS transform (compositor-only, no Plotly redraw), so it can run for
+            // every presented video frame without falling behind. The timeseries
+            // cursor is a Plotly shape moved on the slower 40 ms loop -- relayout is
+            // too heavy to call per frame and would starve this update.
             function place(mt) {
                 try {
                     var s = window.__seg;
@@ -1605,21 +1636,7 @@ def create_app(
                     var i = Math.round(mt * fpsEff);
                     if (i < 0) { i = 0; }
                     if (i > n - 1) { i = n - 1; }
-                    var hgd = pdiv('head');
-                    var dot = document.getElementById('head-dot');
-                    if (hgd && hgd._fullLayout && dot) {
-                        var xa = hgd._fullLayout.xaxis;
-                        var ya = hgd._fullLayout.yaxis;
-                        if (xa && ya && xa._length && ya._length) {
-                            var px = xa._offset + (s.hx[i] - xa.range[0])
-                                / (xa.range[1] - xa.range[0]) * xa._length;
-                            var py = ya._offset + (ya.range[1] - s.hy[i])
-                                / (ya.range[1] - ya.range[0]) * ya._length;
-                            dot.style.transform = 'translate('
-                                + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
-                            dot.style.display = 'block';
-                        }
-                    }
+                    window.__placeHeadDot(i);
                     // Cursor at this frame's wall-clock time (aligns with the data
                     // and spike ticks, same as the head dot) -- but NOT while a click
                     // hold is active (the 40 ms sync loop pins the cursor to the click
