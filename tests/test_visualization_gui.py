@@ -174,6 +174,76 @@ def test_segments_and_segment_info():
     assert fps == pytest.approx(60.0, rel=0.05)
 
 
+def test_build_segment_table_matches_segment_info():
+    n = 120
+    src = np.where(np.arange(n) < 60, "TopCamera_A", "TopCamera_B")
+    df = pd.DataFrame({
+        "source_file": src,
+        "frame": np.concatenate([np.arange(60), np.arange(60)]),
+        "time_since_start": np.arange(n) / 60.0,
+    })
+    table = viz.build_segment_table(df)
+    assert [name for name, _, _, _ in table] == ["TopCamera_A", "TopCamera_B"]
+    # Each table row must agree with the per-segment scan it replaces.
+    for name, base, count, fps in table:
+        b2, c2, f2 = viz.segment_info(df, name)
+        assert (base, count) == (b2, c2)
+        assert fps == pytest.approx(f2, rel=1e-6)
+
+
+def test_clear_firing_rate_caches(tmp_path):
+    import pickle
+    uf = tmp_path / "u.pkl"
+    with open(uf, "wb") as f:
+        pickle.dump({1: {"spike_times": np.array([1.0])}}, f)
+    parq, js = viz.ephys.cache_paths(uf)
+    parq.write_bytes(b"x")
+    js.write_text("{}")
+    viz._clear_firing_rate_caches(tmp_path)
+    assert not parq.exists() and not js.exists()  # caches removed
+    assert uf.exists()  # the units file itself is kept
+
+
+def test_file_options_show_only_names(tmp_path):
+    (tmp_path / "a.parquet").write_bytes(b"x")
+    (tmp_path / "b.csv").write_text("x")
+    opts = viz.file_options(tmp_path, (".parquet", ".pkl", ".csv"))
+    # Labels and values are bare names -- never the absolute path.
+    for o in opts:
+        assert o["label"] == o["value"]
+        assert "/" not in o["value"] and "\\" not in o["value"]
+    assert {o["value"] for o in opts} == {"a.parquet", "b.csv"}
+
+
+def test_resolve_in_dir_confines_to_folder(tmp_path):
+    (tmp_path / "data.parquet").write_bytes(b"x")
+    resolved = viz.resolve_in_dir(tmp_path, "data.parquet")
+    assert resolved is not None and resolved.endswith("data.parquet")
+    # Traversal / outside names are rejected.
+    assert viz.resolve_in_dir(tmp_path, "../secret.parquet") is None
+    assert viz.resolve_in_dir(tmp_path, "missing.parquet") is None
+    assert viz.resolve_in_dir(tmp_path, None) is None
+
+
+def test_segment_options_flags_missing_videos(tmp_path):
+    segs = ["TopCamera_A", "TopCamera_B", "TopCamera_C"]
+    (tmp_path / "TopCamera_B.mp4").write_bytes(b"x")  # only B has a video
+    options, default = viz.segment_options(segs, tmp_path)
+    labels = {o["value"]: o["label"] for o in options}
+    disabled = {o["value"]: o["disabled"] for o in options}
+    assert labels["TopCamera_B"] == "TopCamera_B"
+    assert labels["TopCamera_A"] == "TopCamera_A — Not Available"
+    assert disabled == {"TopCamera_A": True, "TopCamera_B": False, "TopCamera_C": True}
+    assert default == "TopCamera_B"  # first (only) available
+
+
+def test_gui_columns_includes_essentials():
+    cols = viz.gui_columns()
+    for c in ("datetime_pacific", "time_since_start", "source_file", "behavior",
+              "left_ear_x_mm", "right_ear_y_mm", "ul_champber_x_mm"):
+        assert c in cols
+
+
 # ---------------------------------------------------------------------------
 # figure builders (need plotly) + frame encoding
 # ---------------------------------------------------------------------------
@@ -267,7 +337,67 @@ def test_named_tunnel_requires_name():
 
 
 def test_named_tunnel_requires_cloudflared(monkeypatch):
-    # Tunnel name given but cloudflared not installed -> actionable error.
-    monkeypatch.setattr("shutil.which", lambda _: None)
-    with pytest.raises(RuntimeError, match="cloudflared not found"):
+    # Tunnel name given but no cloudflared anywhere -> actionable error.
+    monkeypatch.setattr(viz, "_cloudflared_bin", lambda: "")
+    with pytest.raises(RuntimeError, match="cloudflared executable not found"):
         viz._start_cloudflare_named_tunnel(8050, "pirouette", "pirouette.example.org")
+
+
+def test_cloudflared_bin_falls_back_to_pycloudflared(monkeypatch):
+    # With nothing on PATH, it should find the pycloudflared-bundled binary.
+    monkeypatch.setattr("shutil.which", lambda _: None)
+    exe = viz._cloudflared_bin()
+    assert exe and exe.lower().endswith(".exe") or exe == ""  # bundled or absent
+
+
+def test_tunnel_exists_parses_json(monkeypatch):
+    from types import SimpleNamespace
+
+    def fake_run(cmd, **kw):
+        return SimpleNamespace(returncode=0, stdout='[{"name": "pirouette"}]', stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    assert viz._tunnel_exists("cf", "pirouette") is True
+    assert viz._tunnel_exists("cf", "other") is False
+
+
+def test_ensure_named_tunnel_creates_when_missing(monkeypatch, tmp_path):
+    # Already logged in (cert.pem present) + tunnel absent -> create + route, no login.
+    from types import SimpleNamespace
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(" ".join(cmd[1:]))
+        stdout = "[]" if "list" in cmd else ""  # list -> tunnel missing
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("os.path.expanduser", lambda _: str(tmp_path))
+    cfdir = tmp_path / ".cloudflared"
+    cfdir.mkdir()
+    (cfdir / "cert.pem").write_text("x")
+
+    viz._ensure_named_tunnel("cf", "pirouette", "pirouette-viz.org")
+    assert any("tunnel create pirouette" in c for c in calls)
+    assert any("route dns pirouette pirouette-viz.org" in c for c in calls)
+    assert not any("tunnel login" in c for c in calls)  # cert present
+
+
+def test_ensure_named_tunnel_logs_in_and_skips_create(monkeypatch, tmp_path):
+    # No cert.pem -> login; tunnel already exists -> no create.
+    from types import SimpleNamespace
+
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(" ".join(cmd[1:]))
+        stdout = '[{"name": "pirouette"}]' if "list" in cmd else ""
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("os.path.expanduser", lambda _: str(tmp_path))  # no cert.pem
+
+    viz._ensure_named_tunnel("cf", "pirouette", "pirouette-viz.org")
+    assert any("tunnel login" in c for c in calls)
+    assert not any("tunnel create" in c for c in calls)

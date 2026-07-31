@@ -32,6 +32,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from . import ephys
+
+# Firing rate lives in the ephys module now; re-exported for backwards-compat.
+from .ephys import instantaneous_firing_rate
+
 # --- Column names produced by the build pipeline ---
 COL_TIME = "time_since_start"
 COL_DATETIME = "datetime_pacific"
@@ -49,19 +54,33 @@ MOVE_COLOR = "#fa8072"  # salmon
 CURSOR_COLOR = "#e53935"  # red
 
 MAX_PLOT_POINTS = 12000  # timeseries downsample target
-MAX_RASTER_SPIKES = 40000  # cap markers in the spike raster (subsample if more)
+MAX_RASTER_SPIKES = 15000  # overview raster cap (full-recording view; ticks are
+#                            sub-pixel there, so a subsample looks identical) -- kept
+#                            small so switching units ships a light figure (~1 MB);
+#                            zoom refetches every tick in the window (below)
+RASTER_ZOOM_CAP = 100000  # cap when a zoomed window is refetched at full detail
+#                           (a window with more ticks than this is denser than the
+#                           pixels can resolve, so a subsample is visually identical
+#                           -- zoom in further to individuate them). ~4.5 MB.
+# Precomputed firing-rate cache resolution over each unit's RAW spike range. Kept
+# well above MAX_PLOT_POINTS so that a pose-window slice (often a fraction of the
+# raw range) still has >= MAX_PLOT_POINTS points to downsample from for display.
+FR_CACHE_POINTS = 60000
 
 
 # ---------------------------------------------------------------------------
 # Data layer (no Dash dependency — unit tested)
 # ---------------------------------------------------------------------------
-def load_dataset(path: str | Path) -> pd.DataFrame:
+def load_dataset(path: str | Path, columns: list[str] | None = None) -> pd.DataFrame:
     """Load a per-frame dataset from ``.parquet``, ``.pkl``, or ``.csv``.
 
     Parameters
     ----------
     path:
         Dataset file path.
+    columns:
+        If given, load only these columns (intersected with those present) for
+        ``.parquet``/``.csv``. ``.pkl`` always loads in full.
 
     Returns
     -------
@@ -76,11 +95,28 @@ def load_dataset(path: str | Path) -> pd.DataFrame:
     path = Path(path)
     suffix = path.suffix.lower()
     if suffix == ".parquet":
-        df = pd.read_parquet(path)
+        # Read only the columns the GUI needs -- these datasets are wide (45 cols,
+        # GBs); selecting ~20 columns roughly halves read time and memory.
+        if columns is not None:
+            import pyarrow.parquet as pq
+
+            available = set(pq.ParquetFile(path).schema.names)
+            use = [c for c in columns if c in available]
+            df = pd.read_parquet(path, columns=use or None)
+        else:
+            df = pd.read_parquet(path)
     elif suffix == ".pkl":
-        df = pd.read_pickle(path)
+        df = pd.read_pickle(path)  # pickled frames can't be column-filtered cheaply
     elif suffix == ".csv":
-        df = pd.read_csv(path)
+        if columns is not None:
+            import csv as _csv
+
+            with open(path, newline="") as fh:
+                header = next(_csv.reader(fh))
+            use = [c for c in columns if c in header]
+            df = pd.read_csv(path, usecols=use or None)
+        else:
+            df = pd.read_csv(path)
     else:
         raise ValueError(f"Unsupported dataset format: {suffix} ({path})")
 
@@ -156,58 +192,6 @@ def spikes_to_datetime(
     return exp_start_dt + pd.to_timedelta(np.asarray(spike_exp_s), unit="s")
 
 
-def instantaneous_firing_rate(
-    spike_exp_s: np.ndarray,
-    t0_s: float,
-    t1_s: float,
-    bin_s: float = 0.05,
-    smooth_sigma_s: float = 0.2,
-    max_bins: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Gaussian-smoothed instantaneous firing rate over ``[t0_s, t1_s]``.
-
-    Parameters
-    ----------
-    spike_exp_s:
-        Experiment-referenced spike times (seconds).
-    t0_s, t1_s:
-        Time window (experiment seconds) over which to compute the rate.
-    bin_s:
-        Requested histogram bin width (seconds).
-    smooth_sigma_s:
-        Gaussian smoothing sigma (seconds).
-    max_bins:
-        Optional cap on the number of bins. Over long windows the ``bin_s``
-        resolution can imply millions of bins that are far finer than the plot
-        can show; capping keeps the computation fast (the effective bin width
-        widens to ``(t1 - t0) / max_bins``).
-
-    Returns
-    -------
-    centers_s : numpy.ndarray
-        Bin-centre times (experiment seconds).
-    rate : numpy.ndarray
-        Firing rate in Hz at each bin centre.
-    """
-    from scipy.ndimage import gaussian_filter1d
-
-    if t1_s <= t0_s:
-        return np.array([]), np.array([])
-    n_bins = max(1, int(round((t1_s - t0_s) / bin_s)))
-    if max_bins is not None and n_bins > max_bins:
-        n_bins = max_bins
-    edges = np.linspace(t0_s, t1_s, n_bins + 1)
-    width = (t1_s - t0_s) / n_bins
-    spikes = np.asarray(spike_exp_s, dtype="float64")
-    spikes = spikes[(spikes >= t0_s) & (spikes <= t1_s)]
-    counts, _ = np.histogram(spikes, bins=edges)
-    rate = counts / width
-    sigma_bins = max(1e-6, smooth_sigma_s / width)
-    rate = gaussian_filter1d(rate, sigma_bins, mode="nearest")
-    centers = (edges[:-1] + edges[1:]) / 2.0
-    return centers, rate
-
-
 def behavior_bouts(df: pd.DataFrame) -> list[tuple[pd.Timestamp, pd.Timestamp, str]]:
     """Contiguous behaviour bouts as ``(start_dt, end_dt, label)`` tuples."""
     if COL_BEHAVIOR not in df.columns:
@@ -224,6 +208,17 @@ def behavior_bouts(df: pd.DataFrame) -> list[tuple[pd.Timestamp, pd.Timestamp, s
 
 
 CHAMBER_CORNERS = ["ul_champber", "ur_champber", "lr_chamber", "ll_chamber"]
+
+
+def gui_columns() -> list[str]:
+    """Columns the GUI actually reads -- used to load wide datasets faster."""
+    cols = [COL_TIME, COL_DATETIME, COL_SOURCE, COL_FRAME, COL_BEHAVIOR,
+            COL_VELOCITY, COL_EAR_HEADING, COL_COMM_HEADING]
+    for ear in (LEFT_EAR, RIGHT_EAR):
+        cols += [f"{ear}_x_mm", f"{ear}_y_mm"]
+    for corner in CHAMBER_CORNERS:
+        cols += [f"{corner}_x_mm", f"{corner}_y_mm"]
+    return cols
 
 
 def chamber_corners_mm(df: pd.DataFrame) -> dict[str, tuple[float, float]]:
@@ -283,6 +278,51 @@ def segment_info(df: pd.DataFrame, source_file: str) -> tuple[int, int, float]:
     else:
         fps = 60.0
     return base, n, fps
+
+
+def segment_options(
+    segs: list[str], video_dir: str | Path
+) -> tuple[list[dict], str | None]:
+    """Dropdown options for the hour segments + the default selection.
+
+    Hours whose ``<name>.mp4`` is missing from ``video_dir`` are labelled
+    ``"<name> — Not Available"`` and disabled; the default is the first hour that
+    does have a video (so playback works out of the box).
+    """
+    video_dir = Path(video_dir)
+    have = {s: (video_dir / f"{s}.mp4").exists() for s in segs}
+    options = [
+        {"label": s if have[s] else f"{s} — Not Available",
+         "value": s, "disabled": not have[s]}
+        for s in segs
+    ]
+    default = next((s for s in segs if have[s]), segs[0] if segs else None)
+    return options, default
+
+
+def build_segment_table(df: pd.DataFrame) -> list[tuple[str, int, int, float]]:
+    """Ordered ``(name, base_row, n_frames, fps)`` per segment, in ONE pass.
+
+    Segments are contiguous blocks of ``source_file``; computing them all at once
+    avoids rescanning the (multi-million-row) source column once per segment,
+    which dominated load time on large datasets.
+    """
+    src = df[COL_SOURCE].to_numpy()
+    t = df[COL_TIME].to_numpy(dtype="float64")
+    codes = pd.factorize(df[COL_SOURCE], sort=False)[0]  # int codes: fast compare
+    change = np.flatnonzero(codes[1:] != codes[:-1]) + 1
+    starts = np.concatenate(([0], change))
+    ends = np.concatenate((change, [len(df)]))
+    table: list[tuple[str, int, int, float]] = []
+    for a, b in zip(starts, ends):
+        n = int(b - a)
+        if n > 1:
+            dt = float(np.median(np.diff(t[a:b])))
+            fps = 1.0 / dt if dt > 0 else 60.0
+        else:
+            fps = 60.0
+        table.append((str(src[a]), int(a), n, fps))
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +419,15 @@ class AppState:
     chamber: dict | None = None
     unit_id: object = None
     bottom_cache: dict = field(default_factory=dict)
+    segtable: list | None = None  # (name, base, n, fps) per segment, computed once
+    fr_cache: dict | None = None  # precomputed firing rates for the loaded units
+    autoselect_unit: object = None  # unit _load just auto-picked (consumed once)
+    load_status_msg: str = ""  # last dataset "Loaded …" summary, to re-show
+    load_counter: int = 0  # nonce so the load-info store always changes
 
     def load(self, dataset_path: str | Path, units_path: str | Path, offset_s: float):
         """Load a dataset + units file into the state."""
-        self.df = load_dataset(dataset_path)
+        self.df = load_dataset(dataset_path, columns=gui_columns())
         self.units = load_units(units_path)
         self.spike_offset_s = float(offset_s)
         self.exp_start_dt = experiment_start_datetime(self.df)
@@ -395,6 +440,13 @@ class AppState:
         self.chamber = chamber_corners_mm(self.df)
         self.unit_id = unit_ids(self.units)[0]
         self.bottom_cache = {}
+        self.segtable = build_segment_table(self.df)  # one pass, reused everywhere
+        # Precomputed firing rates (built before launch; recomputed here only if the
+        # cache is missing/stale). Makes switching units near-instant.
+        self.fr_cache = ephys.ensure_firing_rates(
+            self.units, units_path, self.firing_rate_bin_s,
+            self.firing_rate_smooth_s, FR_CACHE_POINTS,
+        )
         return self
 
 
@@ -405,6 +457,30 @@ def _list_files(directory: Path, suffixes: tuple[str, ...]) -> list[str]:
     return sorted(
         str(p) for p in directory.iterdir() if p.suffix.lower() in suffixes
     )
+
+
+def file_options(directory: Path, suffixes: tuple[str, ...]) -> list[dict]:
+    """Dropdown options for files in *directory*, showing/sending only the file
+    NAME (never the full path, which would leak the server's directory layout to
+    viewers)."""
+    return [{"label": Path(p).name, "value": Path(p).name}
+            for p in _list_files(directory, suffixes)]
+
+
+def resolve_in_dir(directory: Path, name: str | None) -> str | None:
+    """Resolve a bare file *name* to a full path inside *directory*.
+
+    Returns ``None`` unless the name is a real file directly in *directory* (so a
+    dropdown value can only ever load a file from the configured folder -- no path
+    traversal, and the client never sees or sends an absolute path).
+    """
+    if not name:
+        return None
+    base = Path(directory).resolve()
+    path = (base / Path(name).name).resolve()
+    if path.parent != base or not path.is_file():
+        return None
+    return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -479,9 +555,12 @@ def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
         )
 
     x0 = x.iloc[0]
+    # Hidden Plotly cursor (kept so the figure/tests still carry it); the VISIBLE
+    # red cursor is a DOM overlay moved by CSS transform -- Plotly.relayout is far
+    # too slow (100-200 ms) on these heavy figures to move a shape per frame.
     fig.add_shape(
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
-        line=dict(color=CURSOR_COLOR, width=2.5),
+        line=dict(color=CURSOR_COLOR, width=2.5), opacity=0,
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="mm/s", row=2, col=1)
@@ -490,7 +569,7 @@ def build_timeseries_top(df: pd.DataFrame, heading_mode: str = "vector"):
     fig.update_yaxes(fixedrange=True)
     fig.update_annotations(font_size=12)  # subplot titles hold the labels
     fig.update_layout(
-        height=460, margin=dict(l=55, r=25, t=30, b=20),
+        autosize=True, margin=dict(l=55, r=25, t=30, b=20),
         showlegend=False, template="plotly_white", uirevision="ts-top",
     )
     return fig
@@ -525,9 +604,9 @@ def build_timeseries_bottom(
         go.Scattergl(x=rate_dt, y=rate, line=dict(color="#1565c0", width=1), name="rate"),
         row=2, col=1,
     )
-    fig.add_shape(
+    fig.add_shape(  # hidden; visible cursor is the DOM overlay (see build_layout)
         type="line", x0=x0, x1=x0, y0=0, y1=1, xref="x", yref="paper",
-        line=dict(color=CURSOR_COLOR, width=2.5),
+        line=dict(color=CURSOR_COLOR, width=2.5), opacity=0,
     )
     fig.update_yaxes(showticklabels=False, row=1, col=1)
     fig.update_yaxes(title_text="Hz", row=2, col=1)
@@ -536,7 +615,7 @@ def build_timeseries_bottom(
     if x_range is not None:
         fig.update_xaxes(range=list(x_range))
     fig.update_layout(
-        height=320, margin=dict(l=55, r=25, t=30, b=20), showlegend=False,
+        autosize=True, margin=dict(l=55, r=25, t=30, b=20), showlegend=False,
         template="plotly_white", uirevision=f"ts-bottom-{unit_label}",
     )
     return fig
@@ -597,6 +676,9 @@ def build_head_position(
                 x=[head_x[current_row]], y=[head_y[current_row]], mode="markers",
                 marker=dict(size=12, color=CURSOR_COLOR, line=dict(color="white", width=1)),
                 name="current", hoverinfo="skip",
+                # Hidden: the live current-position dot is a DOM overlay (#head-dot)
+                # moved by CSS transform each frame, which the video can't outrun.
+                opacity=0,
             )
         )
 
@@ -622,7 +704,7 @@ def build_head_position(
         fig.update_yaxes(autorange="reversed")
 
     fig.update_layout(
-        height=480, margin=dict(l=55, r=20, t=30, b=20), showlegend=False,
+        autosize=True, margin=dict(l=55, r=20, t=30, b=20), showlegend=False,
         template="plotly_white", title="head position (mm), time-coloured",
         uirevision="head",
     )
@@ -663,7 +745,7 @@ def create_app(
     dash.Dash
         The configured app. Call ``app.run(...)`` (or :func:`run`) to serve it.
     """
-    from dash import Dash, Input, Output, State, dcc, html, no_update
+    from dash import Dash, Input, Output, Patch, State, dcc, html, no_update
     from flask import abort, send_file
 
     state = AppState(
@@ -677,8 +759,10 @@ def create_app(
         heading_mode=heading_mode,
     )
 
-    datasets = _list_files(state.dataset_dir, (".parquet", ".pkl", ".csv"))
-    unit_files = _list_files(state.units_dir, (".pkl",))
+    # Show only file NAMES in the dropdowns (values are names too) so the server's
+    # absolute paths are never exposed to viewers.
+    dataset_opts = file_options(state.dataset_dir, (".parquet", ".pkl", ".csv"))
+    unit_opts = file_options(state.units_dir, (".pkl",))
 
     app = Dash(__name__, title="Pirouette explorer")
 
@@ -695,6 +779,13 @@ def create_app(
       .js-plotly-plot .nsewdrag,
       .js-plotly-plot .nsewdrag.cursor-ew-resize,
       .js-plotly-plot .nsewdrag.cursor-ns-resize { cursor: crosshair !important; }
+      /* Indeterminate loading bar (we can't get true % from the sync read). */
+      .load-bar-track { position: relative; height: 8px; width: 100%;
+        background: #e0e0e0; border-radius: 4px; overflow: hidden; }
+      .load-bar-track .fill { position: absolute; top: 0; height: 100%;
+        width: 40%; background: #1565c0; border-radius: 4px;
+        animation: loadslide 1.1s ease-in-out infinite; }
+      @keyframes loadslide { 0% { left: -40%; } 100% { left: 100%; } }
     </style>
   </head>
   <body>
@@ -718,13 +809,15 @@ def create_app(
         [
             html.Div([
                 html.Label("Dataset"),
-                dcc.Dropdown(id="dataset", options=datasets,
-                             value=datasets[0] if datasets else None, clearable=False),
+                dcc.Dropdown(id="dataset", options=dataset_opts,
+                             value=dataset_opts[0]["value"] if dataset_opts else None,
+                             clearable=False),
             ], style={"flex": "3"}),
             html.Div([
                 html.Label("Spike units"),
-                dcc.Dropdown(id="unitsfile", options=unit_files,
-                             value=unit_files[0] if unit_files else None, clearable=False),
+                dcc.Dropdown(id="unitsfile", options=unit_opts,
+                             value=unit_opts[0]["value"] if unit_opts else None,
+                             clearable=False),
             ], style={"flex": "3"}),
             html.Div([
                 html.Label("Spike offset (s)"),
@@ -736,15 +829,29 @@ def create_app(
                 dcc.Dropdown(id="unit", options=[], clearable=False),
             ], style={"flex": "1"}),
             html.Div([
-                html.Label(" "),
+                # Status + progress bar sit directly above the Load button.
+                html.Div(id="load-status", children="⏳ Loading…",
+                         style={"fontSize": "11px", "color": "#555",
+                                "minHeight": "14px", "marginBottom": "3px",
+                                "lineHeight": "1.2"}),
+                html.Div(html.Div(className="fill"), id="load-bar",
+                         className="load-bar-track", style={"marginBottom": "5px"}),
                 html.Button("Load", id="load", n_clicks=0, style={"width": "100%"}),
-            ], style={"flex": "1"}),
+            ], style={"flex": "2"}),
         ],
         style={"display": "flex", "gap": "10px", "alignItems": "flex-end",
                "padding": "8px"},
     )
 
-    graph_config = {"scrollZoom": True, "displaylogo": False}
+    # responsive: figures fill their flex cells and refit on window resize, so the
+    # GUI auto-sizes to whatever screen it's shown on. The right column is a flex
+    # column that fills the viewport height; the three plots share it by flex-grow
+    # (so none gets clipped), each graph filling its cell at height 100%.
+    graph_config = {"scrollZoom": True, "displaylogo": False, "responsive": True}
+    graph_fill = {"height": "100%", "width": "100%"}
+    wrap_top = {"position": "relative", "flex": "1.15 1 0", "minHeight": "0"}
+    wrap_head = {"position": "relative", "flex": "1 1 0", "minHeight": "0"}
+    wrap_bot = {"position": "relative", "flex": "1.1 1 0", "minHeight": "0"}
 
     # Equal-width columns: the video and the plots share the same horizontal
     # extent. The video sizes naturally to that width (no letterbox); the plots
@@ -752,9 +859,12 @@ def create_app(
     left = html.Div(
         [
             # Native HTML5 player: smooth, browser-buffered playback + scrubbing.
+            # preload="auto" tells the browser to buffer ahead aggressively so
+            # playback doesn't stall waiting on the next chunk.
             html.Video(
-                id="video", controls=True, autoPlay=False,
-                style={"width": "100%", "border": "1px solid #ccc", "background": "#000"},
+                id="video", controls=True, autoPlay=False, preload="auto",
+                style={"width": "100%", "maxHeight": "55vh", "objectFit": "contain",
+                       "border": "1px solid #ccc", "background": "#000"},
             ),
             html.Div(id="frame-info",
                      style={"fontFamily": "monospace", "padding": "6px 0",
@@ -799,34 +909,120 @@ def create_app(
             dcc.Interval(id="sync", interval=40, n_intervals=0),
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
+            dcc.Store(id="rasterwin"),  # visible x-window -> refetch full raster
+            dcc.Store(id="curhead"),  # clicked frame's head pos -> instant dot
             dcc.Store(id="seek"),
             dcc.Store(id="segspikes"),
+            # Server -> client "load finished" signal ({msg, n}); the visible
+            # status/bar are driven ONLY by client-side JS (Dash can't reliably
+            # share one output between a clientside and a server callback).
+            dcc.Store(id="load-info"),
             html.Div(id="_dummy", style={"display": "none"}),
             html.Div(id="_dummy2", style={"display": "none"}),
             html.Div(id="_dummy3", style={"display": "none"}),
             html.Div(id="_dummy4", style={"display": "none"}),
             html.Div(id="_dummy5", style={"display": "none"}),
             html.Div(id="_dummy6", style={"display": "none"}),
+            html.Div(id="_dummy7", style={"display": "none"}),
+            html.Div(id="_dummy8", style={"display": "none"}),
+            html.Div(id="_dummy9", style={"display": "none"}),
+            html.Div(id="_dummy10", style={"display": "none"}),
         ],
-        style={"flex": "1", "minWidth": "560px", "padding": "8px"},
+        style={"flex": "1", "minWidth": "560px", "padding": "8px",
+               "overflowY": "auto", "minHeight": "0"},
     )
 
     right = html.Div(
         [
-            dcc.Graph(id="ts-top", config=graph_config),
-            dcc.Graph(id="head", config=graph_config),
-            dcc.Graph(id="ts-bottom", config=graph_config),
+            html.Div(
+                [
+                    dcc.Graph(id="ts-top", config=graph_config, style=graph_fill),
+                    html.Div(id="cursor-top", style={
+                        "position": "absolute", "left": "0", "top": "0",
+                        "width": "2px", "height": "100%", "background": CURSOR_COLOR,
+                        "transform": "translateX(-100px)", "pointerEvents": "none",
+                        "display": "none", "zIndex": "10",
+                    }),
+                ],
+                style=wrap_top,
+            ),
+            # The head graph is wrapped so a lightweight DOM dot can be overlaid on
+            # it: the current-position marker is moved by a CSS transform (GPU
+            # compositor) every animation frame, which tracks the video with no lag
+            # -- Plotly.restyle can't keep up at high playback speed.
+            html.Div(
+                [
+                    dcc.Graph(id="head", config=graph_config, style=graph_fill),
+                    html.Div(id="head-dot", style={
+                        "position": "absolute", "left": "0", "top": "0",
+                        "boxSizing": "border-box",
+                        "width": "13px", "height": "13px", "borderRadius": "50%",
+                        "background": CURSOR_COLOR, "border": "1.5px solid white",
+                        "boxShadow": "0 0 3px rgba(0,0,0,0.6)",
+                        "transform": "translate(-100px,-100px)",
+                        "pointerEvents": "none", "display": "none", "zIndex": "10",
+                    }),
+                ],
+                style=wrap_head,
+            ),
+            html.Div(
+                [
+                    dcc.Graph(id="ts-bottom", config=graph_config, style=graph_fill),
+                    html.Div(id="cursor-bot", style={
+                        "position": "absolute", "left": "0", "top": "0",
+                        "width": "2px", "height": "100%", "background": CURSOR_COLOR,
+                        "transform": "translateX(-100px)", "pointerEvents": "none",
+                        "display": "none", "zIndex": "10",
+                    }),
+                ],
+                style=wrap_bot,
+            ),
         ],
-        style={"flex": "1", "padding": "8px"},
+        style={"flex": "1", "padding": "8px", "display": "flex",
+               "flexDirection": "column", "minWidth": "0", "minHeight": "0"},
     )
 
     app.layout = html.Div([
-        html.H3("Pirouette dataset explorer", style={"padding": "0 8px"}),
+        html.H3("Pirouette dataset explorer", style={"padding": "0 8px", "margin": "6px 0"}),
         controls,
-        html.Div([left, right], style={"display": "flex"}),
+        # Fill the viewport below the title + controls; the right column's plots
+        # flex to share this height (so the firing-rate plot is never clipped), and
+        # the left column scrolls internally on short screens.
+        html.Div(
+            [left, right],
+            style={"display": "flex", "gap": "8px", "alignItems": "stretch",
+                   "height": "calc(100vh - 96px)", "minHeight": "420px"},
+        ),
     ])
 
     # ---- helpers bound to state ----
+    def _rate_window(t0, t1, offset):
+        """Precomputed firing-rate points within ``[t0, t1]`` (experiment secs).
+
+        The cache holds the rate over raw spike seconds; shift the shared bin
+        centres by ``offset`` and slice to the window. Falls back to an on-the-fly
+        compute if the cache is somehow missing.
+        """
+        fr = state.fr_cache
+        rate = fr["rates"].get(str(state.unit_id)) if fr else None
+        if fr is None or rate is None:
+            spikes = unit_spike_times_experiment(state.units, state.unit_id, offset)
+            centers, r = instantaneous_firing_rate(
+                spikes, t0, t1, bin_s=state.firing_rate_bin_s,
+                smooth_sigma_s=state.firing_rate_smooth_s,
+            )
+            rs = _stride(len(centers))
+            return (spikes_to_datetime(centers[::rs], state.exp_start_dt)
+                    .tz_localize(None), r[::rs])
+        centers_exp = fr["centers_s"] + float(offset)
+        mask = (centers_exp >= t0) & (centers_exp <= t1)
+        cw, rw = centers_exp[mask], rate[mask]
+        # The cache is finer than the display; downsample the window to the plot
+        # target (matches the old shipped resolution).
+        rs = _stride(len(cw))
+        rate_dt = spikes_to_datetime(cw[::rs], state.exp_start_dt).tz_localize(None)
+        return rate_dt, rw[::rs]
+
     def _bottom_figure():
         df = state.df
         key = (state.unit_id, round(float(state.spike_offset_s), 3))
@@ -845,19 +1041,10 @@ def create_app(
                 in_range = in_range[idx]
             # tz-naive wall-clock so the client-side cursor lines up exactly.
             spike_dt = spikes_to_datetime(in_range, state.exp_start_dt).tz_localize(None)
-            # Firing rate at full (fine) resolution so the trace stays smooth;
-            # downsample the plotted points BEFORE the datetime conversion (that
-            # conversion of the full fine grid was the main cost, not the bins).
-            centers, rate = instantaneous_firing_rate(
-                spikes, t0, t1,
-                bin_s=state.firing_rate_bin_s,
-                smooth_sigma_s=state.firing_rate_smooth_s,
-            )
-            rs = _stride(len(centers))
-            rate_dt = spikes_to_datetime(
-                centers[::rs], state.exp_start_dt
-            ).tz_localize(None)
-            rate_ds = rate[::rs]
+            # Firing rate from the PRECOMPUTED cache: shift the shared raw-spike bin
+            # centres by the current offset and slice to the visible window -- no
+            # per-unit recompute (that ~1 s histogram+smooth was the bottleneck).
+            rate_dt, rate_ds = _rate_window(t0, t1, state.spike_offset_s)
             cached = (spike_dt, rate_dt, rate_ds)
             state.bottom_cache[key] = cached
         spike_dt, rate_dt, rate_ds = cached
@@ -882,44 +1069,142 @@ def create_app(
         Output("frame", "value"),
         Output("frame", "marks"),
         Output("segmap", "data"),
+        Output("load-info", "data"),
         Input("load", "n_clicks"),
+        # dataset/units are State -> they load only when the Load button is pressed.
         State("dataset", "value"),
         State("unitsfile", "value"),
         State("offset", "value"),
         prevent_initial_call=False,
     )
-    def _load(_clicks, dataset_path, units_path, offset):
+    def _load(_clicks, dataset_name, units_name, offset):
+        # Dropdown values are bare file names; resolve them to paths inside the
+        # configured folders (guards against anything outside those folders).
+        dataset_path = resolve_in_dir(state.dataset_dir, dataset_name)
+        units_path = resolve_in_dir(state.units_dir, units_name)
+        state.load_counter += 1
         if not dataset_path or not units_path:
-            return (no_update,) * 10
+            msg = "⚠ Select a dataset and a units file, then Load."
+            return (no_update,) * 10 + ({"msg": msg, "n": state.load_counter},)
         state.load(dataset_path, units_path, offset or 0.0)
         options = [{"label": f"unit {u}", "value": u} for u in unit_ids(state.units)]
         top_fig = build_timeseries_top(state.df, heading_mode=state.heading_mode)
-        segs = segments(state.df)
-        # Slider marks at each segment start (Pacific hour), and a global map of
-        # row -> (segment, fps, start time) so the slider can move the cursor and
-        # seek the right video entirely client-side.
-        marks = {}
+        # Use the precomputed segment table (one pass) instead of rescanning the
+        # source column per segment. Global map: row -> (segment, fps, start time)
+        # so the slider can move the cursor + seek the right video client-side.
+        table = state.segtable or build_segment_table(state.df)
+        dt_col = state.df[COL_DATETIME]
         segmap = []
-        for s in segs:
-            base, n, fps = segment_info(state.df, s)
-            marks[int(base)] = pd.Timestamp(state.df[COL_DATETIME].iloc[base]).strftime("%H:%M")
-            start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
-            segmap.append({"name": s, "base": base, "n": n, "fps": fps, "startMs": start_ms})
+        for name, base, n, fps in table:
+            start_ms = int(dt_col.iloc[base].tz_localize(None).value // 1_000_000)
+            segmap.append({"name": name, "base": base, "n": n, "fps": fps,
+                           "startMs": start_ms})
+        # Thin the tick labels so they never overlap: show at most ~MAX marks,
+        # spaced evenly across the segments (scales with dataset size).
+        MAX_MARKS = 8
+        stepm = max(1, -(-len(table) // MAX_MARKS))  # ceil(len/MAX)
+        marks = {
+            int(base): pd.Timestamp(dt_col.iloc[base]).strftime("%H:%M")
+            for i, (name, base, n, fps) in enumerate(table) if i % stepm == 0
+        }
+        segs = [name for name, _, _, _ in table]
+        # Flag hours whose video file is missing (disabled + "Not Available") and
+        # default to the first hour that has a video.
+        seg_options, default_seg = segment_options(segs, state.video_dir)
+        n_frames = len(state.df)
+        frames_txt = (f"{n_frames / 1e6:.1f}M" if n_frames >= 1e6
+                      else f"{n_frames:,}")
+        n_avail = sum(1 for o in seg_options if not o["disabled"])
+        status = (f"✓ Loaded · {len(segs)} hr ({n_avail} with video) · "
+                  f"{frames_txt} frames")
+        # The unit dropdown value changes here too, which fires _select_unit; mark
+        # that auto-selection so it keeps this dataset summary rather than replacing
+        # it with a "Loaded unit X" message.
+        state.autoselect_unit = state.unit_id
+        state.load_status_msg = status
         return (
             top_fig,
             _bottom_figure(),
             options,
             state.unit_id,
-            [{"label": s, "value": s} for s in segs],
-            segs[0],
+            seg_options,
+            default_seg,
             len(state.df) - 1,
             0,
             marks,
             segmap,
+            {"msg": status, "n": state.load_counter},
         )
+
+    # The instant Load is clicked OR the dataset/units/unit is changed, flip to
+    # "Loading…" + show the bar (client-side, so it appears before the server
+    # callback runs; the server callback then writes the "Loaded" confirmation and
+    # hides the bar). This is what makes changing a file/unit auto-load with visible
+    # progress.
+    app.clientside_callback(
+        """
+        function(n, unit) {
+            var ctx = window.dash_clientside.callback_context;
+            var trig = ctx && ctx.triggered && ctx.triggered[0];
+            var id = (trig && trig.prop_id) ? trig.prop_id.split('.')[0] : '';
+            var msg = (id === 'unit') ? '⏳ Loading unit…' : '⏳ Loading dataset…';
+            // Write the DOM directly (the status/bar are client-owned; the server
+            // signals completion via the load-info store -> the confirm callback).
+            // Triggers: the Load button (dataset) and the unit dropdown -- NOT the
+            // dataset/units file dropdowns (those load only on Load press).
+            var s = document.getElementById('load-status');
+            if (s) { s.textContent = msg; }
+            var b = document.getElementById('load-bar');
+            if (b) { b.style.display = 'block'; }
+            return '';
+        }
+        """,
+        Output("_dummy8", "children"),
+        Input("load", "n_clicks"),
+        Input("unit", "value"),
+        prevent_initial_call=True,
+    )
+
+    # When a load finishes (server bumps load-info), write the confirmation text and
+    # hide the bar -- client-side, so it never conflicts with the "Loading" writer.
+    app.clientside_callback(
+        """
+        function(info) {
+            if (info && info.msg) {
+                var s = document.getElementById('load-status');
+                if (s) { s.textContent = info.msg; }
+                var b = document.getElementById('load-bar');
+                if (b) { b.style.display = 'none'; }
+            }
+            return '';
+        }
+        """,
+        Output("_dummy9", "children"),
+        Input("load-info", "data"),
+        prevent_initial_call=False,
+    )
+
+    def _segment_row(seg):
+        """(base, n, fps) for a segment from the cached table (O(1)-ish)."""
+        for name, base, n, fps in (state.segtable or []):
+            if name == seg:
+                return base, n, fps
+        return segment_info(state.df, seg)  # fallback
 
     @app.callback(
         Output("video", "src"),
+        Input("segment", "value"),
+        prevent_initial_call=True,
+    )
+    def _load_video(seg):
+        # Tiny, instant response: point the <video> at the chosen hour so it starts
+        # loading immediately, WITHOUT waiting on the multi-MB head-data payload
+        # (which ships from the separate callback below).
+        if not seg:
+            return no_update
+        return f"/pirouette-video/{seg}.mp4"
+
+    @app.callback(
         Output("seg", "data"),
         Output("head", "figure"),
         Input("segment", "value"),
@@ -927,26 +1212,73 @@ def create_app(
         prevent_initial_call=True,
     )
     def _load_segment(seg, window_s):
-        # Point the <video> at the chosen hour, ship this segment's head-position
-        # data to the browser (so the head plot can update client-side during
-        # playback), and build the initial head figure.
+        # Ship this segment's head-position data to the browser (so the head plot +
+        # dot update client-side during playback) and build the initial head figure.
         if state.df is None or not seg:
-            return no_update, no_update, no_update
-        base, n, fps = segment_info(state.df, seg)
+            return no_update, no_update
+        base, n, fps = _segment_row(seg)
         # tz-naive wall-clock ms so the client-side cursor aligns with the axis.
         start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
         sl = slice(base, base + n)
+        # Ship head x/y as int16 (0.1 mm units), base64-encoded (~1.1 MB vs ~5.3 MB
+        # of JSON number arrays, and fast to parse -- the head plot was slow to
+        # appear/catch up on a cross-hour click because of that payload). The
+        # per-frame time is NOT shipped: the camera runs at a rock-steady rate
+        # (std 0.01 ms, linear-fit dev <= 0.1 ms), so the client reconstructs
+        # time as ht0 + i*ht_dt. The client decodes these back to arrays.
+        import base64
+        hx_i16 = np.clip(np.round(state.head_x[sl] * 10), -32000, 32000).astype("int16")
+        hy_i16 = np.clip(np.round(state.head_y[sl] * 10), -32000, 32000).astype("int16")
+        ht_arr = state.head_t[sl]
+        ht0 = float(ht_arr[0]) if ht_arr.size else 0.0
+        ht_dt = (float((ht_arr[-1] - ht_arr[0]) / (n - 1)) if n > 1
+                 else 1.0 / (fps or 60.0))
         seg_store = {
             "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
-            "hx": np.round(state.head_x[sl], 2).tolist(),
-            "hy": np.round(state.head_y[sl], 2).tolist(),
-            "ht": np.round(state.head_t[sl], 3).tolist(),
+            "ht0": ht0, "ht_dt": ht_dt,
+            "hx_i16": base64.b64encode(hx_i16.tobytes()).decode("ascii"),
+            "hy_i16": base64.b64encode(hy_i16.tobytes()).decode("ascii"),
         }
         head_fig = build_head_position(
             state.head_x, state.head_y, state.head_ms, base,
             float(window_s or 10.0), chamber=state.chamber,
         )
-        return f"/pirouette-video/{seg}.mp4", seg_store, head_fig
+        # Ship the head plot's home axis ranges so Plot Reset can restore the exact
+        # tight view (its axes aren't auto-ranged).
+        hx_rng = head_fig.layout.xaxis.range
+        hy_rng = head_fig.layout.yaxis.range
+        seg_store["head_xrange"] = list(hx_rng) if hx_rng else None
+        seg_store["head_yrange"] = list(hy_rng) if hy_rng else None
+        return seg_store, head_fig
+
+    @app.callback(
+        Output("curhead", "data"),
+        Input("seek", "data"),
+        State("window", "value"),
+        prevent_initial_call=True,
+    )
+    def _current_head(seek, window_s):
+        # Tiny fast path for a cross-hour seek: the clicked frame's head position
+        # AND its trail window (a small ~200-point array), so both the head dot and
+        # the trail snap to the right spot immediately -- before the new hour's
+        # (~1 MB) head array loads. Head axes are the fixed chamber, so raw (x, y)
+        # positions + wall-clock ms colours are enough.
+        if state.df is None or not seek or not seek.get("seg"):
+            return no_update
+        base, n, fps = _segment_row(seek["seg"])
+        fps = fps or 60.0
+        frame = max(0, min(n - 1, int(round(float(seek.get("t", 0.0)) * fps))))
+        row = base + frame
+        half = int(round(float(window_s or 10.0) * fps))
+        lo = max(base, row - half)
+        idx = np.unique(np.linspace(lo, row, min(200, row - lo + 1)).astype("int64"))
+        return {
+            "seg": seek["seg"],
+            "hx": float(state.head_x[row]), "hy": float(state.head_y[row]),
+            "tx": np.round(state.head_x[idx], 1).tolist(),
+            "ty": np.round(state.head_y[idx], 1).tolist(),
+            "tc": state.head_ms[idx].tolist(),
+        }
 
     # Slider drag -> move the red cursor live (client-side, in sync with the
     # handle) and seek the video. Within the current hour the seek is client-side
@@ -963,21 +1295,9 @@ def create_app(
             }
             var localT = (row - s.base) / s.fps;
             if (localT < 0) { localT = 0; }
-            // Move the cursor immediately so it tracks the slider handle.
-            var cursor = new Date(s.startMs + localT * 1000).toISOString();
-            if (window.Plotly) {
-                ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                    var el = document.getElementById(gid);
-                    var gd = el && (el.classList.contains('js-plotly-plot')
-                        ? el : el.querySelector('.js-plotly-plot'));
-                    if (gd) {
-                        try {
-                            window.Plotly.relayout(gd, {
-                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
-                            });
-                        } catch (e) { /* not ready */ }
-                    }
-                });
+            // Move the cursor immediately (DOM overlay) so it tracks the handle.
+            if (window.__placeCursor) {
+                window.__placeCursor(s.startMs + localT * 1000);
             }
             var curName = seg && seg.name;
             var v = document.getElementById('video');
@@ -1004,9 +1324,10 @@ def create_app(
     # frame-info text. Data for the current segment lives in the `seg` store.
     app.clientside_callback(
         """
-        function(_n, seg, seek, windowS, listen, segspikes) {
+        function(_n, seek, windowS, listen, segspikes) {
             var nou = window.dash_clientside.no_update;
             var v = document.getElementById('video');
+            var seg = window.__seg;  // mirrored once per segment (not marshalled/tick)
             if (!v || !seg || !seg.hx) { return [nou, nou]; }
             var ct = v.currentTime || 0;
             var clearSeek = nou;
@@ -1024,6 +1345,8 @@ def create_app(
             // not paused, so the cursor always advances.
             if (!moved && v.paused) { return [clearSeek, nou]; }
             window.__lastCt = ct;
+            var nowT = (window.performance && performance.now)
+                ? performance.now() : Date.now();
             var Plotly = window.Plotly;
             function plotDiv(id) {
                 var el = document.getElementById(id);
@@ -1031,28 +1354,59 @@ def create_app(
                     ? el : el.querySelector('.js-plotly-plot'));
             }
 
-            // Red time cursor on both timeseries figures.
-            var cursor = (typeof seg.startMs === 'number')
-                ? new Date(seg.startMs + ct * 1000).toISOString() : null;
-            if (Plotly && cursor) {
-                ['ts-top', 'ts-bottom'].forEach(function (gid) {
-                    var gd = plotDiv(gid);
-                    if (gd) {
-                        try {
-                            Plotly.relayout(gd, {
-                                'shapes[0].x0': cursor, 'shapes[0].x1': cursor,
-                            });
-                        } catch (e) { /* not ready */ }
-                    }
-                });
-            }
+            // Current frame index off the video's own frame rate (as in place()).
+            // Reference this frame's ACTUAL timestamp for the cursor + info, not a
+            // linear startMs+ct*1000 -- the video duration is slightly longer than
+            // the data span, so linear time drifts ahead of the data samples (and
+            // the head dot) over the hour.
+            var nFrames = seg.hx.length;
+            var fpsEff = (v.duration && isFinite(v.duration) && v.duration > 0)
+                ? (nFrames / v.duration) : seg.fps;
+            var curIdx = Math.round(ct * fpsEff);
+            if (curIdx < 0) { curIdx = 0; }
+            if (curIdx > nFrames - 1) { curIdx = nFrames - 1; }
+            // frameT = current frame's time from segment start in the DATA timeline
+            // (what segspikes are referenced to); frameMs = its wall-clock ms.
+            var frameT = seg.ht[curIdx] - seg.ht[0];
+            var frameMs = seg.startMs + frameT * 1000;
 
-            // Auto-follow: when zoomed in, keep the cursor in view by centring the
-            // (fixed-width) window on it once it passes the middle. Only while the
-            // video is actually playing, and only when zoomed past ~90% of the full
-            // span, so full-span (incl. after Plot Reset) and paused views are left
-            // untouched.
-            if (Plotly && typeof seg.startMs === 'number' && !v.paused) {
+            // Red time cursor: move the DOM overlay (cheap CSS transform, not a
+            // 100-200 ms Plotly.relayout) to this frame's wall-clock time. rVFC
+            // moves it per frame during playback; this 40 ms loop covers paused
+            // seeks and is the fallback where rVFC is unavailable.
+            //
+            // Seek hold: right after a click the video's frame lags (it's still
+            // seeking; a cross-segment click is also loading a new hour + buffering),
+            // so tracking frameMs would snap the cursor back to the old/stale spot.
+            // Pin the cursor to the clicked wall-clock time until the REAL frame time
+            // (segment-aware -- frameMs uses the loaded segment's startMs) reaches it,
+            // then resume tracking. A safety timeout clears a hold that never lands.
+            if (window.__cursorHoldMs != null) {
+                var reached = Math.abs(frameMs - window.__cursorHoldMs) <= 500;
+                var tooLong = window.__cursorHoldT != null
+                    && (nowT - window.__cursorHoldT) > 6000;
+                if (reached || tooLong) {
+                    window.__cursorHoldMs = null;
+                    window.__cursorHoldT = null;
+                }
+            }
+            var cursorAt = (window.__cursorHoldMs != null)
+                ? window.__cursorHoldMs : frameMs;
+            if (window.__placeCursor && typeof seg.startMs === 'number') {
+                window.__placeCursor(cursorAt);
+            }
+            window.__cursorMs = cursorAt;
+
+            // Auto-follow: when zoomed in and playing, PAGE the window forward only
+            // when the cursor reaches the right edge (or lands outside after a
+            // seek). This replaces the old centre-every-tick behaviour, which ran a
+            // slow relayout ~16x/s and fought the user's own zoom/click. It's also
+            // suppressed briefly after a manual zoom/pan/click so it doesn't yank
+            // the view the user just set.
+            var suppressed = window.__suppressFollowUntil
+                && nowT < window.__suppressFollowUntil;
+            if (Plotly && typeof seg.startMs === 'number' && !v.paused
+                && !suppressed) {
                 var sm = window.__segmap;
                 var fullSpan = Infinity;
                 if (sm && sm.length) {
@@ -1073,17 +1427,19 @@ def create_app(
                     var r0 = _toMs(tg._fullLayout.xaxis.range[0]);
                     var r1 = _toMs(tg._fullLayout.xaxis.range[1]);
                     var W = r1 - r0;
-                    var curMs = seg.startMs + ct * 1000;
+                    var curMs = frameMs;  // same frame-accurate time as the cursor
+                    // Page only when the cursor nears/passes the right edge or is
+                    // behind the window (after a seek) -- not while it's comfortably
+                    // in view. New window puts the cursor ~10% from the left so most
+                    // of the window shows what's coming.
                     if (W > 0 && W < 0.9 * fullSpan
-                        && (curMs < r0 || curMs > r0 + 0.5 * W)) {
-                        // Format endpoints as naive wall-clock date STRINGS -- the
-                        // same coordinate space the axis + cursor use. (A numeric
-                        // ms range is mis-placed on a date axis -> blank plots.)
+                        && (curMs > r0 + 0.9 * W || curMs < r0)) {
                         var _fmt = function (ms) {
                             return new Date(ms).toISOString()
                                 .replace('T', ' ').replace('Z', '');
                         };
-                        var rng = [_fmt(curMs - 0.5 * W), _fmt(curMs + 0.5 * W)];
+                        var nr0 = curMs - 0.1 * W;
+                        var rng = [_fmt(nr0), _fmt(nr0 + W)];
                         window.__xsyncKey = JSON.stringify(rng);
                         ['ts-top', 'ts-bottom'].forEach(function (gid) {
                             var gd = plotDiv(gid);
@@ -1099,52 +1455,46 @@ def create_app(
                 }
             }
 
-            // Head-position trail + current marker (windowed).
-            var n = seg.hx.length;
-            var i = Math.round(ct * seg.fps);
-            if (i < 0) { i = 0; }
-            if (i > n - 1) { i = n - 1; }
-            var win = Math.round((windowS || 10) * seg.fps);
+            // Head-position trail + current marker (windowed), using the shared
+            // frame index (video frame rate) computed above.
+            var n = nFrames;
+            var i = curIdx;
+            var win = Math.round((windowS || 10) * fpsEff);
             var lo = Math.max(0, i - win);
-            var hgd = plotDiv('head');
-            if (hgd && Plotly) {
-                try {
-                    // Current-position marker first (1 point) so it lands promptly.
-                    Plotly.restyle(hgd, {x: [[seg.hx[i]]], y: [[seg.hy[i]]]}, [1]);
-                    // Subsample the trail (cap points) so the restyle stays light
-                    // and renders in sync with the video even for long windows.
-                    var CAP = 200;
-                    var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
-                    var xs = [], ys = [], color = [];
-                    for (var j = lo; j <= i; j += step) {
-                        xs.push(seg.hx[j]); ys.push(seg.hy[j]);
-                        color.push(seg.startMs + (j / seg.fps) * 1000);
-                    }
-                    if ((i - lo) % step !== 0) {  // always include the current point
-                        xs.push(seg.hx[i]); ys.push(seg.hy[i]);
-                        color.push(seg.startMs + (i / seg.fps) * 1000);
-                    }
-                    var cmin = color[0], cmax = color[color.length - 1];
-                    if (cmax <= cmin) { cmax = cmin + 1; }
-                    var tv = [], tt = [], NT = 4;
-                    for (var t = 0; t < NT; t++) {
-                        var val = cmin + (cmax - cmin) * t / (NT - 1);
-                        tv.push(val);
-                        tt.push(new Date(val).toISOString().slice(11, 19));
-                    }
-                    Plotly.restyle(hgd, {
-                        x: [xs], y: [ys], 'marker.color': [color],
-                        'marker.cmin': [cmin], 'marker.cmax': [cmax],
-                        'marker.cauto': [false],
-                        'marker.colorbar.tickmode': ['array'],
-                        'marker.colorbar.tickvals': [tv],
-                        'marker.colorbar.ticktext': [tt],
-                    }, [0]);
-                } catch (e) { /* not ready */ }
+            // Rebuild the trail ~10x/s while playing (every tick when paused so
+            // scrubbing stays fresh). Skip during a cross-hour transition (stale
+            // head data) -- the curhead fast path already drew the correct trail.
+            var freshTrail = v.paused
+                || window.__lastTrailT === undefined
+                || (nowT - window.__lastTrailT) >= 100;
+            if (freshTrail && window.__renderHeadTrail && window.__segMatchesVideo
+                && window.__segMatchesVideo()) {
+                window.__lastTrailT = nowT;
+                var CAP = 200;
+                var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
+                var xs = [], ys = [], color = [];
+                for (var j = lo; j <= i; j += step) {
+                    xs.push(seg.hx[j]); ys.push(seg.hy[j]);
+                    color.push(seg.startMs + (seg.ht[j] - seg.ht[0]) * 1000);
+                }
+                if ((i - lo) % step !== 0) {  // always include current point
+                    xs.push(seg.hx[i]); ys.push(seg.hy[i]);
+                    color.push(seg.startMs + (seg.ht[i] - seg.ht[0]) * 1000);
+                }
+                window.__renderHeadTrail(xs, ys, color);
             }
 
-            // Frame info (client-side; startMs is Pacific wall-clock).
-            var wall = new Date(seg.startMs + ct * 1000).toISOString()
+            // Head dot: rVFC drives it smoothly during playback, but often doesn't
+            // fire on a PAUSED seek/scrub -- so update it here too when paused, so
+            // the head plot lands on the clicked spot immediately (not only on play).
+            // Skip during a cross-hour transition (stale head data) -- curhead holds.
+            if (v.paused && window.__placeHeadDot && window.__segMatchesVideo
+                && window.__segMatchesVideo()) {
+                window.__placeHeadDot(i);
+            }
+
+            // Frame info (client-side; frameMs is the current frame's wall-clock).
+            var wall = new Date(frameMs).toISOString()
                 .replace('T', ' ').replace('Z', '');
             var row = seg.base + i;
             var tss = seg.ht[i];
@@ -1168,23 +1518,26 @@ def create_app(
                 window.__lastTickPerf = nowP;
                 realDt = Math.min(Math.max(realDt, 5), 500) / 1000;  // seconds
                 var prev = window.__lastSpikeCt;
-                // Play only for a forward advance consistent with playback (not a
-                // seek). 8 s covers even 10x with laggy ticks; seeks are larger.
-                if (prev !== undefined && ct > prev && (ct - prev) <= 8.0) {
+                // Compare against the frame's DATA-timeline time (same reference as
+                // segspikes), not the linear video time, so pops fire exactly when
+                // the cursor crosses each spike. Forward-advance only (not a seek);
+                // 8 s covers even 10x with laggy ticks, seeks are larger.
+                if (prev !== undefined && frameT > prev && (frameT - prev) <= 8.0) {
                     var a = 0, b = segspikes.length;
                     while (a < b) {  // first index with segspikes[idx] > prev
                         var mm = (a + b) >> 1;
                         if (segspikes[mm] <= prev) a = mm + 1; else b = mm;
                     }
-                    var span = ct - prev, base = actx.currentTime, cnt = 0;
-                    for (var si = a; si < segspikes.length && segspikes[si] <= ct; si++) {
+                    var span = frameT - prev, base = actx.currentTime, cnt = 0;
+                    for (var si = a; si < segspikes.length && segspikes[si] <= frameT;
+                         si++) {
                         if (cnt >= 60) break;  // avoid extreme bursts
                         var frac = span > 0 ? (segspikes[si] - prev) / span : 0;
                         window.__pop(actx, base + frac * realDt);
                         cnt++;
                     }
                 }
-                window.__lastSpikeCt = ct;
+                window.__lastSpikeCt = frameT;
             }
             return [clearSeek, info];
         }
@@ -1192,11 +1545,266 @@ def create_app(
         Output("seek", "data", allow_duplicate=True),
         Output("frame-info", "children"),
         Input("sync", "n_intervals"),
-        State("seg", "data"),
         State("seek", "data"),
         State("window", "value"),
         State("listen", "value"),
         State("segspikes", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Mirror the per-segment head data to a window global (once per segment, not
+    # marshalled every tick) and drive the current head dot -- the one thing that
+    # must update every video frame -- from a per-frame callback. Moving the dot is
+    # a single CSS transform, so it keeps full frame rate without falling behind
+    # (the heavier Plotly cursor/trail live on the 40 ms loop). rVFC fires once per
+    # *presented* frame (fresh mediaTime); rAF+currentTime is the fallback.
+    app.clientside_callback(
+        """
+        function(seg) {
+            // Decode the compact head payload (int16 0.1 mm x/y) back into arrays,
+            // and reconstruct per-frame time as ht0 + i*ht_dt (the camera rate is
+            // rock-steady). Much faster to transfer + parse than JSON number arrays,
+            // which made the head plot slow to appear / catch up on a cross-hour
+            // click.
+            if (seg && seg.hx_i16 && !seg.hx) {
+                try {
+                    var b64ToArr = function (b64, Ctor) {
+                        var bin = atob(b64), len = bin.length;
+                        var bytes = new Uint8Array(len);
+                        for (var k = 0; k < len; k++) { bytes[k] = bin.charCodeAt(k); }
+                        return new Ctor(bytes.buffer);
+                    };
+                    var hxi = b64ToArr(seg.hx_i16, Int16Array);
+                    var hyi = b64ToArr(seg.hy_i16, Int16Array);
+                    var m = hxi.length, ht0 = seg.ht0 || 0;
+                    var dt = seg.ht_dt || (1 / 60);
+                    var hx = new Float64Array(m), hy = new Float64Array(m);
+                    var ht = new Float64Array(m);
+                    for (var j = 0; j < m; j++) {
+                        hx[j] = hxi[j] / 10; hy[j] = hyi[j] / 10;
+                        ht[j] = ht0 + j * dt;
+                    }
+                    seg.hx = hx; seg.hy = hy; seg.ht = ht;
+                } catch (e) {}
+            }
+            window.__seg = seg;
+            // Position the head dot for the current frame as soon as this segment's
+            // data AND its rebuilt figure are laid out (retry briefly). Fixes the
+            // head marker not updating after a click/seek until playback -- a race
+            // with the data/layout being ready.
+            (function () {
+                var tries = 0;
+                function pos() {
+                    var vv = document.getElementById('video');
+                    var hgd = document.getElementById('head');
+                    hgd = hgd && (hgd.classList.contains('js-plotly-plot')
+                        ? hgd : hgd.querySelector('.js-plotly-plot'));
+                    if (window.__placeHeadDot && window.__seg && window.__seg.hx
+                        && vv && vv.duration && hgd && hgd._fullLayout
+                        && hgd._fullLayout.xaxis && hgd._fullLayout.xaxis._length) {
+                        var fe = window.__seg.hx.length / vv.duration;
+                        window.__placeHeadDot(Math.round((vv.currentTime || 0) * fe));
+                        return;
+                    }
+                    if (tries++ < 60) { setTimeout(pos, 50); }
+                }
+                pos();
+            })();
+            // Head plot's home ranges for Plot Reset (updated once per segment).
+            if (seg && seg.head_xrange && seg.head_yrange) {
+                window.__headHome = {x: seg.head_xrange, y: seg.head_yrange};
+            }
+            if (window.__headSync) { return ''; }
+            window.__headSync = true;
+            function pdiv(id) {
+                var el = document.getElementById(id);
+                return el && (el.classList.contains('js-plotly-plot')
+                    ? el : el.querySelector('.js-plotly-plot'));
+            }
+            // Move the red time cursor on both timeseries figures to wall-clock
+            // `ms` by translating a DOM overlay line (compositor-only). This
+            // replaces Plotly.relayout of a shape, which costs 100-200 ms on these
+            // heavy figures and was the bulk of the click/playback latency. Hides
+            // the line when the time is outside the current (zoomed) x-view.
+            window.__placeCursor = function (ms) {
+                try {
+                    window.__cursorMs = ms;
+                    var pairs = [['ts-top', 'cursor-top'], ['ts-bottom', 'cursor-bot']];
+                    for (var pi = 0; pi < pairs.length; pi++) {
+                        var g = pdiv(pairs[pi][0]);
+                        var line = document.getElementById(pairs[pi][1]);
+                        if (!g || !g._fullLayout || !g._fullLayout.xaxis || !line) {
+                            continue;
+                        }
+                        var xa = g._fullLayout.xaxis, lay = g._fullLayout;
+                        var toMs = function (x) {
+                            if (typeof x === 'number') { return x; }
+                            var t = String(x);
+                            if (t.indexOf('Z') < 0 && t.indexOf('+') < 0) {
+                                t = t.replace(' ', 'T') + 'Z';  // naive == UTC here
+                            }
+                            return new Date(t).getTime();
+                        };
+                        var r0 = toMs(xa.range[0]), r1 = toMs(xa.range[1]);
+                        if (!(r1 > r0)) { continue; }
+                        var frac = (ms - r0) / (r1 - r0);
+                        if (frac < -0.002 || frac > 1.002) {
+                            line.style.display = 'none';
+                            continue;
+                        }
+                        var top = lay.margin ? lay.margin.t : 0;
+                        var h = lay.height - (lay.margin
+                            ? (lay.margin.t + lay.margin.b) : 0);
+                        line.style.top = top + 'px';
+                        line.style.height = h + 'px';
+                        line.style.transform = 'translateX('
+                            + (xa._offset + frac * xa._length) + 'px)';
+                        line.style.display = 'block';
+                    }
+                } catch (e) {}
+            };
+            // Position the head dot at frame index `i` via a CSS transform. Exposed
+            // as a global so the 40 ms sync loop can also call it on a PAUSED seek
+            // (rVFC often doesn't fire while paused, which left the head plot stale
+            // until playback resumed).
+            // Position the head dot at raw chamber coords (mm). The head axes are
+            // the fixed chamber, identical across hours, so this works even before a
+            // new segment's data/figure arrive -- used by the instant cross-hour
+            // "current head position" fast path.
+            window.__placeHeadDotXY = function (hx, hy) {
+                try {
+                    var hgd = pdiv('head');
+                    var dot = document.getElementById('head-dot');
+                    if (hgd && hgd._fullLayout && dot) {
+                        var xa = hgd._fullLayout.xaxis, ya = hgd._fullLayout.yaxis;
+                        if (xa && ya && xa._length && ya._length) {
+                            var px = xa._offset + (hx - xa.range[0])
+                                / (xa.range[1] - xa.range[0]) * xa._length;
+                            var py = ya._offset + (ya.range[1] - hy)
+                                / (ya.range[1] - ya.range[0]) * ya._length;
+                            dot.style.transform = 'translate('
+                                + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
+                            dot.style.display = 'block';
+                        }
+                    }
+                } catch (e) {}
+            };
+            window.__placeHeadDot = function (i) {
+                var s = window.__seg;
+                if (!s || !s.hx) { return; }
+                if (i < 0) { i = 0; }
+                if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                window.__placeHeadDotXY(s.hx[i], s.hy[i]);
+            };
+            // True only when the loaded head data (window.__seg) matches the video
+            // that's actually showing. During a cross-hour switch the new video is
+            // up but the new head array hasn't arrived, so frame-indexed updates
+            // would use stale data -- skip them and let the instant curhead path
+            // hold the dot until the new data lands.
+            window.__segMatchesVideo = function () {
+                var vv = document.getElementById('video');
+                return !!(window.__seg && window.__seg.name && vv && vv.currentSrc
+                    && vv.currentSrc.indexOf(window.__seg.name) >= 0);
+            };
+            // Draw the head trail (trace 0) from window arrays (x, y, wall-clock ms
+            // colour). Shared by the 40 ms loop and the instant curhead fast path.
+            window.__renderHeadTrail = function (xs, ys, color) {
+                try {
+                    var hgd = pdiv('head');
+                    if (!hgd || !window.Plotly || !xs || !xs.length) { return; }
+                    var cmin = color[0], cmax = color[color.length - 1];
+                    if (cmax <= cmin) { cmax = cmin + 1; }
+                    var tv = [], tt = [], NT = 4;
+                    for (var t = 0; t < NT; t++) {
+                        var val = cmin + (cmax - cmin) * t / (NT - 1);
+                        tv.push(val);
+                        tt.push(new Date(val).toISOString().slice(11, 19));
+                    }
+                    window.Plotly.restyle(hgd, {
+                        x: [xs], y: [ys], 'marker.color': [color],
+                        'marker.cmin': [cmin], 'marker.cmax': [cmax],
+                        'marker.cauto': [false],
+                        'marker.colorbar.tickmode': ['array'],
+                        'marker.colorbar.tickvals': [tv],
+                        'marker.colorbar.ticktext': [tt],
+                    }, [0]);
+                } catch (e) {}
+            };
+            // Move the head dot for a media time `mt` (seconds). This is a single
+            // CSS transform (compositor-only, no Plotly redraw), so it can run for
+            // every presented video frame without falling behind. The timeseries
+            // cursor is a Plotly shape moved on the slower 40 ms loop -- relayout is
+            // too heavy to call per frame and would starve this update.
+            function place(mt) {
+                try {
+                    var s = window.__seg;
+                    if (!s || !s.hx) { return; }
+                    // Index off the VIDEO's own frame rate (frames / duration), not
+                    // the data-derived s.fps -- the latter is slightly low here and
+                    // makes the frame index drift behind the video (tens of frames
+                    // deep into an hour). n/duration ties the dot to the frame on
+                    // screen.
+                    var vid = document.getElementById('video');
+                    var n = s.hx.length;
+                    var fpsEff = (vid && vid.duration && isFinite(vid.duration)
+                        && vid.duration > 0) ? (n / vid.duration) : s.fps;
+                    var i = Math.round(mt * fpsEff);
+                    if (i < 0) { i = 0; }
+                    if (i > n - 1) { i = n - 1; }
+                    // Skip during a cross-hour transition (stale head data vs the
+                    // new video) -- the instant curhead path holds the dot.
+                    if (window.__segMatchesVideo()) { window.__placeHeadDot(i); }
+                    // Cursor at this frame's wall-clock time (aligns with the data
+                    // and spike ticks, same as the head dot) -- but NOT while a click
+                    // hold is active (the 40 ms sync loop pins the cursor to the click
+                    // and clears the hold once the frame reaches it).
+                    if (window.__placeCursor && window.__cursorHoldMs == null) {
+                        window.__placeCursor(s.startMs + (s.ht[i] - s.ht[0]) * 1000);
+                    }
+                } catch (e) {}
+            }
+            var v = document.getElementById('video');
+            if (v && typeof v.requestVideoFrameCallback === 'function') {
+                // Frame-accurate: metadata.mediaTime is the presentation time of
+                // the frame now on screen. Fires per presented frame (and once
+                // after any seek/pause), so the dot tracks the visible frame.
+                var vcb = function (now, metadata) {
+                    place(metadata.mediaTime);
+                    var vid = document.getElementById('video');
+                    if (vid) { vid.requestVideoFrameCallback(vcb); }
+                };
+                v.requestVideoFrameCallback(vcb);
+            } else {
+                // Fallback: rAF reading currentTime (a few browsers lack rVFC).
+                var raf = function () {
+                    var vid = document.getElementById('video');
+                    if (vid) {
+                        var t = vid.currentTime || 0;
+                        if (t !== window.__rafCt) { window.__rafCt = t; place(t); }
+                    }
+                    window.requestAnimationFrame(raf);
+                };
+                window.requestAnimationFrame(raf);
+            }
+            return '';
+        }
+        """,
+        Output("_dummy7", "children"),
+        Input("seg", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Instant cross-hour head dot: as soon as the clicked frame's (hx, hy) arrives
+    # (a tiny store, faster than the full head array), snap the dot to it. The
+    # frame-indexed updaters are gated off until the new head data matches the
+    # video (see __segMatchesVideo), so this position holds instead of flickering.
+    app.clientside_callback(
+        "function(ch){ if (!ch) { return ''; } "
+        "if (window.__placeHeadDotXY) { window.__placeHeadDotXY(ch.hx, ch.hy); } "
+        "if (window.__renderHeadTrail && ch.tx) { "
+        "window.__renderHeadTrail(ch.tx, ch.ty, ch.tc); } return ''; }",
+        Output("_dummy10", "children"),
+        Input("curhead", "data"),
         prevent_initial_call=True,
     )
 
@@ -1260,17 +1868,20 @@ def create_app(
         prevent_initial_call=False,
     )
 
-    # "Plot Reset": restore both timeseries figures to their full span (original
-    # zoom). Auto-ranging every x-axis reverts pan/zoom; y stays fixed. Clearing
-    # __xsyncKey lets the next real zoom re-sync the two figures.
+    # "Plot Reset": restore the timeseries figures to their full span (auto-range
+    # x; y stays fixed) AND the head plot to its home view. Clearing __xsyncKey
+    # lets the next real zoom re-sync the two timeseries figures.
     app.clientside_callback(
         """
         function(n) {
             if (!n) return '';
-            ['ts-top', 'ts-bottom'].forEach(function (id) {
+            function gdOf(id) {
                 var el = document.getElementById(id);
-                var gd = el && (el.classList.contains('js-plotly-plot')
+                return el && (el.classList.contains('js-plotly-plot')
                     ? el : el.querySelector('.js-plotly-plot'));
+            }
+            ['ts-top', 'ts-bottom'].forEach(function (id) {
+                var gd = gdOf(id);
                 if (gd && window.Plotly && gd.layout) {
                     var upd = {};
                     ['xaxis', 'xaxis2', 'xaxis3', 'xaxis4'].forEach(function (ax) {
@@ -1279,7 +1890,27 @@ def create_app(
                     try { window.Plotly.relayout(gd, upd); } catch (e) {}
                 }
             });
+            // Head plot: restore the tight home ranges captured on load (its axes
+            // aren't auto-ranged, so re-apply the exact original range).
+            var hgd = gdOf('head');
+            if (hgd && window.Plotly) {
+                var home = window.__headHome;
+                try {
+                    if (home && home.x && home.y) {
+                        window.Plotly.relayout(hgd, {
+                            'xaxis.range': home.x, 'yaxis.range': home.y,
+                        });
+                    } else {
+                        window.Plotly.relayout(hgd,
+                            {'xaxis.autorange': true, 'yaxis.autorange': true});
+                    }
+                } catch (e) {}
+            }
             window.__xsyncKey = null;
+            // Re-place the cursor overlay for the restored x-ranges.
+            if (window.__placeCursor && window.__cursorMs != null) {
+                setTimeout(function () { window.__placeCursor(window.__cursorMs); }, 0);
+            }
             return '';
         }
         """,
@@ -1287,6 +1918,7 @@ def create_app(
         Input("plot-reset", "n_clicks"),
         prevent_initial_call=True,
     )
+
 
     # Link the x-axis (time) range of the two timeseries figures: zoom/pan in one
     # applies the same range to the other. Runs client-side so it's instant and
@@ -1324,24 +1956,81 @@ def create_app(
                 });
                 try { window.Plotly.relayout(gd, upd); } catch (e) {}
             }
+            function toMs(x) {
+                if (typeof x === 'number') return x;
+                var s = String(x);
+                if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) s = s.replace(' ', 'T') + 'Z';
+                return new Date(s).getTime();
+            }
+            var nou = window.dash_clientside.no_update;
             var ctx = window.dash_clientside.callback_context;
             var trig = ctx && ctx.triggered && ctx.triggered[0];
-            if (!trig || !trig.prop_id) return '';
+            if (!trig || !trig.prop_id) return [nou, nou];
             var src = trig.prop_id.split('.')[0];
             var rng = extractX(src === 'ts-top' ? rdTop : rdBot);
-            if (rng === null) return '';
+            if (rng === null) return [nou, nou];
             var key = JSON.stringify(rng);
-            if (window.__xsyncKey === key) return '';
+            if (window.__xsyncKey === key) return [nou, nou];
             window.__xsyncKey = key;
             apply(src === 'ts-top' ? 'ts-bottom' : 'ts-top', rng);
-            return '';
+            // This is a user zoom/pan (follow's own relayouts are caught by the
+            // __xsyncKey guard above): pause auto-follow briefly so it doesn't yank
+            // the view the user just set.
+            var nowP = (window.performance && performance.now)
+                ? performance.now() : Date.now();
+            window.__suppressFollowUntil = nowP + 2500;
+            // Keep the cursor overlay aligned with the new (zoomed/panned) x-range.
+            if (window.__placeCursor && window.__cursorMs != null) {
+                window.__placeCursor(window.__cursorMs);
+            }
+            // Tell the server the visible window so it can refetch EVERY spike in
+            // it at full detail (nonce `k` so identical windows still fire).
+            var rw = (rng === 'auto')
+                ? {overview: true, k: nowP}
+                : {lo: toMs(rng[0]), hi: toMs(rng[1]), k: nowP};
+            return ['', rw];
         }
         """,
         Output("_dummy2", "children"),
+        Output("rasterwin", "data"),
         Input("ts-top", "relayoutData"),
         Input("ts-bottom", "relayoutData"),
         prevent_initial_call=True,
     )
+
+    # Refetch the spike raster at FULL resolution for the visible window whenever
+    # the user zooms/pans (the overview ships a fast subsample; zooming in fetches
+    # every tick in the window -- few enough to send once you can actually see
+    # them). Patches only the raster trace, so it's cheap.
+    @app.callback(
+        Output("ts-bottom", "figure", allow_duplicate=True),
+        Input("rasterwin", "data"),
+        prevent_initial_call=True,
+    )
+    def _raster_zoom(win):
+        if state.df is None or state.unit_id is None or not win:
+            return no_update
+        spikes = unit_spike_times_experiment(
+            state.units, state.unit_id, state.spike_offset_s
+        )
+        if win.get("overview"):
+            t0e = float(state.df[COL_TIME].iloc[0])
+            t1e = float(state.df[COL_TIME].iloc[-1])
+            cap = MAX_RASTER_SPIKES
+        else:
+            exp_ms = int(state.exp_start_dt.tz_localize(None).value // 1_000_000)
+            t0e = (float(win["lo"]) - exp_ms) / 1000.0
+            t1e = (float(win["hi"]) - exp_ms) / 1000.0
+            cap = RASTER_ZOOM_CAP
+        inwin = spikes[(spikes >= t0e) & (spikes <= t1e)]
+        if inwin.size > cap:  # still sub-pixel dense -> a subsample looks the same
+            idx = np.linspace(0, inwin.size - 1, cap).astype("int64")
+            inwin = inwin[idx]
+        spike_dt = spikes_to_datetime(inwin, state.exp_start_dt).tz_localize(None)
+        patch = Patch()
+        patch["data"][0]["x"] = spike_dt
+        patch["data"][0]["y"] = np.zeros(len(spike_dt))
+        return patch
 
     # Click ANYWHERE on either timeseries figure to set the time (not just on a
     # data point): a native listener converts the click's pixel x to a time,
@@ -1360,17 +2049,19 @@ def create_app(
                 if (s.indexOf('Z') < 0 && s.indexOf('+') < 0) s = s.replace(' ', 'T') + 'Z';
                 return new Date(s).getTime();
             }
-            document.addEventListener('click', function (evt) {
+            // Click-to-seek. We can't rely on the native 'click' event: Plotly's
+            // drag layer swaps in a full-screen "dragcover" as soon as the pointer
+            // moves even slightly, so mouseup lands on a different element and no
+            // 'click' fires (still clicks worked, moved ones didn't). Instead treat
+            // mousedown+mouseup on a plot with < 6px movement as a click; a real
+            // drag (> 6px) is left to Plotly for zoom/pan.
+            function seekFromPoint(container, clientX) {
                 try {
-                    if (evt.target.closest && evt.target.closest('.modebar')) return;
-                    var container = evt.target.closest &&
-                        evt.target.closest('#ts-top, #ts-bottom');
-                    if (!container) return;
                     var gd = container.querySelector('.js-plotly-plot');
                     if (!gd || !gd._fullLayout || !gd._fullLayout.xaxis) return;
                     var xa = gd._fullLayout.xaxis;
                     var rect = gd.getBoundingClientRect();
-                    var px = evt.clientX - rect.left - xa._offset;
+                    var px = clientX - rect.left - xa._offset;
                     if (px < 0 || px > xa._length) return;
                     var r0 = toMs(xa.range[0]), r1 = toMs(xa.range[1]);
                     var ms = r0 + (px / xa._length) * (r1 - r0);
@@ -1387,17 +2078,97 @@ def create_app(
                     if (localT < 0) localT = 0;
                     var maxT = (s.n - 1) / s.fps;
                     if (localT > maxT) localT = maxT;
-                    var row = s.base + Math.round(localT * s.fps);
-                    var input = document.querySelector('#frame input');
-                    if (input) {
-                        var setter = Object.getOwnPropertyDescriptor(
-                            window.HTMLInputElement.prototype, 'value').set;
-                        setter.call(input, String(row));
-                        input.dispatchEvent(new Event('input', {bubbles: true}));
-                        input.dispatchEvent(new Event('change', {bubbles: true}));
+
+                    var v = document.getElementById('video');
+                    var wasPlaying = !!(v && !v.paused);
+                    var curName = window.__seg && window.__seg.name;
+
+                    var nowP = (window.performance && performance.now)
+                        ? performance.now() : Date.now();
+                    // Don't let auto-follow yank the view right after a click.
+                    window.__suppressFollowUntil = nowP + 2500;
+                    // Pin the cursor to the clicked wall-clock time immediately (it's
+                    // valid on the full-session x-axis regardless of which hour is
+                    // loaded) and HOLD it there until the video -- including a newly
+                    // loaded segment -- actually reaches it. This makes the line land
+                    // on the click across hours and through buffering, instead of
+                    // snapping back to the old/stale position. The hold clears in the
+                    // sync loop when the real frame time reaches it (segment-aware).
+                    window.__cursorHoldMs = ms;
+                    window.__cursorHoldT = nowP;
+                    if (window.__placeCursor) { window.__placeCursor(ms); }
+                    if (v && s.name === curName) {
+                        // Move the head dot to the clicked frame RIGHT NOW -- don't
+                        // wait for the sync loop or rVFC (which often doesn't fire on
+                        // a paused seek), so the head plot lands on the clicked spot
+                        // immediately instead of only after pressing play.
+                        if (window.__placeHeadDot && window.__seg && window.__seg.hx
+                            && v.duration) {
+                            var fpsE = window.__seg.hx.length / v.duration;
+                            window.__placeHeadDot(Math.round(localT * fpsE));
+                        }
+                        // Same hour: seek natively RIGHT NOW (no Dash round-trip) and
+                        // keep playing if it was. Coalesce rapid clicks: if a seek is
+                        // already in flight, remember the latest target and apply it
+                        // when the current seek finishes (setting currentTime on every
+                        // click thrashes the decoder).
+                        if (v.seeking) {
+                            window.__pendingSeek = localT;
+                        } else {
+                            try { v.currentTime = localT; } catch (e) {}
+                        }
+                        if (wasPlaying) {
+                            var pp = v.play();
+                            if (pp && pp.catch) { pp.catch(function () {}); }
+                        }
+                    } else {
+                        // Different hour: switch the video via the slider -> _drag
+                        // -> server load, and resume playback once it's ready if it
+                        // was playing (the 'canplay' handler honours __autoPlayNext).
+                        window.__autoPlayNext = wasPlaying;
+                        var row = s.base + Math.round(localT * s.fps);
+                        var input = document.querySelector('#frame input');
+                        if (input) {
+                            var setter = Object.getOwnPropertyDescriptor(
+                                window.HTMLInputElement.prototype, 'value').set;
+                            setter.call(input, String(row));
+                            input.dispatchEvent(new Event('input', {bubbles: true}));
+                            input.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
                     }
                 } catch (e) { /* ignore */ }
+            }
+            var __mdown = null;
+            document.addEventListener('mousedown', function (evt) {
+                if (evt.target.closest && evt.target.closest('.modebar')) {
+                    __mdown = null; return;
+                }
+                var c = evt.target.closest &&
+                    evt.target.closest('#ts-top, #ts-bottom');
+                __mdown = c ? {x: evt.clientX, y: evt.clientY, c: c} : null;
             }, true);
+            document.addEventListener('mouseup', function (evt) {
+                var md = __mdown; __mdown = null;
+                if (!md) { return; }
+                if (Math.abs(evt.clientX - md.x) > 6 ||
+                    Math.abs(evt.clientY - md.y) > 6) { return; }  // drag -> zoom
+                seekFromPoint(md.c, evt.clientX);
+            }, true);
+
+            // Load button: show the progress bar on the REAL click, synchronously,
+            // before Dash even dispatches -- a Dash clientside can't be relied on to
+            // paint before the heavy server _load runs. The confirm callback (on the
+            // load-info store) writes "Loaded" and hides the bar when done.
+            var loadBtn = document.getElementById('load');
+            if (loadBtn && !window.__loadBtnAttached) {
+                window.__loadBtnAttached = true;
+                loadBtn.addEventListener('click', function () {
+                    var s = document.getElementById('load-status');
+                    if (s) { s.textContent = '⏳ Loading dataset…'; }
+                    var b = document.getElementById('load-bar');
+                    if (b) { b.style.display = 'block'; }
+                });
+            }
 
             // Auto-advance: when an hour finishes, load the next segment and keep
             // playing. 'ended' jumps the slider to the next hour's first frame
@@ -1431,6 +2202,15 @@ def create_app(
                         if (p && p.catch) p.catch(function () {});
                     }
                 });
+                // Apply the latest coalesced click target once the in-flight seek
+                // finishes, so a burst of rapid clicks resolves to one final seek.
+                vid.addEventListener('seeked', function () {
+                    if (window.__pendingSeek != null) {
+                        var t = window.__pendingSeek;
+                        window.__pendingSeek = null;
+                        try { vid.currentTime = t; } catch (e) {}
+                    }
+                });
             }
             return '';
         }
@@ -1445,13 +2225,20 @@ def create_app(
         Input("seg", "data"),
         Input("unit", "value"),
         Input("offset", "value"),
+        Input("listen", "value"),
         prevent_initial_call=True,
     )
-    def _segment_spikes(seg, unit, offset):
-        # Spike times (seconds from the segment start) for the selected unit
-        # within the current video hour — used by the client-side audio monitor.
-        if state.df is None or not seg or unit is None:
-            return no_update
+    def _segment_spikes(seg, unit, offset, listen):
+        # EVERY spike (uncapped) of the unit within the current video hour, in
+        # seconds from the hour start -- the audible monitor pops on every one,
+        # regardless of the raster's display cap or the zoom window.
+        #
+        # Only shipped when "listen to spikes" is on: this array is several MB for
+        # a busy unit, and shipping it on every unit switch (audio off) was the main
+        # source of switch latency. Off -> empty (nothing to play, nothing to send).
+        listen_on = bool(listen) and "on" in listen
+        if not listen_on or state.df is None or not seg or unit is None:
+            return []
         base, n = seg["base"], seg["n"]
         t0 = float(state.df[COL_TIME].iloc[base])
         t1 = float(state.df[COL_TIME].iloc[base + n - 1])
@@ -1461,15 +2248,24 @@ def create_app(
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
+        Output("load-info", "data", allow_duplicate=True),
         Input("unit", "value"),
         prevent_initial_call=True,
     )
     def _select_unit(unit_value):
-        # Selecting a unit updates the spike + firing-rate plots immediately.
+        # Selecting a unit updates the spike + firing-rate plots immediately, with
+        # the progress bar shown while it loads (the top/head plots stay as-is).
         if state.df is None or unit_value is None:
-            return no_update
+            return no_update, no_update
+        state.load_counter += 1
+        if unit_value == state.autoselect_unit:
+            # Change came from loading a dataset (auto-picked first unit); _load
+            # already built the bottom plot -- keep the dataset summary.
+            state.autoselect_unit = None  # consume (real unit ids are never None)
+            return no_update, {"msg": state.load_status_msg, "n": state.load_counter}
         state.unit_id = unit_value
-        return _bottom_figure()
+        fig = _bottom_figure()
+        return fig, {"msg": f"✓ Loaded unit {unit_value}", "n": state.load_counter}
 
     @app.callback(
         Output("ts-bottom", "figure", allow_duplicate=True),
@@ -1543,6 +2339,79 @@ def _start_cloudflare_tunnel(port: int) -> str:
 _TUNNEL_PROCS: list = []
 
 
+def _cloudflared_bin() -> str:
+    """Locate a ``cloudflared`` executable.
+
+    Prefer one on ``PATH`` (a proper ``winget`` install), else fall back to the
+    copy ``pycloudflared`` downloads for the quick tunnel — so the named tunnel
+    needs no separate install. Returns ``""`` if none is found.
+    """
+    import os
+    import shutil
+
+    exe = shutil.which("cloudflared")
+    if exe:
+        return exe
+    try:
+        from pycloudflared.util import get_info
+
+        cand = getattr(get_info(), "executable", None)
+        if cand and os.path.exists(cand):
+            return cand
+    except Exception:  # noqa: BLE001 - fallback is best-effort
+        pass
+    return ""
+
+
+def _tunnel_exists(exe: str, tunnel: str) -> bool:
+    """Return True if a named tunnel already exists (requires prior login)."""
+    import json
+    import subprocess
+
+    try:
+        r = subprocess.run(
+            [exe, "tunnel", "list", "--output", "json"],
+            capture_output=True, text=True, check=False,
+        )
+        if r.returncode != 0:
+            return False
+        return any(t.get("name") == tunnel for t in json.loads(r.stdout or "[]"))
+    except Exception:  # noqa: BLE001 - treat any parse/exec failure as "missing"
+        return False
+
+
+def _ensure_named_tunnel(exe: str, tunnel: str, hostname: str | None) -> None:
+    """Provision the named tunnel on first run so the GUI "just works".
+
+    Idempotent: logs in (once, via browser), creates the tunnel, and routes the
+    hostname only if those steps haven't already been done. The single browser
+    authorization on first ``login`` is unavoidable (Cloudflare OAuth); every run
+    afterwards is fully automatic.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    cert = Path(os.path.expanduser("~")) / ".cloudflared" / "cert.pem"
+    if not cert.exists():
+        print("  [share] first-time Cloudflare login — a browser window will open;"
+              f" authorize the {hostname or 'chosen'} zone to continue...")
+        subprocess.run([exe, "tunnel", "login"], check=True)
+
+    if not _tunnel_exists(exe, tunnel):
+        print(f"  [share] creating named tunnel '{tunnel}' (one-time)...")
+        subprocess.run([exe, "tunnel", "create", tunnel], check=True)
+
+    if hostname:
+        r = subprocess.run(
+            [exe, "tunnel", "route", "dns", tunnel, hostname],
+            capture_output=True, text=True, check=False,
+        )
+        blob = (r.stdout + r.stderr).lower()
+        if r.returncode != 0 and "already" not in blob and "exists" not in blob:
+            print(f"  [share] DNS route warning: {(r.stderr or r.stdout).strip()}")
+
+
 def _start_cloudflare_named_tunnel(
     port: int, tunnel: str | None, hostname: str | None = None
 ) -> str:
@@ -1559,7 +2428,6 @@ def _start_cloudflare_named_tunnel(
 
     after which this launches ``cloudflared tunnel run`` pointed at the local app.
     """
-    import shutil
     import subprocess
 
     if not tunnel:
@@ -1567,13 +2435,15 @@ def _start_cloudflare_named_tunnel(
             "cloudflare-named needs a tunnel name (set CLOUDFLARE_TUNNEL or "
             "--cloudflare-tunnel). Create one with `cloudflared tunnel create <name>`."
         )
-    exe = shutil.which("cloudflared")
+    exe = _cloudflared_bin()
     if not exe:
         raise RuntimeError(
-            "cloudflared not found on PATH. Install it "
-            "(`winget install --id Cloudflare.cloudflared`) and complete the "
+            "cloudflared executable not found (neither on PATH nor bundled with "
+            "pycloudflared). Run `uv sync --extra gui`, or install it with "
+            "`winget install --id Cloudflare.cloudflared`, then complete the "
             "one-time tunnel setup (login / create / route dns)."
         )
+    _ensure_named_tunnel(exe, tunnel, hostname)  # provision on first run
     cmd = [exe, "tunnel", "--url", f"http://localhost:{port}", "run", tunnel]
     proc = subprocess.Popen(cmd)  # noqa: S603 - args are ours, not user input
     _TUNNEL_PROCS.append(proc)
@@ -1593,6 +2463,52 @@ def _start_ngrok_tunnel(port: int) -> str:
     return ngrok.connect(port, "http").public_url
 
 
+def _precompute_firing_rates(units_dir, bin_s: float, smooth_s: float) -> None:
+    """Ensure every units file in *units_dir* has a firing-rate cache on disk.
+
+    Runs once before serving; a matching cache is reused (fast), otherwise it is
+    computed and saved. Progress is printed so the operator sees the one-time cost.
+    """
+    files = _list_files(units_dir, (".pkl",))
+    if not files:
+        return
+    for uf in files:
+        name = Path(uf).name
+        parq, js = ephys.cache_paths(uf)
+        if parq.exists() and js.exists():
+            print(f"  [firing-rate] {name}: cached")
+            continue
+        try:
+            units = load_units(uf)
+        except Exception as exc:  # noqa: BLE001 - skip unreadable units files
+            print(f"  [firing-rate] {name}: skipped ({exc})")
+            continue
+        n = len(units)
+        print(f"  [firing-rate] {name}: computing for {n} units (one-time)...")
+
+        def _progress(done, total, _name=name):
+            if done == total or done % 25 == 0:
+                print(f"      {_name}: {done}/{total}")
+
+        ephys.ensure_firing_rates(units, uf, bin_s, smooth_s, FR_CACHE_POINTS,
+                                  progress=_progress)
+        print(f"  [firing-rate] {name}: done")
+
+
+def _clear_firing_rate_caches(units_dir) -> None:
+    """Delete every firing-rate cache file under *units_dir* (on GUI exit)."""
+    removed = 0
+    for uf in _list_files(units_dir, (".pkl",)):
+        for f in ephys.cache_paths(uf):
+            try:
+                if Path(f).exists():
+                    Path(f).unlink()
+                    removed += 1
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+    print(f"\n  [firing-rate] cleared {removed} cache file(s) on exit.")
+
+
 def run(
     dataset_dir: str | Path,
     units_dir: str | Path,
@@ -1609,6 +2525,7 @@ def run(
     firing_rate_bin_s: float = 0.05,
     firing_rate_smooth_s: float = 0.2,
     heading_mode: str = "vector",
+    clear_cache_on_exit: bool = False,
 ) -> None:
     """Create and serve the app, printing the URLs to share.
 
@@ -1641,6 +2558,16 @@ def run(
         heading_mode=heading_mode,
     )
 
+    # Precompute the instantaneous firing rate for every spiking (units) file so
+    # switching units in the GUI is instant. Cached to a parquet next to each units
+    # file; only recomputed when the file or bin/smoothing params change.
+    _precompute_firing_rates(units_dir, firing_rate_bin_s, firing_rate_smooth_s)
+    if show_all_spikes:
+        print("  [note] SHOW_ALL_SPIKES=true renders EVERY spike tick -- busy units "
+              "ship tens of MB per unit switch and are slow (especially over the "
+              "public link). Set SHOW_ALL_SPIKES=false for fast switching "
+              f"({MAX_RASTER_SPIKES:,}-tick subsample, visually the same).")
+
     print("\nPirouette explorer — share one of these links:")
     print(f"  this machine : http://127.0.0.1:{port}")
     if host == "0.0.0.0":
@@ -1667,4 +2594,14 @@ def run(
         "\nNote: for the LAN link, allow Python through the Windows Firewall when "
         "prompted.\n"
     )
-    app.run(host=host, port=port, debug=debug)
+    if clear_cache_on_exit:
+        print("  [firing-rate] caches will be deleted when the GUI is closed "
+              "(CLEAR_CACHE_ON_EXIT=true).")
+    # threaded=True so video range requests are served concurrently with the app's
+    # other requests/callbacks -- a single-threaded server blocks during a video
+    # chunk, which shows up as playback buffering/stalls.
+    try:
+        app.run(host=host, port=port, debug=debug, threaded=True)
+    finally:
+        if clear_cache_on_exit:
+            _clear_firing_rate_caches(units_dir)

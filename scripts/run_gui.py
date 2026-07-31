@@ -46,11 +46,14 @@ def main(argv: list[str] | None = None) -> None:
                    help="Tunnel backend: cloudflare (quick, random URL), "
                         "cloudflare-named (stable URL lasting weeks; needs setup), "
                         "or ngrok.")
-    p.add_argument("--cloudflare-tunnel", default=os.getenv("CLOUDFLARE_TUNNEL"),
-                   help="Named-tunnel name for --share-method cloudflare-named.")
-    p.add_argument("--cloudflare-hostname", default=os.getenv("CLOUDFLARE_HOSTNAME"),
+    p.add_argument("--cloudflare-tunnel",
+                   default=os.getenv("CLOUDFLARE_TUNNEL", "pirouette"),
+                   help="Named-tunnel name for --share-method cloudflare-named "
+                        "(default 'pirouette').")
+    p.add_argument("--cloudflare-hostname",
+                   default=os.getenv("CLOUDFLARE_HOSTNAME", "pirouette-viz.org"),
                    help="Routed hostname for the named tunnel "
-                        "(e.g. pirouette.example.org).")
+                        "(default 'pirouette-viz.org').")
     p.add_argument("--show-all-spikes", action="store_true",
                    default=os.getenv("SHOW_ALL_SPIKES", "").lower() in ("1", "true", "yes"),
                    help="Render every spike in the raster (slower for busy units) "
@@ -64,6 +67,11 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--heading-mode", choices=("vector", "commutator", "both"),
                    default=os.getenv("HEADING_MODE", "vector"),
                    help="Which heading trace(s) to plot (default vector).")
+    p.add_argument("--clear-cache-on-exit", action="store_true",
+                   default=os.getenv("CLEAR_CACHE_ON_EXIT", "").lower()
+                   in ("1", "true", "yes"),
+                   help="Delete the firing-rate caches when the GUI is closed "
+                        "(default off; caches persist so restarts are fast).")
     p.add_argument("--debug", action="store_true")
     args = p.parse_args(argv)
 
@@ -87,6 +95,7 @@ def main(argv: list[str] | None = None) -> None:
         firing_rate_bin_s=args.firing_rate_bin_s,
         firing_rate_smooth_s=args.firing_rate_smooth_s,
         heading_mode=args.heading_mode,
+        clear_cache_on_exit=args.clear_cache_on_exit,
     )
 
 

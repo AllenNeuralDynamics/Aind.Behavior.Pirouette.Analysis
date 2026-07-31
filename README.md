@@ -174,27 +174,30 @@ browser** — no local files. On start it prints the links to share:
 ### Stable link that lasts weeks
 
 The default quick tunnel is deliberately ephemeral. For a link you can hand out
-and rely on for weeks, use a **named Cloudflare tunnel**. One-time setup (needs a
-domain on a free [Cloudflare](https://dash.cloudflare.com) account):
+and rely on for weeks, use a **named Cloudflare tunnel**. This project's canonical
+host is **`https://pirouette-viz.org`** (a domain on a free
+[Cloudflare](https://dash.cloudflare.com) account).
 
-```bash
-winget install --id Cloudflare.cloudflared   # install the cloudflared CLI (once)
-cloudflared tunnel login                      # opens a browser; pick your domain
-cloudflared tunnel create pirouette           # creates the tunnel + credentials
-cloudflared tunnel route dns pirouette pirouette.<your-domain>   # map a hostname
-```
-
-Then set in `.env`:
+Setup is **automatic on first run** — no manual `cloudflared` commands. Just set
+in `.env`:
 
 ```env
 SHARE=true
 SHARE_METHOD=cloudflare-named
-CLOUDFLARE_TUNNEL=pirouette
-CLOUDFLARE_HOSTNAME=pirouette.<your-domain>
+CLOUDFLARE_TUNNEL=pirouette          # optional; this is the default
+CLOUDFLARE_HOSTNAME=pirouette-viz.org  # optional; this is the default
 ```
 
-and run `uv run python scripts/run_gui.py`. It prints your stable
-`https://pirouette.<your-domain>` link, which stays the same every run.
+and run `uv run python scripts/run_gui.py`. The **first** time, a browser window
+opens once so you can authorize the `pirouette-viz.org` zone (Cloudflare OAuth —
+unavoidable); the app then creates the tunnel and routes the hostname for you.
+`cloudflared` itself needs no separate install — the copy bundled with
+`pycloudflared` (from `uv sync --extra gui`) is used automatically.
+
+Every run **after** that is fully automatic and prints the same stable
+`https://pirouette-viz.org` link. (The provisioning is idempotent: it logs in only
+if `~/.cloudflared/cert.pem` is missing, and creates the tunnel only if it doesn't
+already exist.)
 
 **Keep it up for weeks.** The link is live only while both the app and the tunnel
 run, so start them at logon and auto-restart on failure. Simplest on Windows —
@@ -207,6 +210,23 @@ Spike times are shifted by `--spike-offset-s` (env `SPIKE_OFFSET_S`, also editab
 live in the app) so they are referenced to the **experiment start**, matching the
 dataset's `time_since_start`. GUI paths come from `.env`: `DATASET_DIR`,
 `UNITS_DIR`, `VIDEO_DIR`, plus `GUI_HOST` / `GUI_PORT`.
+
+**Spike raster (every tick, fast).** Rendering millions of ticks per unit is slow
+to ship, but at the full-recording zoom they are sub-pixel anyway, so the overview
+shows a fast subsample (`MAX_RASTER_SPIKES`). **Zoom in** and the raster refetches
+**every** spike in the visible window at full resolution (`RASTER_ZOOM_CAP`) — a
+zoomed window has few enough spikes to send instantly — so no individual event is
+lost when you investigate. Only the raster trace is patched, so it stays cheap.
+
+**Firing-rate cache.** The instantaneous firing rate (`pirouette_data.ephys`) is
+precomputed for every units file **before the GUI starts serving** and cached to a
+`<units_file>.firing_rate.parquet` next to it, so switching units is near-instant
+(a per-unit lookup instead of a ~1 s recompute). The cache is offset- and
+dataset-independent (rates are stored over the raw spike range and shifted/sliced
+at view time), so it survives offset tuning and pairing with different pose
+datasets; it is recomputed only when the units file, `FIRING_RATE_BIN_S`, or
+`FIRING_RATE_SMOOTH_S` change. The first run prints per-file progress (a one-time
+cost of a few minutes for a large multi-hundred-unit file).
 
 ## Methods notes
 
