@@ -1254,20 +1254,31 @@ def create_app(
     @app.callback(
         Output("curhead", "data"),
         Input("seek", "data"),
+        State("window", "value"),
         prevent_initial_call=True,
     )
-    def _current_head(seek):
-        # Tiny fast path: the clicked frame's head position for a cross-hour seek,
-        # so the head dot snaps to the right spot immediately -- before the new
-        # hour's (~1 MB) head array finishes loading. The head axes are the fixed
-        # chamber, so (hx, hy) alone is enough to place the dot.
+    def _current_head(seek, window_s):
+        # Tiny fast path for a cross-hour seek: the clicked frame's head position
+        # AND its trail window (a small ~200-point array), so both the head dot and
+        # the trail snap to the right spot immediately -- before the new hour's
+        # (~1 MB) head array loads. Head axes are the fixed chamber, so raw (x, y)
+        # positions + wall-clock ms colours are enough.
         if state.df is None or not seek or not seek.get("seg"):
             return no_update
         base, n, fps = _segment_row(seek["seg"])
-        frame = int(round(float(seek.get("t", 0.0)) * (fps or 60.0)))
-        row = base + max(0, min(n - 1, frame))
-        return {"seg": seek["seg"],
-                "hx": float(state.head_x[row]), "hy": float(state.head_y[row])}
+        fps = fps or 60.0
+        frame = max(0, min(n - 1, int(round(float(seek.get("t", 0.0)) * fps))))
+        row = base + frame
+        half = int(round(float(window_s or 10.0) * fps))
+        lo = max(base, row - half)
+        idx = np.unique(np.linspace(lo, row, min(200, row - lo + 1)).astype("int64"))
+        return {
+            "seg": seek["seg"],
+            "hx": float(state.head_x[row]), "hy": float(state.head_y[row]),
+            "tx": np.round(state.head_x[idx], 1).tolist(),
+            "ty": np.round(state.head_y[idx], 1).tolist(),
+            "tc": state.head_ms[idx].tolist(),
+        }
 
     # Slider drag -> move the red cursor live (client-side, in sync with the
     # handle) and seek the video. Within the current hour the seek is client-side
@@ -1450,47 +1461,27 @@ def create_app(
             var i = curIdx;
             var win = Math.round((windowS || 10) * fpsEff);
             var lo = Math.max(0, i - win);
-            var hgd = plotDiv('head');
-            if (hgd && Plotly) {
-                try {
-                    // The current-position marker is updated on rAF (below). Here we
-                    // only rebuild the trail + colorbar, which is much heavier -- run
-                    // it ~10x/s while playing (every tick when paused, so scrubbing
-                    // stays fresh) rather than every 40 ms tick.
-                    var freshTrail = v.paused
-                        || window.__lastTrailT === undefined
-                        || (nowT - window.__lastTrailT) >= 100;
-                    if (freshTrail) {
-                        window.__lastTrailT = nowT;
-                        var CAP = 200;
-                        var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
-                        var xs = [], ys = [], color = [];
-                        for (var j = lo; j <= i; j += step) {
-                            xs.push(seg.hx[j]); ys.push(seg.hy[j]);
-                            color.push(seg.startMs + (seg.ht[j] - seg.ht[0]) * 1000);
-                        }
-                        if ((i - lo) % step !== 0) {  // always include current point
-                            xs.push(seg.hx[i]); ys.push(seg.hy[i]);
-                            color.push(seg.startMs + (seg.ht[i] - seg.ht[0]) * 1000);
-                        }
-                        var cmin = color[0], cmax = color[color.length - 1];
-                        if (cmax <= cmin) { cmax = cmin + 1; }
-                        var tv = [], tt = [], NT = 4;
-                        for (var t = 0; t < NT; t++) {
-                            var val = cmin + (cmax - cmin) * t / (NT - 1);
-                            tv.push(val);
-                            tt.push(new Date(val).toISOString().slice(11, 19));
-                        }
-                        Plotly.restyle(hgd, {
-                            x: [xs], y: [ys], 'marker.color': [color],
-                            'marker.cmin': [cmin], 'marker.cmax': [cmax],
-                            'marker.cauto': [false],
-                            'marker.colorbar.tickmode': ['array'],
-                            'marker.colorbar.tickvals': [tv],
-                            'marker.colorbar.ticktext': [tt],
-                        }, [0]);
-                    }
-                } catch (e) { /* not ready */ }
+            // Rebuild the trail ~10x/s while playing (every tick when paused so
+            // scrubbing stays fresh). Skip during a cross-hour transition (stale
+            // head data) -- the curhead fast path already drew the correct trail.
+            var freshTrail = v.paused
+                || window.__lastTrailT === undefined
+                || (nowT - window.__lastTrailT) >= 100;
+            if (freshTrail && window.__renderHeadTrail && window.__segMatchesVideo
+                && window.__segMatchesVideo()) {
+                window.__lastTrailT = nowT;
+                var CAP = 200;
+                var step = Math.max(1, Math.ceil((i - lo + 1) / CAP));
+                var xs = [], ys = [], color = [];
+                for (var j = lo; j <= i; j += step) {
+                    xs.push(seg.hx[j]); ys.push(seg.hy[j]);
+                    color.push(seg.startMs + (seg.ht[j] - seg.ht[0]) * 1000);
+                }
+                if ((i - lo) % step !== 0) {  // always include current point
+                    xs.push(seg.hx[i]); ys.push(seg.hy[i]);
+                    color.push(seg.startMs + (seg.ht[i] - seg.ht[0]) * 1000);
+                }
+                window.__renderHeadTrail(xs, ys, color);
             }
 
             // Head dot: rVFC drives it smoothly during playback, but often doesn't
@@ -1715,6 +1706,30 @@ def create_app(
                 return !!(window.__seg && window.__seg.name && vv && vv.currentSrc
                     && vv.currentSrc.indexOf(window.__seg.name) >= 0);
             };
+            // Draw the head trail (trace 0) from window arrays (x, y, wall-clock ms
+            // colour). Shared by the 40 ms loop and the instant curhead fast path.
+            window.__renderHeadTrail = function (xs, ys, color) {
+                try {
+                    var hgd = pdiv('head');
+                    if (!hgd || !window.Plotly || !xs || !xs.length) { return; }
+                    var cmin = color[0], cmax = color[color.length - 1];
+                    if (cmax <= cmin) { cmax = cmin + 1; }
+                    var tv = [], tt = [], NT = 4;
+                    for (var t = 0; t < NT; t++) {
+                        var val = cmin + (cmax - cmin) * t / (NT - 1);
+                        tv.push(val);
+                        tt.push(new Date(val).toISOString().slice(11, 19));
+                    }
+                    window.Plotly.restyle(hgd, {
+                        x: [xs], y: [ys], 'marker.color': [color],
+                        'marker.cmin': [cmin], 'marker.cmax': [cmax],
+                        'marker.cauto': [false],
+                        'marker.colorbar.tickmode': ['array'],
+                        'marker.colorbar.tickvals': [tv],
+                        'marker.colorbar.ticktext': [tt],
+                    }, [0]);
+                } catch (e) {}
+            };
             // Move the head dot for a media time `mt` (seconds). This is a single
             // CSS transform (compositor-only, no Plotly redraw), so it can run for
             // every presented video frame without falling behind. The timeseries
@@ -1784,8 +1799,10 @@ def create_app(
     # frame-indexed updaters are gated off until the new head data matches the
     # video (see __segMatchesVideo), so this position holds instead of flickering.
     app.clientside_callback(
-        "function(ch){ if (ch && window.__placeHeadDotXY) { "
-        "window.__placeHeadDotXY(ch.hx, ch.hy); } return ''; }",
+        "function(ch){ if (!ch) { return ''; } "
+        "if (window.__placeHeadDotXY) { window.__placeHeadDotXY(ch.hx, ch.hy); } "
+        "if (window.__renderHeadTrail && ch.tx) { "
+        "window.__renderHeadTrail(ch.tx, ch.ty, ch.tc); } return ''; }",
         Output("_dummy10", "children"),
         Input("curhead", "data"),
         prevent_initial_call=True,
