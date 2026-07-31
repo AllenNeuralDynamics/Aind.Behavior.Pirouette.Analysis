@@ -910,6 +910,7 @@ def create_app(
             dcc.Store(id="seg"),
             dcc.Store(id="segmap"),
             dcc.Store(id="rasterwin"),  # visible x-window -> refetch full raster
+            dcc.Store(id="curhead"),  # clicked frame's head pos -> instant dot
             dcc.Store(id="seek"),
             dcc.Store(id="segspikes"),
             # Server -> client "load finished" signal ({msg, n}); the visible
@@ -925,6 +926,7 @@ def create_app(
             html.Div(id="_dummy7", style={"display": "none"}),
             html.Div(id="_dummy8", style={"display": "none"}),
             html.Div(id="_dummy9", style={"display": "none"}),
+            html.Div(id="_dummy10", style={"display": "none"}),
         ],
         style={"flex": "1", "minWidth": "560px", "padding": "8px",
                "overflowY": "auto", "minHeight": "0"},
@@ -1249,6 +1251,24 @@ def create_app(
         seg_store["head_yrange"] = list(hy_rng) if hy_rng else None
         return seg_store, head_fig
 
+    @app.callback(
+        Output("curhead", "data"),
+        Input("seek", "data"),
+        prevent_initial_call=True,
+    )
+    def _current_head(seek):
+        # Tiny fast path: the clicked frame's head position for a cross-hour seek,
+        # so the head dot snaps to the right spot immediately -- before the new
+        # hour's (~1 MB) head array finishes loading. The head axes are the fixed
+        # chamber, so (hx, hy) alone is enough to place the dot.
+        if state.df is None or not seek or not seek.get("seg"):
+            return no_update
+        base, n, fps = _segment_row(seek["seg"])
+        frame = int(round(float(seek.get("t", 0.0)) * (fps or 60.0)))
+        row = base + max(0, min(n - 1, frame))
+        return {"seg": seek["seg"],
+                "hx": float(state.head_x[row]), "hy": float(state.head_y[row])}
+
     # Slider drag -> move the red cursor live (client-side, in sync with the
     # handle) and seek the video. Within the current hour the seek is client-side
     # too; crossing into another hour switches the video via the server.
@@ -1476,7 +1496,11 @@ def create_app(
             // Head dot: rVFC drives it smoothly during playback, but often doesn't
             // fire on a PAUSED seek/scrub -- so update it here too when paused, so
             // the head plot lands on the clicked spot immediately (not only on play).
-            if (v.paused && window.__placeHeadDot) { window.__placeHeadDot(i); }
+            // Skip during a cross-hour transition (stale head data) -- curhead holds.
+            if (v.paused && window.__placeHeadDot && window.__segMatchesVideo
+                && window.__segMatchesVideo()) {
+                window.__placeHeadDot(i);
+            }
 
             // Frame info (client-side; frameMs is the current frame's wall-clock).
             var wall = new Date(frameMs).toISOString()
@@ -1652,20 +1676,20 @@ def create_app(
             // as a global so the 40 ms sync loop can also call it on a PAUSED seek
             // (rVFC often doesn't fire while paused, which left the head plot stale
             // until playback resumed).
-            window.__placeHeadDot = function (i) {
+            // Position the head dot at raw chamber coords (mm). The head axes are
+            // the fixed chamber, identical across hours, so this works even before a
+            // new segment's data/figure arrive -- used by the instant cross-hour
+            // "current head position" fast path.
+            window.__placeHeadDotXY = function (hx, hy) {
                 try {
-                    var s = window.__seg;
-                    if (!s || !s.hx) { return; }
-                    if (i < 0) { i = 0; }
-                    if (i > s.hx.length - 1) { i = s.hx.length - 1; }
                     var hgd = pdiv('head');
                     var dot = document.getElementById('head-dot');
                     if (hgd && hgd._fullLayout && dot) {
                         var xa = hgd._fullLayout.xaxis, ya = hgd._fullLayout.yaxis;
                         if (xa && ya && xa._length && ya._length) {
-                            var px = xa._offset + (s.hx[i] - xa.range[0])
+                            var px = xa._offset + (hx - xa.range[0])
                                 / (xa.range[1] - xa.range[0]) * xa._length;
-                            var py = ya._offset + (ya.range[1] - s.hy[i])
+                            var py = ya._offset + (ya.range[1] - hy)
                                 / (ya.range[1] - ya.range[0]) * ya._length;
                             dot.style.transform = 'translate('
                                 + (px - 6.5) + 'px,' + (py - 6.5) + 'px)';
@@ -1673,6 +1697,23 @@ def create_app(
                         }
                     }
                 } catch (e) {}
+            };
+            window.__placeHeadDot = function (i) {
+                var s = window.__seg;
+                if (!s || !s.hx) { return; }
+                if (i < 0) { i = 0; }
+                if (i > s.hx.length - 1) { i = s.hx.length - 1; }
+                window.__placeHeadDotXY(s.hx[i], s.hy[i]);
+            };
+            // True only when the loaded head data (window.__seg) matches the video
+            // that's actually showing. During a cross-hour switch the new video is
+            // up but the new head array hasn't arrived, so frame-indexed updates
+            // would use stale data -- skip them and let the instant curhead path
+            // hold the dot until the new data lands.
+            window.__segMatchesVideo = function () {
+                var vv = document.getElementById('video');
+                return !!(window.__seg && window.__seg.name && vv && vv.currentSrc
+                    && vv.currentSrc.indexOf(window.__seg.name) >= 0);
             };
             // Move the head dot for a media time `mt` (seconds). This is a single
             // CSS transform (compositor-only, no Plotly redraw), so it can run for
@@ -1695,7 +1736,9 @@ def create_app(
                     var i = Math.round(mt * fpsEff);
                     if (i < 0) { i = 0; }
                     if (i > n - 1) { i = n - 1; }
-                    window.__placeHeadDot(i);
+                    // Skip during a cross-hour transition (stale head data vs the
+                    // new video) -- the instant curhead path holds the dot.
+                    if (window.__segMatchesVideo()) { window.__placeHeadDot(i); }
                     // Cursor at this frame's wall-clock time (aligns with the data
                     // and spike ticks, same as the head dot) -- but NOT while a click
                     // hold is active (the 40 ms sync loop pins the cursor to the click
@@ -1733,6 +1776,18 @@ def create_app(
         """,
         Output("_dummy7", "children"),
         Input("seg", "data"),
+        prevent_initial_call=True,
+    )
+
+    # Instant cross-hour head dot: as soon as the clicked frame's (hx, hy) arrives
+    # (a tiny store, faster than the full head array), snap the dot to it. The
+    # frame-indexed updaters are gated off until the new head data matches the
+    # video (see __segMatchesVideo), so this position holds instead of flickering.
+    app.clientside_callback(
+        "function(ch){ if (ch && window.__placeHeadDotXY) { "
+        "window.__placeHeadDotXY(ch.hx, ch.hy); } return ''; }",
+        Output("_dummy10", "children"),
+        Input("curhead", "data"),
         prevent_initial_call=True,
     )
 
