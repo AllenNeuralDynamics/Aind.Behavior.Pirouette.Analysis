@@ -1218,22 +1218,24 @@ def create_app(
         # tz-naive wall-clock ms so the client-side cursor aligns with the axis.
         start_ms = int(state.df[COL_DATETIME].iloc[base].tz_localize(None).value // 1_000_000)
         sl = slice(base, base + n)
-        # Ship head x/y as int16 (0.1 mm units) and per-frame time as int32 ms
-        # relative to the segment start, base64-encoded. This is ~2.3 MB vs ~5.3 MB
-        # of JSON number arrays and much faster to parse -- the head plot was slow
-        # to appear because of that payload. The client decodes it back to arrays.
+        # Ship head x/y as int16 (0.1 mm units), base64-encoded (~1.1 MB vs ~5.3 MB
+        # of JSON number arrays, and fast to parse -- the head plot was slow to
+        # appear/catch up on a cross-hour click because of that payload). The
+        # per-frame time is NOT shipped: the camera runs at a rock-steady rate
+        # (std 0.01 ms, linear-fit dev <= 0.1 ms), so the client reconstructs
+        # time as ht0 + i*ht_dt. The client decodes these back to arrays.
         import base64
         hx_i16 = np.clip(np.round(state.head_x[sl] * 10), -32000, 32000).astype("int16")
         hy_i16 = np.clip(np.round(state.head_y[sl] * 10), -32000, 32000).astype("int16")
         ht_arr = state.head_t[sl]
         ht0 = float(ht_arr[0]) if ht_arr.size else 0.0
-        ht_rel_ms = np.round((ht_arr - ht0) * 1000.0).astype("int32")
+        ht_dt = (float((ht_arr[-1] - ht_arr[0]) / (n - 1)) if n > 1
+                 else 1.0 / (fps or 60.0))
         seg_store = {
             "base": base, "n": n, "fps": fps, "name": seg, "startMs": start_ms,
-            "ht0": ht0,
+            "ht0": ht0, "ht_dt": ht_dt,
             "hx_i16": base64.b64encode(hx_i16.tobytes()).decode("ascii"),
             "hy_i16": base64.b64encode(hy_i16.tobytes()).decode("ascii"),
-            "ht_rel_ms_i32": base64.b64encode(ht_rel_ms.tobytes()).decode("ascii"),
         }
         head_fig = build_head_position(
             state.head_x, state.head_y, state.head_ms, base,
@@ -1544,9 +1546,11 @@ def create_app(
     app.clientside_callback(
         """
         function(seg) {
-            // Decode the compact head payload (int16 0.1 mm x/y, int32 ms relative
-            // time) back into arrays. Much faster to transfer + parse than JSON
-            // number arrays, which made the head plot slow to appear.
+            // Decode the compact head payload (int16 0.1 mm x/y) back into arrays,
+            // and reconstruct per-frame time as ht0 + i*ht_dt (the camera rate is
+            // rock-steady). Much faster to transfer + parse than JSON number arrays,
+            // which made the head plot slow to appear / catch up on a cross-hour
+            // click.
             if (seg && seg.hx_i16 && !seg.hx) {
                 try {
                     var b64ToArr = function (b64, Ctor) {
@@ -1557,13 +1561,13 @@ def create_app(
                     };
                     var hxi = b64ToArr(seg.hx_i16, Int16Array);
                     var hyi = b64ToArr(seg.hy_i16, Int16Array);
-                    var htr = b64ToArr(seg.ht_rel_ms_i32, Int32Array);
                     var m = hxi.length, ht0 = seg.ht0 || 0;
+                    var dt = seg.ht_dt || (1 / 60);
                     var hx = new Float64Array(m), hy = new Float64Array(m);
                     var ht = new Float64Array(m);
                     for (var j = 0; j < m; j++) {
                         hx[j] = hxi[j] / 10; hy[j] = hyi[j] / 10;
-                        ht[j] = ht0 + htr[j] / 1000;
+                        ht[j] = ht0 + j * dt;
                     }
                     seg.hx = hx; seg.hy = hy; seg.ht = ht;
                 } catch (e) {}
