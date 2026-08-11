@@ -432,6 +432,34 @@ def make_animation(
     # dense periods contribute proportionally more points, revealing striations.
     _scatter_cap = max(cap, 500_000)
 
+    # ── Precomputed 2D density heatmap ───────────────────────────────────────
+    # 10 k time bins × 400 depth bins.  Per-row normalisation means each depth
+    # position (unit) shows its own temporal firing rate normalised to [0, 1],
+    # so units with wildly different mean rates are equally visible.
+    # The image is static — matplotlib pans/zooms it as set_xlim() changes —
+    # so there is no per-frame computation.  draw() fades it in smoothly by
+    # calling hmap_im.set_alpha() as the window grows past ~30 s.
+    _HMAP_T = 10_000
+    _HMAP_D = 400
+    _hmap_bins_t = np.linspace(t_lo, t_hi, _HMAP_T + 1)
+    _hmap_bins_d = np.linspace(d_lo - d_pad, d_hi + d_pad, _HMAP_D + 1)
+    _hmap = np.zeros((_HMAP_D, _HMAP_T), dtype="float64")
+    for _hpu in per_unit:
+        # Vectorised 2-D binning via searchsorted on the pre-sorted arrays.
+        _ht = np.clip(
+            np.searchsorted(_hmap_bins_t[1:], _hpu["times"], side="right"),
+            0, _HMAP_T - 1,
+        )
+        _hd = np.clip(
+            np.searchsorted(_hmap_bins_d[1:], _hpu["spike_depths"], side="right"),
+            0, _HMAP_D - 1,
+        )
+        _hmap += np.bincount(_hd * _HMAP_T + _ht,
+                             minlength=_HMAP_D * _HMAP_T).reshape(_HMAP_D, _HMAP_T)
+    _hmap_row_max = np.maximum(_hmap.max(axis=1, keepdims=True), 1.0)
+    _hmap_norm = (_hmap / _hmap_row_max).astype("float32")
+    del _hmap, _hmap_row_max   # free ~30 MB
+
     # Zoom-mode bookkeeping.
     if anchor_s is None:
         anchor_s = t_lo + 70.0          # default: 70 s into the recording
@@ -482,7 +510,24 @@ def make_animation(
     # marker="o" (filled circle) and s=1 are dartsort's defaults; edgecolors/lw=0
     # avoids marker outlines that would dominate at small sizes.
     scat = ax_raster.scatter([], [], s=1, marker="o", edgecolors="none",
-                             linewidths=0, rasterized=True)
+                             linewidths=0, rasterized=True, zorder=1)
+
+    # Precomputed density heatmap — zorder=2 places it on top of the scatter /
+    # pixel buffer (both at zorder=1).  draw() sets alpha to 0 at narrow zoom
+    # and ramps to _HMAP_MAX_ALPHA as the window crosses 30 s → 1 hr.
+    # "Blues" maps sparse (0) → near-white and dense (1) → dark blue, so
+    # high-firing time periods appear as dark vertical stripes (striations).
+    hmap_im = ax_raster.imshow(
+        _hmap_norm,
+        cmap="Blues",
+        vmin=0.0, vmax=1.0,
+        aspect="auto",
+        origin="lower",
+        extent=[t_lo, t_hi, d_lo - d_pad, d_hi + d_pad],
+        alpha=0.0,          # starts invisible; set per-frame in draw()
+        zorder=2,
+        interpolation="bilinear",
+    )
     if invert_depth:
         ax_raster.set_ylim(d_lo - d_pad, d_hi + d_pad)
     else:
@@ -595,6 +640,16 @@ def make_animation(
     _d_lo_px = d_lo - d_pad     # data y at the bottom of the imshow extent
     _d_full  = (d_hi + d_pad) - (d_lo - d_pad)   # full depth span of the image
 
+    # Heatmap blend: ramp alpha 0 → _HMAP_MAX_ALPHA over one log-decade in
+    # window width, starting where the pixel path begins (_PX_S = 30 s) and
+    # reaching full opacity at 1 hour.  Smoothstep gives an imperceptible
+    # transition — no jarring switch, just gradual appearance of the blue
+    # striation overlay as the zoom widens past 30 s → 3600 s.
+    _HMAP_MAX_ALPHA = 0.72        # at 1 hr+: heatmap at 72 % opacity
+    _HMAP_LOG_LO    = np.log10(_PX_S)        # log10(30)
+    _HMAP_LOG_HI    = np.log10(3600.0)       # log10(1 hr)
+    _HMAP_LOG_SPAN  = _HMAP_LOG_HI - _HMAP_LOG_LO
+
     # Lazy state: built on the first wide-zoom frame so axes are fully laid out.
     _pxim_state: list = [None]   # None → not yet created; else (im, buf, iw, ih)
     _use_pxim = [False]          # True → pixel imshow is the visible artist
@@ -620,13 +675,28 @@ def make_animation(
         im  = ax_raster.imshow(
             buf, aspect="auto", origin="lower", interpolation="nearest",
             extent=[t_lo, t_hi, _d_lo_px, _d_lo_px + _d_full],
-            zorder=2, visible=False,
+            zorder=1, visible=False,   # below hmap_im (zorder=2)
         )
         _pxim_state[0] = (im, buf, iw, ih)
         return _pxim_state[0]
 
     def draw(lo, hi):
         width = hi - lo
+
+        # ── Heatmap blend ────────────────────────────────────────────────────
+        # Fade the precomputed density overlay in as the window passes ~30 s.
+        # Below _PX_S: alpha=0 (scatter-only, no heatmap visible).
+        # Above 1 hr: alpha=_HMAP_MAX_ALPHA (striation pattern fully visible).
+        # Smoothstep in log-window-width space gives a gentle ramp.
+        if width <= _PX_S:
+            _hmap_a = 0.0
+        elif width >= 3600.0:
+            _hmap_a = _HMAP_MAX_ALPHA
+        else:
+            _ht = (np.log10(width) - _HMAP_LOG_LO) / _HMAP_LOG_SPAN
+            _hmap_a = _HMAP_MAX_ALPHA * _ht * _ht * (3.0 - 2.0 * _ht)
+        hmap_im.set_alpha(_hmap_a)
+
         # Adaptive marker size matching dartsort's s=1 at wide zoom, thicker at
         # narrow zoom so individual spikes are legible when zoomed in.
         # dartsort uses s=1 fixed; we floor at 1 and scale up at narrow zoom.
