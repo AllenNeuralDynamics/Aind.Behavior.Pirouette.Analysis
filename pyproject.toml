@@ -58,10 +58,12 @@ dependencies = [
     "swc-aeon>=0.2.0",
     # --- .csv is handled by pandas (above) ---
     # --- .h5 support ---
-    "h5py>=3.9",            # generic HDF5 read/write
-    "tables>=3.9",          # PyTables backend for pandas.read_hdf (DeepLabCut pose files)
+    "h5py>=3.9", # generic HDF5 read/write
+    "tables>=3.9", # PyTables backend for pandas.read_hdf (DeepLabCut pose files)
     # --- .parquet support (default dataset output format) ---
     "pyarrow>=14.0",
+    # --- Perceptual colour science (JCh filter for muted glasbey palette) ---
+    "colorspacious>=1.1",
     # --- .mp4 / video support ---
     "opencv-python>=4.8",
     "imageio>=2.31",
@@ -129,6 +131,9 @@ all = [
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["pirouette_data*"]
+
+[tool.setuptools.package-data]
+pirouette_data = ["assets/*.npz"]
 
 # ---------------------------------------------------------------------
 # uv dependency groups
