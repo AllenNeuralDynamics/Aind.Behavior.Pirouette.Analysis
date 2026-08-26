@@ -6,6 +6,7 @@ from pirouette_data import (
     ingestion,
     kinematics,
     processing,
+    vis,
     visualization_gui,
 )
 from pirouette_data.behavior_classification import (
@@ -47,6 +48,7 @@ __all__ = [
     "ingestion",
     "kinematics",
     "processing",
+    "vis",
     "visualization_gui",
     "build_dataset",
     "flatten_pose_columns",
