@@ -23,14 +23,25 @@ from pirouette_data.animations import make_animation
 
 
 def _default_units() -> str | None:
-    explicit = os.getenv("RASTER_UNITS_FILE")
-    if explicit:
-        return explicit
+    # Priority: EPHYS_DATASET (new) > RASTER_UNITS_FILE > UNITS_DIR/good_units.pkl
+    for var in ("EPHYS_DATASET", "RASTER_UNITS_FILE"):
+        val = os.getenv(var)
+        if val:
+            return val
     units_dir = os.getenv("UNITS_DIR")
     if units_dir:
         cand = Path(units_dir) / "good_units.pkl"
         if cand.exists():
             return str(cand)
+    return None
+
+
+def _default_center() -> float | None:
+    # RASTER_START_TIME_S (new) or legacy RASTER_CENTER_S
+    for var in ("RASTER_START_TIME_S", "RASTER_CENTER_S"):
+        val = os.getenv(var)
+        if val:
+            return float(val)
     return None
 
 
@@ -48,12 +59,12 @@ def main(argv: list[str] | None = None) -> None:
                    help="Output file name or path, .mp4/.gif (env RASTER_OUT). "
                         "A bare name is written under --save-dir.")
     p.add_argument("--center-s", type=float,
-                   default=(float(os.getenv("RASTER_CENTER_S"))
-                            if os.getenv("RASTER_CENTER_S") else None),
-                   help="Time the zoom centres on (default: middle of the recording).")
+                   default=_default_center(),
+                   help="Time the zoom centres on (default: middle of the recording). "
+                        "Env: RASTER_START_TIME_S or RASTER_CENTER_S.")
     p.add_argument("--window-start-s", type=float,
-                   default=float(os.getenv("RASTER_WINDOW_START_S", "0.01")),
-                   help="Initial window width in seconds (default 0.01 = 10 ms).")
+                   default=float(os.getenv("RASTER_WINDOW_START_S", "0.001")),
+                   help="Initial window width in seconds (default 0.001 = 1 ms).")
     p.add_argument("--window-end-s", type=float,
                    default=(float(os.getenv("RASTER_WINDOW_END_S"))
                             if os.getenv("RASTER_WINDOW_END_S") else None),
@@ -75,6 +86,85 @@ def main(argv: list[str] | None = None) -> None:
                    default=os.getenv("RASTER_INVERT_DEPTH", "").lower()
                    in ("1", "true", "yes"),
                    help="Put the deepest units at the TOP (default: bottom).")
+    p.add_argument("--axis-unit-ms-to-s", type=float,
+                   default=float(os.getenv("RASTER_AXIS_MS_TO_S", "1.0")),
+                   help="Window width (s) at which axis labels switch ms→s "
+                        "(default 1.0, env RASTER_AXIS_MS_TO_S).")
+    p.add_argument("--axis-unit-s-to-min", type=float,
+                   default=float(os.getenv("RASTER_AXIS_S_TO_MIN", "100.0")),
+                   help="Window width (s) at which axis labels switch s→min "
+                        "(default 100, env RASTER_AXIS_S_TO_MIN).")
+    p.add_argument("--axis-unit-min-to-hr", type=float,
+                   default=float(os.getenv("RASTER_AXIS_MIN_TO_HR", "6000.0")),
+                   help="Window width (s) at which axis labels switch min→hours "
+                        "(default 6000, env RASTER_AXIS_MIN_TO_HR).")
+    p.add_argument("--easing",
+                   default=os.getenv("RASTER_EASING", "ease-in-out"),
+                   help="Zoom-speed curve: 'ease-in-out' (default), 'ease-in', "
+                        "'ease-out', or 'linear' (env RASTER_EASING).")
+    p.add_argument("--milestone-dwell-s", type=float,
+                   default=float(os.getenv("RASTER_MILESTONE_DWELL_S", "0.5")),
+                   help="Seconds to hold at each scale-bar milestone "
+                        "(1 ms/100 ms/1 s/…/100 hrs). 0 = no dwell "
+                        "(env RASTER_MILESTONE_DWELL_S).")
+    p.add_argument("--zoom-mode",
+                   default=os.getenv("RASTER_ZOOM_MODE", "anchor-left"),
+                   choices=["anchor-left", "center", "center-right"],
+                   help="Zoom style: 'anchor-left' pins the left edge; 'center' zooms "
+                        "from a fixed centre; 'center-right' centres until the left "
+                        "edge reaches t=0 then expands rightward only, allowing the "
+                        "window to show blank space beyond the data end "
+                        "(env RASTER_ZOOM_MODE).")
+    p.add_argument("--depth-lo", type=float,
+                   default=(float(os.getenv("RASTER_DEPTH_LO_UM"))
+                            if os.getenv("RASTER_DEPTH_LO_UM") else None),
+                   help="Fixed lower y-limit for the raster (µm). "
+                        "Default: computed from data (env RASTER_DEPTH_LO_UM).")
+    p.add_argument("--depth-hi", type=float,
+                   default=(float(os.getenv("RASTER_DEPTH_HI_UM"))
+                            if os.getenv("RASTER_DEPTH_HI_UM") else None),
+                   help="Fixed upper y-limit for the raster (µm). "
+                        "Default: computed from data (env RASTER_DEPTH_HI_UM).")
+    p.add_argument("--anchor-s", type=float,
+                   default=(float(os.getenv("RASTER_ANCHOR_S"))
+                            if os.getenv("RASTER_ANCHOR_S") else None),
+                   help="Left-edge start time (s) for anchor-left mode. "
+                        "Default: 70 s into the recording (env RASTER_ANCHOR_S).")
+    p.add_argument("--rate-bin-s", type=float,
+                   default=float(os.getenv("RASTER_RATE_BIN_S", "1800")),
+                   help="Bin width (s) for the population firing-rate panel. "
+                        "1800 = 30 min (default); 3600 = 1 hr (env RASTER_RATE_BIN_S).")
+    p.add_argument("--t0-pst-s", type=float,
+                   default=float(os.getenv("RASTER_T0_PST_S", "0")),
+                   help="PST time-of-day in seconds at t=0 of the recording "
+                        "(e.g. 66866 for 18:34 PST). Used for the day/night strip "
+                        "(env RASTER_T0_PST_S).")
+    p.add_argument("--raster-mode",
+                   default=os.getenv("RASTER_MODE", "hybrid"),
+                   choices=["hybrid", "charlie"],
+                   help="Raster display mode: 'hybrid' (default) — per-unit colour "
+                        "ticks blending into a density heatmap at wide zoom; "
+                        "'charlie' — dartsort-style amplitude-ordered scatter with "
+                        "gaussian depth-smear at wide zoom (env RASTER_MODE).")
+    p.add_argument("--charlie-max-spikes", type=int,
+                   default=int(os.getenv("CHARLIE_MAX_SPIKES", "500000")),
+                   help="Global spike count cap for charlie mode (default 500 000; "
+                        "env CHARLIE_MAX_SPIKES).")
+    p.add_argument("--charlie-jitter-density",
+                   default=os.getenv("CHARLIE_JITTER_DENSITY", "per-unit"),
+                   choices=["per-unit", "global", "none"],
+                   help="Jitter density mode for charlie scatter: "
+                        "'per-unit' (default) — each unit's spread scales by its own "
+                        "local firing density so quiet units stay as sharp ticks; "
+                        "'global' — spread scales by total population spike density; "
+                        "'none' — uniform jitter at full sigma, no density weighting "
+                        "(env CHARLIE_JITTER_DENSITY).")
+    p.add_argument("--show-probe-map", action="store_true",
+                   default=os.getenv("RASTER_SHOW_PROBE_MAP", "").lower()
+                   in ("1", "true", "yes"),
+                   help="Add a static NP2.0 probe spiking map to the left of the raster, "
+                        "sharing the depth axis and using the same unit colours "
+                        "(env RASTER_SHOW_PROBE_MAP).")
     args = p.parse_args(argv)
 
     if not args.units_file:
@@ -101,6 +191,21 @@ def main(argv: list[str] | None = None) -> None:
         dpi=args.dpi,
         invert_depth=args.invert_depth,
         palette=args.palette,
+        easing=args.easing,
+        milestone_dwell_s=args.milestone_dwell_s,
+        axis_unit_ms_to_s=args.axis_unit_ms_to_s,
+        axis_unit_s_to_min=args.axis_unit_s_to_min,
+        axis_unit_min_to_hr=args.axis_unit_min_to_hr,
+        zoom_mode=args.zoom_mode,
+        anchor_s=args.anchor_s,
+        rate_bin_s=args.rate_bin_s,
+        t0_pst_s=args.t0_pst_s,
+        raster_mode=args.raster_mode,
+        charlie_max_spikes=args.charlie_max_spikes,
+        charlie_jitter_density=args.charlie_jitter_density,
+        depth_lo_um=args.depth_lo,
+        depth_hi_um=args.depth_hi,
+        show_probe_map=args.show_probe_map,
     )
     print(f"Saved {saved}")
 

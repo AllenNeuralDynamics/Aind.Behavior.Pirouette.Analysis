@@ -19,13 +19,56 @@ from pathlib import Path
 
 import numpy as np
 
+# Glasbey 1024-colour categorical palette bundled in pirouette_data/assets/.
+# This is the same npz that dartsort ships; bundling it here means the
+# animation code has no runtime dependency on the dartsort package.
+# Falls back to the dartsort package if the bundled copy is somehow absent,
+# and ultimately to colorcet via unit_colors() as a last resort.
+_dartsort_glasbey1024: "np.ndarray | None" = None
+try:
+    from importlib.resources import files as _importlib_files
+    with np.load(
+        str(_importlib_files("pirouette_data.assets").joinpath("glasbey1024.npz"))
+    ) as _gb_npz:
+        _dartsort_glasbey1024 = np.asarray(_gb_npz["glasbey1024"], dtype="float32")
+except Exception:
+    # Fallback: load from dartsort if installed (e.g. developer environment).
+    try:
+        with np.load(
+            str(_importlib_files("dartsort.pretrained").joinpath("glasbey1024.npz"))
+        ) as _gb_npz:
+            _dartsort_glasbey1024 = np.asarray(_gb_npz["glasbey1024"], dtype="float32")
+    except Exception:
+        try:
+            from dartsort.vis.colors import glasbey1024 as _gb  # type: ignore
+            _dartsort_glasbey1024 = np.asarray(_gb, dtype="float32")
+        except Exception:
+            pass
+
+# Pre-compute JCh (CIECAM02: J = lightness, C = chroma, h = hue) for every
+# colour in the palette so the muted-range filter mirrors the glasbey library's
+# lightness_bounds / chroma_bounds API — perceptually principled rather than
+# an ad-hoc HSV threshold.  Done once at import time; if colorspacious is
+# absent the draw block falls back to the HSV filter automatically.
+_dartsort_glasbey1024_jch: "np.ndarray | None" = None
+try:
+    from colorspacious import cspace_convert as _cspace_convert  # type: ignore
+    if _dartsort_glasbey1024 is not None:
+        _rgb_01 = np.clip(_dartsort_glasbey1024[:, :3], 0.0, 1.0).astype("float64")
+        _dartsort_glasbey1024_jch = _cspace_convert(
+            _rgb_01, "sRGB1", "JCh"
+        ).astype("float32")
+    del _cspace_convert
+except Exception:
+    pass
+
 # Scale-bar steps (seconds, label): the bar shows the largest of these that fits
 # in the current view, so it "switches" as the zoom widens.
 SCALE_STEPS: list[tuple[float, str]] = [
-    (0.001, "1 ms"),
-    (0.1,   "100 ms"),
-    (1.0,   "1 s"),
-    (60.0,  "1 min"),
+    (0.001,    "1 ms"),
+    (0.1,      "100 ms"),
+    (1.0,      "1 s"),
+    (60.0,     "1 min"),
     (3600.0,   "1 hr"),
     (36000.0,  "10 hrs"),
     (360000.0, "100 hrs"),
@@ -215,6 +258,23 @@ def _window_bounds_left(anchor_s: float, width_s: float, lo_limit: float,
     return lo, hi
 
 
+def _window_bounds_center_right(center_s: float, width_s: float,
+                                lo_limit: float, max_hi: float,
+                                ) -> tuple[float, float]:
+    """Centered zoom until the left edge reaches *lo_limit*, then expands right.
+
+    For small windows the view is symmetrically centred on *center_s*.  Once
+    the window is wide enough that the left edge would go below *lo_limit* the
+    left edge is pinned there and the window continues growing rightward only —
+    creating a seamless, non-jarring transition from centred to anchor-left.
+    The right edge can grow up to *max_hi* (the full animation end, which may
+    extend beyond the actual recording data).
+    """
+    lo = max(lo_limit, center_s - width_s / 2.0)
+    hi = min(lo + width_s, max_hi)
+    return lo, hi
+
+
 def _gaussian_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
     """Convolve *x* with a Gaussian kernel of std-dev *sigma* (in samples)."""
     r = int(np.ceil(3.5 * sigma))
@@ -297,14 +357,113 @@ def frame_points(per_unit: list[dict], lo: float, hi: float, cap: int
     return all_x, all_y, all_c
 
 
+def frame_points_binned(
+    per_unit: list[dict],
+    lo: float,
+    hi: float,
+    n_bins: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """At most one tick per (unit × time bin) — density-invariant raster.
+
+    Divides ``[lo, hi]`` into *n_bins* equal-width buckets.  For each unit,
+    only the *first* spike found in each occupied bucket is emitted.  The
+    output size is bounded by ``n_bins × n_units`` regardless of firing rate
+    or window width, so the apparent raster density stays visually consistent
+    as the zoom changes — analogous to dartsort's ``scatter_time_vs_depth``
+    decimation strategy.
+
+    Unlike :func:`frame_points`, no random cap is applied: presence is
+    determined from the raw spike train, so quiet periods are never
+    accidentally shown as active due to unlucky subsampling.
+    """
+    if n_bins < 1:
+        n_bins = 1
+    bin_edges = np.linspace(lo, hi, n_bins + 1)
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    cs: list[np.ndarray] = []
+    for pu in per_unit:
+        a = int(np.searchsorted(pu["times"], lo, "left"))
+        b = int(np.searchsorted(pu["times"], hi, "right"))
+        if b <= a:
+            continue
+        t = pu["times"][a:b]
+        d = pu["spike_depths"][a:b]
+        # Bin index for each spike: 0 … n_bins-1.
+        # searchsorted on the *interior* edges (bin_edges[1:-1]) puts spikes
+        # in [edges[k], edges[k+1]) into bucket k.
+        bidx = np.searchsorted(bin_edges[1:-1], t)
+        # One representative spike per occupied bucket (the first one found,
+        # which is also the earliest because times are sorted).
+        unique_b, first_idx = np.unique(bidx, return_index=True)
+        bin_cx = 0.5 * (bin_edges[unique_b] + bin_edges[unique_b + 1])
+        xs.append(bin_cx)
+        ys.append(d[first_idx])
+        cs.append(np.full(len(unique_b), pu["cidx"], dtype="int64"))
+    if not xs:
+        empty = np.array([], dtype="float64")
+        return empty, empty, np.array([], dtype="int64")
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(cs)
+
+
+def frame_points_fixed_k(
+    per_unit: list[dict],
+    lo: float,
+    hi: float,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Uniformly sub-sample each unit to at most *k* ticks in [lo, hi].
+
+    For a unit with *m* spikes in the window, retains the spike at index
+    ``round(i * (m-1) / (k-1))`` for *i* in ``0 … k-1`` (i.e. evenly-spaced
+    indices covering the full window, first and last spike always included).
+    When ``m <= k`` all spikes are kept.
+
+    This gives a **density-invariant** display: regardless of firing rate, each
+    unit contributes at most *k* ticks.  With ``k=60`` across a ~1240-px pixel
+    buffer, fill per unit ≈ 5 %.  Even if 10 units share the same y-pixel row,
+    the combined fill stays ≈ 40 % — clearly dashed rather than solid.
+
+    Unlike :func:`frame_points_binned`, the sub-sampled spikes retain their
+    *exact* spike times (not bin-center positions), so temporal clustering
+    (bursts, silences) is faithfully preserved.
+    """
+    if k < 1:
+        k = 1
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    cs: list[np.ndarray] = []
+    for pu in per_unit:
+        a = int(np.searchsorted(pu["times"], lo, "left"))
+        b = int(np.searchsorted(pu["times"], hi, "right"))
+        m = b - a
+        if m == 0:
+            continue
+        if m <= k:
+            t = pu["times"][a:b]
+            d = pu["spike_depths"][a:b]
+        else:
+            idx = np.round(np.linspace(0, m - 1, k)).astype(np.int64)
+            t = pu["times"][a:b][idx]
+            d = pu["spike_depths"][a:b][idx]
+        xs.append(t)
+        ys.append(d)
+        cs.append(np.full(len(t), pu["cidx"], dtype="int64"))
+    if not xs:
+        empty = np.array([], dtype="float64")
+        return empty, empty, np.array([], dtype="int64")
+    return np.concatenate(xs), np.concatenate(ys), np.concatenate(cs)
+
+
 def _build_widths(
     window_start_s: float,
     window_end_s: float,
     n_base: int,
     easing: str = "ease-in-out",
     milestone_dwell_n: int = 0,
+    slow_zones: list | None = None,
 ) -> np.ndarray:
-    """Per-frame window-width sequence, with optional easing and milestone dwells.
+    """Per-frame window-width sequence, with optional easing, milestone dwells, and slow zones.
 
     Parameters
     ----------
@@ -315,30 +474,83 @@ def _build_widths(
         Extra frames to hold at each scale-bar milestone (where the scale-bar
         label switches). Gives viewers a moment to orient at each decade before
         the next zoom begins. Set to ``0`` to disable.
-    """
-    t = np.linspace(0.0, 1.0, max(2, n_base))
-    if easing == "ease-in-out":
-        t = t * t * (3.0 - 2.0 * t)          # smoothstep
-    elif easing == "ease-in":
-        t = t * t
-    elif easing == "ease-out":
-        t = 1.0 - (1.0 - t) ** 2
-    # else "linear": keep t as-is
+    slow_zones:
+        List of zone tuples controlling per-region animation speed.  Two forms:
 
-    widths = window_start_s * (window_end_s / window_start_s) ** t
+        * ``(lo_s, hi_s, factor)`` — constant weight: the zone plays at
+          ``1/factor`` of the baseline log-speed (factor > 1 → slower).
+        * ``(lo_s, hi_s, factor_start, factor_end)`` — linear ramp: the weight
+          interpolates linearly (in log-width space) from ``factor_start`` at
+          ``lo_s`` to ``factor_end`` at ``hi_s``, giving a smooth acceleration
+          or deceleration across the zone.
+    """
+    log_start = np.log10(max(window_start_s, 1e-9))
+    log_end   = np.log10(max(window_end_s,   1e-9))
+
+    if slow_zones:
+        # Build a piecewise weight function in log-width space via cumulative
+        # integration, then invert to map uniform animation-time → log-width.
+        # High-weight zones get proportionally more animation frames (slower).
+        _N = 8192
+        lw_fine = np.linspace(log_start, log_end, _N)
+        w_fine  = np.ones(_N, dtype="float64")
+        for zone in slow_zones:
+            lo_s, hi_s = zone[0], zone[1]
+            factor_start = float(zone[2])
+            factor_end   = float(zone[3]) if len(zone) == 4 else factor_start
+            lo_l = np.log10(max(lo_s, window_start_s))
+            hi_l = np.log10(min(hi_s, window_end_s))
+            if lo_l < hi_l:
+                mask = (lw_fine >= lo_l) & (lw_fine <= hi_l)
+                if factor_start == factor_end:
+                    w_fine[mask] = factor_start
+                else:
+                    # Linear ramp in log-width space → smooth speed change.
+                    t_zone = (lw_fine[mask] - lo_l) / (hi_l - lo_l)
+                    w_fine[mask] = factor_start + (factor_end - factor_start) * t_zone
+        cum = np.cumsum(w_fine)
+        cum -= cum[0]
+        cum /= cum[-1]          # CDF over log-width → maps anim-t to log-width
+
+        # Apply easing to animation time, then look up log-widths via the CDF.
+        t = np.linspace(0.0, 1.0, max(2, n_base))
+        if easing == "ease-in-out":
+            t = t * t * (3.0 - 2.0 * t)
+        elif easing == "ease-in":
+            t = t * t
+        elif easing == "ease-out":
+            t = 1.0 - (1.0 - t) ** 2
+        lw = np.interp(t, cum, lw_fine)
+        widths = 10.0 ** lw
+    else:
+        t = np.linspace(0.0, 1.0, max(2, n_base))
+        if easing == "ease-in-out":
+            t = t * t * (3.0 - 2.0 * t)          # smoothstep
+        elif easing == "ease-in":
+            t = t * t
+        elif easing == "ease-out":
+            t = 1.0 - (1.0 - t) ** 2
+        # else "linear": keep t as-is
+        widths = window_start_s * (window_end_s / window_start_s) ** t
 
     if milestone_dwell_n <= 0:
         return widths
 
     # Insert dwell frames at each scale-bar milestone that falls inside the zoom range.
+    # IMPORTANT: dwell must be inserted BEFORE the frame that first crosses the
+    # milestone, not after it.  If we append w first, the sequence becomes
+    #   …, 99 ms, 101 ms, [100 ms × dwell], 102 ms, …
+    # which causes the visible "extends then snaps back" blip.  Inserting the
+    # dwell before w gives the correct monotone sequence:
+    #   …, 99 ms, [100 ms × dwell], 101 ms, …
     milestones = sorted(s for s, _ in SCALE_STEPS if window_start_s < s < window_end_s)
     result: list[float] = []
     prev = float(widths[0])
     for w in widths:
-        result.append(float(w))
         for ms in milestones:
             if prev < ms <= w:
                 result.extend([ms] * milestone_dwell_n)
+        result.append(float(w))
         prev = float(w)
     return np.array(result)
 
@@ -357,7 +569,7 @@ def make_animation(
     invert_depth: bool = False,
     palette: str = "glasbey",
     easing: str = "ease-in-out",
-    milestone_dwell_s: float = 0.5,
+    milestone_dwell_s: float = 0.0,
     axis_unit_ms_to_s: float = 1.0,
     axis_unit_s_to_min: float = 100.0,
     axis_unit_min_to_hr: float = 6000.0,
@@ -367,6 +579,14 @@ def make_animation(
     t0_pst_s: float = 0.0,
     seed: int = 0,
     title: str = "Manually curated spike output",
+    raster_mode: str = "hybrid",
+    charlie_max_spikes: int = 500_000,
+    depth_lo_um: float | None = None,
+    depth_hi_um: float | None = None,
+    show_rate: bool = False,
+    slow_zones: list[tuple[float, float, float]] | None = None,
+    charlie_jitter_density: str = "none",
+    show_probe_map: bool = False,
 ) -> Path:
     """Render + save the Powers-of-Ten spike-raster zoom animation.
 
@@ -392,6 +612,32 @@ def make_animation(
         ``"ease-in-out"`` (default) slows the zoom at the start and end so it
         feels intentional rather than mechanical. ``"linear"`` gives constant
         log-speed (original behaviour). Also accepts ``"ease-in"`` / ``"ease-out"``.
+    raster_mode:
+        ``"hybrid"`` (default) — per-unit colour ticks blending into a coloured
+        density heatmap at wide zoom.  ``"charlie"`` — dartsort-style: all spikes
+        globally subsampled, coloured by depth via glasbey, drawn amplitude-order
+        (high-amp on top), vertical ticks at narrow zoom that smear into a
+        gaussian depth-scattered scatter plot as the window grows.
+    charlie_max_spikes:
+        Global spike count cap for ``raster_mode="charlie"`` (default 500 000).
+        Spikes are chosen with a fixed random seed so renders are reproducible.
+    charlie_jitter_density:
+        How to compute the local density that scales each spike's Gaussian
+        y-jitter in ``"charlie"`` mode.  ``"per-unit"`` (default) — each unit
+        independently bins its own spikes across the visible window; a quiet unit
+        keeps near-zero spread even when other units are bursting.  ``"global"``
+        — all spikes from all units are pooled into one density estimate; spread
+        tracks the population firing rate at each moment.  ``"none"`` — jitter
+        is applied uniformly at full sigma regardless of local density, identical
+        to the behaviour before adaptive jitter was introduced.
+    show_rate:
+        Show the population-rate panel below the raster (default ``False``).
+        When ``False`` the raster is taller and the layout has 3 rows.
+    slow_zones:
+        List of ``(lo_s, hi_s, factor)`` triples that slow down specific
+        timescale regions.  Defaults to ``[(3600, 36_000, 2.0),
+        (36_000, 360_000, 4.0)]`` — half-speed from 1 hr → 10 hr and
+        quarter-speed from 10 hr → 100 hr.  Pass ``[]`` for uniform speed.
     milestone_dwell_s:
         Seconds to hold at each scale-bar milestone (where the bar label
         switches: 1 ms → 100 ms → 1 s → … → 100 hrs). Default 0.5 s. Set to
@@ -409,7 +655,8 @@ def make_animation(
     from matplotlib.transforms import blended_transform_factory
 
     # Colours follow ascending depth; top/bottom orientation is set on the axis.
-    per_unit = prepare_units(load_units_with_depth(units_path))
+    _raw_units = load_units_with_depth(units_path)
+    per_unit = prepare_units(_raw_units)
     n_units = len(per_unit)
     _ = seed  # jitter is deterministic in x (see draw); seed kept for API stability
 
@@ -425,40 +672,148 @@ def make_animation(
     # stray slightly outside the unit-mean range are not clipped.
     d_lo = float(min(pu["spike_depths"].min() for pu in per_unit))
     d_hi = float(max(pu["spike_depths"].max() for pu in per_unit))
-    d_pad = 0.04 * (d_hi - d_lo) + 5.0
+    if depth_lo_um is not None:
+        d_lo = float(depth_lo_um)
+    if depth_hi_um is not None:
+        d_hi = float(depth_hi_um)
+    d_pad = 0.0   # use exact depth range with no margin
 
     # Match dartsort's max_spikes_plot=500k: no subsampling for windows < ~350 s
     # (500k / (240 units × 6 Hz avg)).  Global random sampling (frame_points) means
     # dense periods contribute proportionally more points, revealing striations.
     _scatter_cap = max(cap, 500_000)
 
-    # ── Precomputed 2D density heatmap ───────────────────────────────────────
-    # 10 k time bins × 400 depth bins.  Per-row normalisation means each depth
-    # position (unit) shows its own temporal firing rate normalised to [0, 1],
-    # so units with wildly different mean rates are equally visible.
-    # The image is static — matplotlib pans/zooms it as set_xlim() changes —
-    # so there is no per-frame computation.  draw() fades it in smoothly by
-    # calling hmap_im.set_alpha() as the window grows past ~30 s.
-    _HMAP_T = 10_000
-    _HMAP_D = 400
-    _hmap_bins_t = np.linspace(t_lo, t_hi, _HMAP_T + 1)
-    _hmap_bins_d = np.linspace(d_lo - d_pad, d_hi + d_pad, _HMAP_D + 1)
-    _hmap = np.zeros((_HMAP_D, _HMAP_T), dtype="float64")
-    for _hpu in per_unit:
-        # Vectorised 2-D binning via searchsorted on the pre-sorted arrays.
-        _ht = np.clip(
-            np.searchsorted(_hmap_bins_t[1:], _hpu["times"], side="right"),
-            0, _HMAP_T - 1,
+    # ── Per-unit colored density (replaces grayscale shadow heatmap) ─────────
+    # For each unit, precompute a 1-D firing-rate density across _UNIT_HMAP_T
+    # equal-width time bins (≈18 s/bin for a 100-hr recording).  Power-law
+    # normalisation (exponent 3) makes quiet periods near-white and bursts
+    # vivid.  draw() uses this to paint a coloured density background in each
+    # unit's pixel row before stamping the sparse fixed-K ticks on top — so
+    # colour identity is maintained at every zoom level and the tick→density
+    # transition is seamless (same hue, only density vs. presence changes).
+    _UNIT_HMAP_T = 20_000          # ≈18 s/bin @ 100 hr; 17 bins at 5-min zoom
+    _unit_dens = np.zeros((n_units, _UNIT_HMAP_T), dtype="float32")
+    for _ui, _hpu in enumerate(per_unit):
+        _uht = np.clip(
+            ((_hpu["times"] - t_lo) / (t_hi - t_lo) * _UNIT_HMAP_T).astype(np.int32),
+            0, _UNIT_HMAP_T - 1,
         )
-        _hd = np.clip(
-            np.searchsorted(_hmap_bins_d[1:], _hpu["spike_depths"], side="right"),
-            0, _HMAP_D - 1,
-        )
-        _hmap += np.bincount(_hd * _HMAP_T + _ht,
-                             minlength=_HMAP_D * _HMAP_T).reshape(_HMAP_D, _HMAP_T)
-    _hmap_row_max = np.maximum(_hmap.max(axis=1, keepdims=True), 1.0)
-    _hmap_norm = (_hmap / _hmap_row_max).astype("float32")
-    del _hmap, _hmap_row_max   # free ~30 MB
+        _row = np.bincount(_uht, minlength=_UNIT_HMAP_T).astype("float32")
+        _mx  = max(_row.max(), 1.0)
+        _unit_dens[_ui] = (_row / _mx) ** 3.0   # power-law contrast
+    del _row
+    # Mean depth per unit — used every frame to map units to y-pixels.
+    _unit_depths = np.array(
+        [float(np.median(pu["spike_depths"])) for pu in per_unit], dtype="float32"
+    )
+
+    # ── "charlie" mode precompute ─────────────────────────────────────────────
+    # Mirrors the dartsort scatter_time_vs_depth() aesthetic:
+    #   • Random priority subsampling (not K-even) — bursts have more spikes so
+    #     they are over-represented → temporal structure (vertical striations)
+    #     is preserved at every zoom level.
+    #   • Each spike has a precomputed random priority in [0, 1).  At render time
+    #     we take the max_spikes highest-priority spikes in the visible window via
+    #     np.argpartition (O(N), stable across frames → no flicker).
+    #   • Spikes sorted by amplitude before drawing: low-amp first, high-amp last
+    #     (on top) → well-isolated single units pop off the background.
+    #   • Colour: dartsort's glasbey1024, palette indices scrambled so that
+    #     depth-adjacent units get perceptually distinct hues (no gradient).
+    if raster_mode == "charlie":
+        _ch_a_list = []
+        for pu in per_unit:
+            _n_pu = len(pu["times"])
+            # Try several amplitude key names; fall back to uniform 1.0
+            _raw_u = _raw_units[pu["id"]]
+            _raw_amp = (
+                _raw_u.get("amplitudes")
+                or _raw_u.get("denoised_ptp_amplitudes")
+                or _raw_u.get("ptp_amplitudes")
+            )
+            if _raw_amp is not None and len(_raw_amp) == len(_raw_u["spike_times"]):
+                # Re-sort to match the time-sorted order used in prepare_units()
+                _raw_sort = np.argsort(
+                    np.asarray(_raw_u["spike_times"], dtype="float64"))
+                _ch_a_list.append(
+                    np.asarray(_raw_amp, dtype="float32")[_raw_sort])
+            else:
+                _ch_a_list.append(np.ones(_n_pu, dtype="float32"))
+
+        # Per-unit amplitude arrays (time-sorted, matching per_unit[i]["times"]).
+        _ch_pu_amps = list(_ch_a_list)
+
+        # Deterministic per-unit random priorities and y-jitter (same seed → stable).
+        _rng_pu = np.random.default_rng(seed + 2)
+        _ch_pu_priority = [
+            _rng_pu.random(len(pu["times"])).astype("float32")
+            for pu in per_unit
+        ]
+        _ch_pu_jitter = [
+            _rng_pu.standard_normal(len(pu["times"])).astype("float32")
+            for pu in per_unit
+        ]
+
+        # Colour palette: muted entries from glasbey1024, selected in the
+        # perceptual JCh colorspace (CIECAM02 J = lightness, C = chroma).
+        # This mirrors the glasbey library's lightness_bounds / chroma_bounds
+        # API — dark (J < 55) and chromatically present (C > 25) keeps
+        # dark magenta, dark blue, dark red, dark teal while definitively
+        # excluding lime green (J~75), light cyan (J~85), pale yellow (J~90).
+        # Muted upper chroma cap (C < 75) softens neon/vivid outliers.
+        # Random shuffle gives categorical variety across depth-adjacent units.
+        _rng_color = np.random.default_rng(seed + 5)
+        if _dartsort_glasbey1024 is not None:
+            _rgb3 = _dartsort_glasbey1024[:, :3].astype("float32")
+            if _dartsort_glasbey1024_jch is not None:
+                # Perceptual muted filter: dark & moderately saturated.
+                _J = _dartsort_glasbey1024_jch[:, 0]
+                _C = _dartsort_glasbey1024_jch[:, 1]
+                _dark_idx = np.where((_J < 55.0) & (_C > 25.0) & (_C < 75.0))[0]
+                if len(_dark_idx) < n_units:          # relax chroma cap
+                    _dark_idx = np.where((_J < 55.0) & (_C > 20.0))[0]
+                if len(_dark_idx) < n_units:          # relax lightness
+                    _dark_idx = np.where((_J < 65.0) & (_C > 15.0))[0]
+                if len(_dark_idx) < n_units:          # last resort: darkest J
+                    _dark_idx = np.argsort(_J)[:max(n_units, 50)]
+            else:
+                # Fallback: HSV brightness/saturation filter.
+                _V  = _rgb3.max(axis=1)
+                _mn = _rgb3.min(axis=1)
+                _S  = np.where(_V > 1e-6, (_V - _mn) / _V, 0.0)
+                _dark_idx = np.where((_V < 0.65) & (_S > 0.4))[0]
+                if len(_dark_idx) < n_units:
+                    _dark_idx = np.where(_V < 0.65)[0]
+                if len(_dark_idx) < n_units:
+                    _dark_idx = np.argsort(_V)[:max(n_units, 50)]
+            _perm      = _rng_color.permutation(len(_dark_idx))
+            _color_idx = _dark_idx[_perm[np.arange(n_units, dtype=np.int64) % len(_dark_idx)]]
+            _ch_colors = _rgb3[_color_idx]            # (n_units, 3) float32
+        else:
+            _base = unit_colors(n_units, "glasbey")[:, :3].astype("float32")
+            _V_b  = _base.max(axis=1)
+            _mn_b = _base.min(axis=1)
+            _S_b  = np.where(_V_b > 1e-6, (_V_b - _mn_b) / _V_b, 0.0)
+            _dark_idx_b = np.where((_V_b < 0.65) & (_S_b > 0.4))[0]
+            if len(_dark_idx_b) < n_units:
+                _dark_idx_b = np.argsort(_V_b)[:max(n_units, 50)]
+            _perm2     = _rng_color.permutation(len(_dark_idx_b))
+            _ch_colors = _base[_dark_idx_b[_perm2[np.arange(n_units) % len(_dark_idx_b)]]]
+
+        # Visual transition schedule (shared with draw()).
+        # Two independent log-width schedules:
+        #   _CH_LOG_TICK_HI    — tick height: 5 px at ≤ 1 s → 1 px at exactly 1 min
+        #   _CH_LOG_JITTER_LO/HI — Gaussian y-spread: onset at 500ms window, max at 10 hr
+        # Alpha is constant 0.9 at all zoom levels.
+        _CH_JITTER_MAX    = 12.0             # max y-jitter sigma (px) at widest zoom
+        _CH_LOG_TICK_HI   = np.log10(60.0)  # tick → 1 px at 1-min window (single-pixel at 1 min)
+        _CH_LOG_JITTER_LO = np.log10(0.5)   # jitter onset at 500ms window
+        _CH_LOG_JITTER_HI = np.log10(36000.0)  # jitter max at 10-hr window
+    else:
+        # Ensure these names are defined so the draw() closure always compiles.
+        (_ch_pu_amps, _ch_pu_priority, _ch_pu_jitter, _ch_colors,
+         _CH_JITTER_MAX, _CH_LOG_TICK_HI,
+         _CH_LOG_JITTER_LO, _CH_LOG_JITTER_HI) = (
+            None, None, None, None, 0.0, 1.0, 0.0, 1.0)
 
     # Zoom-mode bookkeeping.
     if anchor_s is None:
@@ -485,80 +840,155 @@ def make_animation(
 
     n_base = max(2, int(round(duration_s * fps)))
     n_dwell = max(0, int(round(milestone_dwell_s * fps)))
-    widths = _build_widths(window_start_s, window_end_s, n_base, easing, n_dwell)
+    _slow = slow_zones if slow_zones is not None else [
+        # 0 → 100 ms window: base speed (good as-is).
+        (0.0,            0.1,   7.5,   7.5),
+        # 100 ms → 1 s: 2× slower than base.
+        (0.1,            1.0,  15.0,  15.0),
+        # 1 s → 1 hr: ramp 30→60, same profile as before the 1hr mark.
+        (1.0,        3_600.0,  30.0,  60.0),
+        # 1 hr → 10 hr: smooth ramp 60→120 — continuously doubles the frame density
+        # entering the 1–100 hr slow window; no speed discontinuity at either edge.
+        (3_600.0,   36_000.0,  60.0, 120.0),
+        # 10 → 100 hr: hold at 120 (2× the previous 60) so the 1–100 hr window as
+        # a whole lasts ~2× longer than before (was ≈5.5 s, now ≈11 s).
+        (36_000.0,  360_000.0, 120.0, 120.0),
+        # 100 → 1332 hr: ramp smoothly from 120 back down to near-zero so the exit
+        # from the slow window is as gradual as the entry.
+        (360_000.0, 4_795_200.0, 120.0,  0.5),
+    ]
+    widths = _build_widths(window_start_s, window_end_s, n_base, easing, n_dwell,
+                           slow_zones=_slow)
     n_zoom = len(widths)
     n_hold = max(1, int(round(hold_s * fps)))
 
     # ------------------------------------------------------------------ figure --
-    # 4 rows: raster | scale-bar strip | full-recording rate | full-recording tod
+    # Layout: [probe_map |] raster | scale-bar strip | [optional rate] | time-of-day
+    # When show_probe_map=True a narrow probe column is added to the left; the
+    # probe and raster share a y-axis (depth) and the depth tick labels live on
+    # the probe panel so the raster shows none.
     fig = plt.figure(figsize=(16, 9))
-    gs = fig.add_gridspec(
-        4, 1,
-        height_ratios=[5, 0.28, 1.8, 0.65],
-        hspace=0.07,
-        left=0.08, right=0.97, top=0.97, bottom=0.10,
-    )
-    ax_raster = fig.add_subplot(gs[0])
-    ax_scale  = fig.add_subplot(gs[1], sharex=ax_raster)   # scale bar; follows zoom
-    ax_rate   = fig.add_subplot(gs[2], sharex=ax_raster)   # zooms with raster
-    ax_tod    = fig.add_subplot(gs[3], sharex=ax_raster)   # zooms with raster
+    _probe_wratios = [1.0, 8.0] if show_probe_map else [1]
+    _n_cols = 2 if show_probe_map else 1
+    _raster_col = 1 if show_probe_map else 0
+    if show_rate:
+        # 4 rows: raster taller; tod halved
+        gs = fig.add_gridspec(
+            4, _n_cols,
+            height_ratios=[7.0, 0.28, 1.8, 0.325],
+            width_ratios=_probe_wratios,
+            hspace=0.07, wspace=0.0,
+            left=0.08, right=0.97, top=0.97, bottom=0.10,
+        )
+        if show_probe_map:
+            ax_probe  = fig.add_subplot(gs[0, 0])
+            ax_raster = fig.add_subplot(gs[0, _raster_col], sharey=ax_probe)
+        else:
+            ax_probe  = None
+            ax_raster = fig.add_subplot(gs[0, _raster_col])
+        ax_scale  = fig.add_subplot(gs[1, _raster_col], sharex=ax_raster)
+        ax_rate   = fig.add_subplot(gs[2, _raster_col], sharex=ax_raster)
+        ax_tod    = fig.add_subplot(gs[3, _raster_col], sharex=ax_raster)
+    else:
+        # 3 rows: raster | thin scale-bar strip | tod.
+        # Dedicated scale-bar strip (0.20 ratio, thinner than original 0.28) so the
+        # bar never overlaps raster spike data.
+        _hspace  = 0.0  if show_probe_map else 0.07
+        _top_gs  = 0.99 if show_probe_map else 0.97
+        _bot_gs  = 0.05 if show_probe_map else 0.10   # 5% gives room for "56 days" tick label
+        gs = fig.add_gridspec(
+            3, _n_cols,
+            height_ratios=[8.5, 0.20, 0.325],
+            width_ratios=_probe_wratios,
+            hspace=_hspace, wspace=0.0,
+            left=0.08, right=0.97, top=_top_gs, bottom=_bot_gs,
+        )
+        if show_probe_map:
+            # Probe spans ALL 3 rows — physical bottom = tod bottom.
+            ax_probe  = fig.add_subplot(gs[0:3, 0])
+            ax_raster = fig.add_subplot(gs[0, _raster_col])
+        else:
+            ax_probe  = None
+            ax_raster = fig.add_subplot(gs[0, _raster_col])
+        ax_scale  = fig.add_subplot(gs[1, _raster_col], sharex=ax_raster)
+        ax_rate   = None
+        ax_tod    = fig.add_subplot(gs[2, _raster_col], sharex=ax_raster)
     fig.patch.set_facecolor("white")
 
     # --- Raster panel ---
     ax_raster.set_facecolor("white")
-    # rasterized=True composites points during save — same as dartsort.
-    # marker="o" (filled circle) and s=1 are dartsort's defaults; edgecolors/lw=0
-    # avoids marker outlines that would dominate at small sizes.
-    scat = ax_raster.scatter([], [], s=1, marker="o", edgecolors="none",
-                             linewidths=0, rasterized=True, zorder=1)
-
-    # Precomputed density heatmap — zorder=2 places it on top of the scatter /
-    # pixel buffer (both at zorder=1).  draw() sets alpha to 0 at narrow zoom
-    # and ramps to _HMAP_MAX_ALPHA as the window crosses 30 s → 1 hr.
-    # "Blues" maps sparse (0) → near-white and dense (1) → dark blue, so
-    # high-firing time periods appear as dark vertical stripes (striations).
-    hmap_im = ax_raster.imshow(
-        _hmap_norm,
-        cmap="Blues",
-        vmin=0.0, vmax=1.0,
-        aspect="auto",
-        origin="lower",
-        extent=[t_lo, t_hi, d_lo - d_pad, d_hi + d_pad],
-        alpha=0.0,          # starts invisible; set per-frame in draw()
-        zorder=2,
-        interpolation="bilinear",
-    )
+    # No separate scatter artist or grayscale heatmap — the pixel buffer is used
+    # at every zoom level.  At narrow zoom it shows sparse fixed-K tick marks;
+    # at wide zoom it paints a per-unit coloured density background and stamps
+    # ticks on top.  Both layers share the same Glasbey unit colours so the
+    # transition is visually seamless.
     if invert_depth:
         ax_raster.set_ylim(d_lo - d_pad, d_hi + d_pad)
     else:
         ax_raster.set_ylim(d_hi + d_pad, d_lo - d_pad)
-    ax_raster.set_ylabel("unit depth (µm)")
-    ax_raster.tick_params(labelbottom=False)
+    if show_probe_map and ax_probe is not None:
+        # ax_probe is physically taller than ax_raster (it spans extra rows so its
+        # bottom edge reaches the tod strip bottom).  Without compensation µm/px
+        # would differ and the same unit depth would appear at different screen heights.
+        # Fix: read actual figure-fraction heights via get_position() and extend
+        # ax_probe's lower ylim by the extra fraction — independent of hardcoded ratios.
+        _raster_h   = ax_raster.get_position().height
+        _probe_h    = ax_probe.get_position().height
+        _data_range = (d_hi + d_pad) - (d_lo - d_pad)
+        _probe_d_lo = (d_lo - d_pad) - (_probe_h / _raster_h - 1.0) * _data_range
+        if invert_depth:
+            ax_probe.set_ylim(_probe_d_lo, d_hi + d_pad)
+        else:
+            ax_probe.set_ylim(d_hi + d_pad, _probe_d_lo)
+    if show_probe_map:
+        # Depth axis lives on the probe panel; raster has no y-axis at all.
+        ax_raster.set_ylabel("")
+        ax_raster.tick_params(left=False, labelleft=False)
+        for _sp in ("top", "right", "bottom", "left"):
+            ax_raster.spines[_sp].set_visible(False)
+    else:
+        ax_raster.set_ylabel("depth (µm)")
+        # Keep only the left spine (y-axis); remove top, right, and bottom.
+        for _sp in ("top", "right", "bottom"):
+            ax_raster.spines[_sp].set_visible(False)
+    ax_raster.tick_params(bottom=False, labelbottom=False)
 
-    # --- Scale-bar strip (shares X with raster; no content except the bar) ---
-    ax_scale.set_facecolor("white")
-    ax_scale.set_yticks([])
-    for _sp in ax_scale.spines.values():
-        _sp.set_visible(False)
-    ax_scale.tick_params(bottom=False, labelbottom=False)
+    # --- Scale-bar (dedicated strip when show_rate; embedded on ax_raster otherwise) ---
+    if ax_scale is not None:
+        ax_scale.set_facecolor("white")
+        ax_scale.set_yticks([])
+        for _sp in ax_scale.spines.values():
+            _sp.set_visible(False)
+        ax_scale.tick_params(bottom=False, labelbottom=False)
+        _bar_ax = ax_scale
+        _bar_y  = 0.35    # y in ax_scale axes fraction
+        _bar_ty = 0.70
+    else:
+        # Draw scale bar near the bottom of the raster to avoid a white-space gap.
+        _bar_ax = ax_raster
+        _bar_y  = 0.04    # y in ax_raster axes fraction (4 % up from raster bottom)
+        _bar_ty = 0.08
 
-    blend = blended_transform_factory(ax_scale.transData, ax_scale.transAxes)
-    (bar_line,) = ax_scale.plot([], [], color="black", lw=3, transform=blend,
-                                 solid_capstyle="butt")
-    bar_text = ax_scale.text(0, 0.78, "", transform=blend,
-                              ha="center", va="bottom", fontsize=10, color="black")
+    blend = blended_transform_factory(_bar_ax.transData, _bar_ax.transAxes)
+    (bar_line,) = _bar_ax.plot([], [], color="black", lw=3, transform=blend,
+                                solid_capstyle="butt", zorder=10)
+    bar_text = _bar_ax.text(0, _bar_ty, "", transform=blend,
+                             ha="center", va="bottom", fontsize=10, color="black", zorder=10)
 
-    # --- Population-rate panel (zooms with raster; adaptive-resolution per frame) ---
-    ax_rate.set_facecolor("white")
-    # Updatable filled polygon: draw() replaces vertices each frame via set_xy().
-    rate_fill = ax_rate.fill([], [], color="#5599ee", alpha=0.80, lw=0)[0]
-    ax_rate.set_ylim(0, 1.3)
-    ax_rate.set_yticks([0.0, 0.5, 1.0])
-    ax_rate.set_yticklabels(["0", "½", "1"], fontsize=7)
-    ax_rate.set_ylabel("pop. rate\n(norm.)", fontsize=8, labelpad=2)
-    ax_rate.tick_params(labelbottom=False)
-    for _sp in ("top", "right"):
-        ax_rate.spines[_sp].set_visible(False)
+    # --- Population-rate panel (optional; zooms with raster) ---
+    if show_rate and ax_rate is not None:
+        ax_rate.set_facecolor("white")
+        # Updatable filled polygon: draw() replaces vertices each frame via set_xy().
+        rate_fill = ax_rate.fill([], [], color="#5599ee", alpha=0.80, lw=0)[0]
+        ax_rate.set_ylim(0, 1.3)
+        ax_rate.set_yticks([0.0, 0.5, 1.0])
+        ax_rate.set_yticklabels(["0", "½", "1"], fontsize=7)
+        ax_rate.set_ylabel("pop. rate\n(norm.)", fontsize=8, labelpad=2)
+        ax_rate.tick_params(labelbottom=False)
+        for _sp in ("top", "right"):
+            ax_rate.spines[_sp].set_visible(False)
+    else:
+        rate_fill = None
 
     # --- Day / night panel (zooms with raster) ---
     from matplotlib.patches import Patch
@@ -578,44 +1008,115 @@ def make_animation(
     _tod_rgb  = _day_f[:, None] * _DAY_RGB + (1 - _day_f[:, None]) * _NIGHT_RGB
     _tod_img  = _tod_rgb[np.newaxis, :, :]
 
+    ax_tod.set_facecolor("white")   # beyond data extent shows white (missing data)
     ax_tod.imshow(_tod_img, aspect="auto", extent=[t_lo, t_hi, 0, 1],
                   origin="lower", interpolation="bilinear", zorder=0)
     ax_tod.set_ylim(0, 1)
     ax_tod.set_yticks([])
-    ax_tod.set_ylabel("time\nof day\n(PST)", fontsize=7, labelpad=2)
-    ax_tod.tick_params(bottom=True, labelbottom=True, labelsize=8)
-    for _sp in ("top", "right", "left"):
-        ax_tod.spines[_sp].set_visible(False)
+    # No axis labels, tick marks, tick values, or legend on the ToD strip.
+    ax_tod.tick_params(bottom=False, labelbottom=False)
+    ax_tod.set_xlabel("")
+    ax_tod.set_ylabel("")
+    for _sp in ax_tod.spines.values():
+        _sp.set_visible(False)
 
-    # Dawn / dusk crossing markers — start invisible; draw() toggles them as the
-    # zoom window reaches each crossing, avoiding font-renderer overflow at narrow zoom.
-    _blend_tod = blended_transform_factory(ax_tod.transData, ax_tod.transAxes)
-    _crossings: list[tuple[float, object, object]] = []
-    for _d in range(-1, 8):
-        for _t_pst, _lbl in [(_DAWN_PST_S, "6 AM"), (_DUSK_PST_S, "8 PM")]:
-            _t_cross = _d * 86400.0 + _t_pst - t0_pst_s
-            if t_lo <= _t_cross <= t_hi:
-                _vl = ax_tod.axvline(_t_cross, color="white", lw=0.6, alpha=0.55,
-                                     zorder=2, visible=False)
-                _tx = ax_tod.text(_t_cross, 0.88, _lbl, ha="center", va="top",
-                                  fontsize=6, color="white", zorder=3,
-                                  transform=_blend_tod, visible=False)
-                _crossings.append((_t_cross, _tx, _vl))
+    # No crossing markers or labels on the ToD strip — decoration only.
 
-    # Legend: day vs night, placed just above the tod strip (does not share x-space).
-    ax_tod.legend(
-        handles=[
-            Patch(facecolor=tuple(_DAY_RGB),                    label="Day  (6 AM – 8 PM PST)"),
-            Patch(facecolor=tuple(_NIGHT_RGB), edgecolor="0.5", label="Night  (8 PM – 6 AM PST)"),
-        ],
-        loc="lower right",
-        bbox_to_anchor=(1.0, 1.06),
-        bbox_transform=ax_tod.transAxes,
-        fontsize=7, ncol=2,
-        framealpha=0.92, facecolor="white", edgecolor="0.8",
-        handlelength=1.2, handleheight=0.9,
-        borderpad=0.4, columnspacing=0.8,
-    )
+    # --- Probe-map panel (static; drawn once before the animation loop) -------
+    if show_probe_map and ax_probe is not None:
+        import os as _os
+        from pirouette_data.vis import (
+            ProbeGeometry as _ProbeGeometry,
+            draw_probe_schematic as _draw_probe,
+            overlay_waveforms as _overlay_wf,
+        )
+        # Read probe geometry from environment (matches .env PROBE_* variables).
+        def _ef(name: str, default: float) -> float:
+            v = _os.getenv(name)
+            return default if not v or not v.strip() else float(v)
+        def _ei(name: str, default: int) -> int:
+            v = _os.getenv(name)
+            return default if not v or not v.strip() else int(v)
+        def _eb(name: str, default: bool) -> bool:
+            v = _os.getenv(name)
+            return default if not v or not v.strip() else v.strip().lower() in ("1","true","yes","on")
+        _geo = _ProbeGeometry(
+            shank_width       = _ef("PROBE_SHANK_WIDTH_UM",      70.0),
+            tip_length        = _ef("PROBE_TIP_LENGTH_UM",       175.0),
+            site_width        = _ef("PROBE_SITE_WIDTH_UM",        12.0),
+            site_height       = _ef("PROBE_SITE_HEIGHT_UM",       12.0),
+            vertical_pitch    = _ef("PROBE_VERTICAL_PITCH_UM",    15.0),
+            horizontal_pitch  = _ef("PROBE_HORIZONTAL_PITCH_UM",  32.0),
+            n_sites           = _ei("PROBE_N_SITES",               96),
+            first_site_offset = _ef("PROBE_FIRST_SITE_OFFSET_UM", 20.0),
+            stagger           = _eb("PROBE_STAGGER",              False),
+        )
+
+        # Draw shank outline + recording-site rectangles.
+        ax_probe.set_facecolor("white")
+        _draw_probe(ax_probe, _geo)
+
+        # Build RGBA color map that exactly matches the raster animation colors.
+        try:
+            # charlie mode: _ch_colors is (n_units, 3) float32; per_unit order = cidx
+            _probe_cm = {
+                per_unit[_pi]["id"]: np.append(_ch_colors[_pi], 1.0).astype("float32")
+                for _pi in range(n_units)
+            }
+        except NameError:
+            # hybrid / non-charlie: colors is (n_units, 4) RGBA
+            _probe_cm = {
+                per_unit[_pi]["id"]: colors[_pi]
+                for _pi in range(n_units)
+            }
+
+        # Overlay mean waveforms using the same unit colors as the raster.
+        # All waveform parameters come from SPIKING_MAP_* env vars (matching .env).
+        try:
+            _overlay_wf(
+                ax_probe, _raw_units, _geo,
+                palette=_os.getenv("SPIKING_MAP_PALETTE", palette),
+                invert_depth=_eb("SPIKING_MAP_INVERT_DEPTH", invert_depth),
+                unit_color_map=_probe_cm,
+                wf_x_span_um   = _ef("SPIKING_MAP_WF_X_SPAN_UM",    24.0),
+                wf_amp_um      = _ef("SPIKING_MAP_WF_AMP_UM",        10.0),
+                relative_amp   = _eb("SPIKING_MAP_WF_RELATIVE_AMP", False),
+                jitter_step_um = _ef("SPIKING_MAP_JITTER_STEP_UM",    4.0),
+                n_jitter       = _ei("SPIKING_MAP_N_JITTER",             5),
+                jitter_y_um    = _ef("SPIKING_MAP_JITTER_Y_UM",       2.5),
+                n_jitter_y     = _ei("SPIKING_MAP_N_JITTER_Y",           3),
+                upsample       = _ei("SPIKING_MAP_WF_UPSAMPLE",          4),
+                linewidth      = _ef("SPIKING_MAP_WF_LW",             0.5),
+                alpha          = _ef("SPIKING_MAP_WF_ALPHA",          0.85),
+                seed=seed,
+            )
+        except Exception:
+            pass   # no waveform data in this pickle — shank outline still shown
+
+        # Set probe x-limits so that 1 µm = 1 µm visually (sites appear square).
+        # Compute axes dimensions from the GridSpec position (available immediately
+        # when explicit left/right/top/bottom are used — no canvas.draw() needed).
+        _pos_p   = ax_probe.get_position()          # Bbox in figure fraction
+        _ax_w_in = _pos_p.width  * fig.get_figwidth()
+        _ax_h_in = _pos_p.height * fig.get_figheight()
+        _y_range = abs(ax_probe.get_ylim()[1] - ax_probe.get_ylim()[0])  # full probe ylim span
+        _x_range = (_ax_w_in / _ax_h_in) * _y_range # µm needed for equal aspect
+        _x_ctr   = _geo.shank_width / 2.0           # centre of probe shank
+        ax_probe.set_xlim(_x_ctr - _x_range / 2.0, _x_ctr + _x_range / 2.0)
+
+        # Style: left spine + depth y-ticks; no x-axis.
+        ax_probe.xaxis.set_visible(False)
+        for _sp in ("top", "right", "bottom"):
+            ax_probe.spines[_sp].set_visible(False)
+        ax_probe.spines["left"].set_visible(False)
+        ax_probe.tick_params(axis="y", left=False, labelleft=False)
+        ax_probe.set_ylabel("")
+        # Unit-count label sits at the very top of the probe axes (99 % up),
+        # just above the topmost recording sites. va='top' anchors the text top
+        # at that fraction so the label hangs down into the visible area.
+        ax_probe.text(0.5, 0.99, f"{n_units} units",
+                      transform=ax_probe.transAxes,
+                      ha="center", va="top", fontsize=8)
 
     # -------------------------------------------------------- draw / update --
     _unit_thresholds = (axis_unit_ms_to_s, axis_unit_s_to_min, axis_unit_min_to_hr)
@@ -640,19 +1141,13 @@ def make_animation(
     _d_lo_px = d_lo - d_pad     # data y at the bottom of the imshow extent
     _d_full  = (d_hi + d_pad) - (d_lo - d_pad)   # full depth span of the image
 
-    # Heatmap blend: ramp alpha 0 → _HMAP_MAX_ALPHA over one log-decade in
-    # window width, starting where the pixel path begins (_PX_S = 30 s) and
-    # reaching full opacity at 1 hour.  Smoothstep gives an imperceptible
-    # transition — no jarring switch, just gradual appearance of the blue
-    # striation overlay as the zoom widens past 30 s → 3600 s.
-    _HMAP_MAX_ALPHA = 0.72        # at 1 hr+: heatmap at 72 % opacity
-    _HMAP_LOG_LO    = np.log10(_PX_S)        # log10(30)
-    _HMAP_LOG_HI    = np.log10(3600.0)       # log10(1 hr)
-    _HMAP_LOG_SPAN  = _HMAP_LOG_HI - _HMAP_LOG_LO
+    # Density-blend schedule: 0 at ≤1 min (pure ticks), 1 at ≥1 hr (full density).
+    _HMAP_LOG_LO   = np.log10(60.0)      # log10(1 min) — blend start
+    _HMAP_LOG_HI   = np.log10(3600.0)    # log10(1 hr)  — blend end
+    _HMAP_LOG_SPAN = _HMAP_LOG_HI - _HMAP_LOG_LO
 
     # Lazy state: built on the first wide-zoom frame so axes are fully laid out.
     _pxim_state: list = [None]   # None → not yet created; else (im, buf, iw, ih)
-    _use_pxim = [False]          # True → pixel imshow is the visible artist
 
     def _ensure_pxim():
         """Return cached (im, buf, iw, ih) — create on first call."""
@@ -675,7 +1170,7 @@ def make_animation(
         im  = ax_raster.imshow(
             buf, aspect="auto", origin="lower", interpolation="nearest",
             extent=[t_lo, t_hi, _d_lo_px, _d_lo_px + _d_full],
-            zorder=1, visible=False,   # below hmap_im (zorder=2)
+            zorder=1, visible=False,   # starts hidden; draw() calls im.set_visible(True)
         )
         _pxim_state[0] = (im, buf, iw, ih)
         return _pxim_state[0]
@@ -683,69 +1178,234 @@ def make_animation(
     def draw(lo, hi):
         width = hi - lo
 
-        # ── Heatmap blend ────────────────────────────────────────────────────
-        # Fade the precomputed density overlay in as the window passes ~30 s.
-        # Below _PX_S: alpha=0 (scatter-only, no heatmap visible).
-        # Above 1 hr: alpha=_HMAP_MAX_ALPHA (striation pattern fully visible).
-        # Smoothstep in log-window-width space gives a gentle ramp.
-        if width <= _PX_S:
-            _hmap_a = 0.0
-        elif width >= 3600.0:
-            _hmap_a = _HMAP_MAX_ALPHA
+        # ── Density-blend factor (_db): 0 at ≤30 s, 1 at ≥5 min ────────────
+        # Smoothstep in log-width space.  At _db=0 only fixed-K ticks show;
+        # at _db=1 the per-unit coloured density background dominates and ticks
+        # accent burst columns.  Same colour for both layers → seamless blend.
+        if width <= 10 ** _HMAP_LOG_LO:
+            _db = 0.0
+        elif width >= 10 ** _HMAP_LOG_HI:
+            _db = 1.0
         else:
-            _ht = (np.log10(width) - _HMAP_LOG_LO) / _HMAP_LOG_SPAN
-            _hmap_a = _HMAP_MAX_ALPHA * _ht * _ht * (3.0 - 2.0 * _ht)
-        hmap_im.set_alpha(_hmap_a)
+            _ht = np.clip(
+                (np.log10(width) - _HMAP_LOG_LO) / _HMAP_LOG_SPAN, 0.0, 1.0
+            )
+            _db = _ht * _ht * (3.0 - 2.0 * _ht)
 
-        # Adaptive marker size matching dartsort's s=1 at wide zoom, thicker at
-        # narrow zoom so individual spikes are legible when zoomed in.
-        # dartsort uses s=1 fixed; we floor at 1 and scale up at narrow zoom.
-        #   1 ms → 10 pt²,  1 s → 4 pt²,  100 s → 1 pt²,  100 hr → 1 pt²
-        # At 120 DPI s=1 ≈ 1.7 px diam — dense periods visibly fuller than sparse.
-        _s = float(max(1.0, 4.0 - 2.0 * np.log10(max(width, 1e-2))))
+        # ── Single pixel-buffer path (all zoom levels) ────────────────────────
+        im, buf, iw, ih = _ensure_pxim()
+        im.set_visible(True)
+        buf[:] = 1.0   # reset to RGBA white
 
-        x, y, c = frame_points(per_unit, lo, hi, _scatter_cap)
+        if raster_mode == "charlie":
+            # ── charlie raster (dartsort scatter_time_vs_depth aesthetic) ────
+            # Three independent log-width visual schedules:
+            #   tick half-height — 5 px at ≤ 1 ms → 1 px by 1 min (striations at short zoom)
+            #   Gaussian y-jitter — 0 until 30 s, grows to _CH_JITTER_MAX px at 10 hr
+            #   alpha             — constant 0.9
+            #
+            # Random priority subsampling (dartsort style): each spike has a
+            # precomputed random priority.  We keep the max_spikes highest-priority
+            # spikes in the visible window via argpartition (O(N), no sort needed).
+            # Bursts → more spikes → more high-priority candidates → burst columns
+            # remain visible as vertical striations at all zoom levels.
+            # After subsampling, spikes are sorted by amplitude so that high-amp
+            # units are drawn last (on top), matching the dartsort look.
+            _ch_lw = np.log10(max(width, 1e-3))
+            _ch_wn_tick   = float(np.clip(
+                _ch_lw / _CH_LOG_TICK_HI, 0.0, 1.0))
+            _ch_wn_jitter = float(np.clip(
+                (_ch_lw - _CH_LOG_JITTER_LO)
+                / (_CH_LOG_JITTER_HI - _CH_LOG_JITTER_LO), 0.0, 1.0))
+            _ch_half   = max(0, round(5.0 * (1.0 - _ch_wn_tick)))
+            _ch_half_x = 1 if width < 3.0 else 0
+            _ch_sigma  = _CH_JITTER_MAX * _ch_wn_jitter
 
-        if width >= _PX_S:
-            # ── Fast path: numpy pixel writes (bypasses Agg circle renderer) ──
-            # Cuts per-frame render from ~1.9 s (scatter "o") to ~5 ms.
-            im, buf, iw, ih = _ensure_pxim()
-            if not _use_pxim[0]:
-                # Transition scatter → imshow: hide scatter, show pixel image.
-                scat.set_offsets(np.empty((0, 2)))   # free memory
-                scat.set_visible(False)
-                im.set_visible(True)
-                _use_pxim[0] = True
-            buf[:] = 1.0   # reset to RGBA white (fast memset)
-            if len(x):
-                px_x = np.clip(
-                    ((x - lo) / (hi - lo) * iw).astype(np.int32), 0, iw - 1)
-                px_y = np.clip(
-                    ((y - _d_lo_px) / _d_full * ih).astype(np.int32), 0, ih - 1)
-                buf[px_y, px_x, :3] = colors[c, :3]
-                buf[px_y, px_x,  3] = 1.0
-            im.set_data(buf)
-            im.set_extent([lo, hi, _d_lo_px, _d_lo_px + _d_full])
+            # Collect spikes for all units in the visible window.
+            # Per-unit density mode also computes each unit's own local density
+            # scale here, before concatenation, so quiet units are unaffected by
+            # other units' bursts.
+            _n_db = 200   # x-bins for density estimation
+            _tvp, _dvp, _avp, _cvp, _pvp, _jvp, _dsp = [], [], [], [], [], [], []
+            for _ipu, _pu in enumerate(per_unit):
+                _ai = int(np.searchsorted(_pu["times"], lo, "left"))
+                _bi = int(np.searchsorted(_pu["times"], hi, "right"))
+                _m  = _bi - _ai
+                if _m == 0:
+                    continue
+                _sl = slice(_ai, _bi)
+                _t_pu = _pu["times"][_sl]
+                _tvp.append(_t_pu)
+                _dvp.append(_pu["spike_depths"][_sl])
+                _avp.append(_ch_pu_amps[_ipu][_sl])
+                _cvp.append(np.full(_m, _pu["cidx"], dtype=np.int32))
+                _pvp.append(_ch_pu_priority[_ipu][_sl])
+                _jvp.append(_ch_pu_jitter[_ipu][_sl])
+                if charlie_jitter_density == "per-unit" and _ch_sigma > 0.0:
+                    # Density scale from this unit's own spikes only.
+                    _xb_pu   = np.clip(
+                        ((_t_pu - lo) / (hi - lo) * _n_db).astype(np.int32),
+                        0, _n_db - 1)
+                    _bc_pu   = np.bincount(_xb_pu, minlength=_n_db).astype("float32")
+                    _mbc_pu  = max(_bc_pu.max(), 1.0)
+                    _dsp.append(_bc_pu[_xb_pu] / _mbc_pu)
+                else:
+                    _dsp.append(None)   # filled after global density computed
+
+            if _tvp:
+                _tv = np.concatenate(_tvp)
+                _dv = np.concatenate(_dvp).astype("float32")
+                _av = np.concatenate(_avp)
+                _cv = np.concatenate(_cvp)
+                _pv = np.concatenate(_pvp)
+                _jv = np.concatenate(_jvp)
+                # Build density-scale array (_ds) aligned with the full spike list.
+                # "none" mode skips density entirely — _ds stays None and jitter
+                # is applied as plain _jv * _ch_sigma (uniform, not adaptive).
+                if _ch_sigma > 0.0 and charlie_jitter_density != "none":
+                    if charlie_jitter_density == "per-unit":
+                        _ds = np.concatenate(_dsp)
+                    else:
+                        # Global: bin all spikes together.
+                        _xb_gl  = np.clip(
+                            ((_tv - lo) / (hi - lo) * _n_db).astype(np.int32),
+                            0, _n_db - 1)
+                        _bc_gl  = np.bincount(_xb_gl, minlength=_n_db).astype("float32")
+                        _ds     = _bc_gl[_xb_gl] / max(_bc_gl.max(), 1.0)
+                else:
+                    _ds = None
+                # Priority subsample if actual count exceeds cap.
+                if len(_tv) > charlie_max_spikes:
+                    _keep = np.argpartition(_pv, -charlie_max_spikes)[
+                        -charlie_max_spikes:
+                    ]
+                    _tv = _tv[_keep]; _dv = _dv[_keep]; _av = _av[_keep]
+                    _cv = _cv[_keep]; _jv = _jv[_keep]
+                    if _ds is not None:
+                        _ds = _ds[_keep]
+                # Amplitude sort: high → low so high-amp units claim pixels first
+                # under paint-on-white-only rendering (first writer wins).
+                _ao = np.argsort(_av, kind="stable")[::-1]
+                _tv, _dv, _cv, _jv = _tv[_ao], _dv[_ao], _cv[_ao], _jv[_ao]
+                if _ds is not None:
+                    _ds = _ds[_ao]
+                _px_x = np.clip(
+                    ((_tv - lo) / (hi - lo) * iw).astype(np.int32), 0, iw - 1)
+                _px_y = ((_dv - _d_lo_px) / _d_full * ih).astype(np.int32)
+                if _ch_sigma > 0.0:
+                    if charlie_jitter_density == "none":
+                        # Uniform jitter: every spike gets the full sigma scale.
+                        _px_y = _px_y + (_jv * _ch_sigma).astype(np.int32)
+                    elif _ds is not None:
+                        # Adaptive jitter: scale by per-unit or global density.
+                        _px_y = _px_y + (_jv * _ds * _ch_sigma).astype(np.int32)
+                _px_y = np.clip(_px_y, 0, ih - 1)
+                for _dy in range(-_ch_half, _ch_half + 1):
+                    _py = np.clip(_px_y + _dy, 0, ih - 1)
+                    for _dx in range(-_ch_half_x, _ch_half_x + 1):
+                        _ppx = np.clip(_px_x + _dx, 0, iw - 1)
+                        # Paint-on-white-only: skip pixels already claimed by
+                        # another spike so each pixel shows exactly one unit's
+                        # colour — no overwrite blending, sharper striation edges.
+                        _wh = buf[_py, _ppx, 3] == 1.0
+                        if _wh.any():
+                            buf[_py[_wh], _ppx[_wh], :3] = _ch_colors[_cv[_wh]]
+                            buf[_py[_wh], _ppx[_wh],  3] = 0.9
+
         else:
-            # ── Narrow zoom: scatter with adaptive circle markers ─────────────
-            # Thick circles (s > 1) keep individual spikes legible at ms zoom.
-            if _use_pxim[0]:
-                _pxim_state[0][0].set_visible(False)
-                scat.set_visible(True)
-                _use_pxim[0] = False
-            if len(x):
-                scat.set_offsets(np.column_stack([x, y]))
-                scat.set_facecolor(colors[c])
-                scat.set_sizes(np.full(len(x), _s))
+            # ── hybrid raster ─────────────────────────────────────────────────
+            # Tick height: fill each unit's full allocated pixel band, with a
+            # generous minimum so ticks look like vertical dashes, not squares.
+            # _ppu is the per-unit pixel budget; floor at 5 → 11 px minimum height.
+            # K-subsampling (3 % fill) keeps adjacent-unit bleed invisible because
+            # 97 % of x-columns are empty even when ticks span multiple unit rows.
+            _ppu  = max(1, ih // max(1, n_units))
+            _half = max(5, _ppu // 2)
+
+            # Tick width (x-spread): 3 px at narrow zoom for visibility, 1 px at
+            # ≥ 3 s so the ticks stay thin and don't smear into bands.
+            if width < 3.0:
+                _half_x = 1      # 3 px wide  (< 3 s)
             else:
-                scat.set_offsets(np.empty((0, 2)))
+                _half_x = 0      # 1 px wide  (≥ 3 s)
+
+            # K ticks per unit: smoothly interpolated from 3 % at ≤ 30 s to 1 % at
+            # ≥ 60 s (1 min) in log-width space so the density of ticks tapers
+            # gradually rather than jumping at any single frame.
+            _k_norm = np.clip(
+                (np.log10(max(width, 1e-3)) - np.log10(30.0))
+                / (np.log10(60.0) - np.log10(30.0)),
+                0.0, 1.0,
+            )
+            _k_frac = 0.03 * (1.0 - _k_norm) + 0.01 * _k_norm   # 3 % → 1 %
+            _k_px = max(5, int(iw * _k_frac))
+
+            # Layer 1 — per-unit coloured density background ──────────────────
+            # Each unit's pixel row is tinted white → unit colour proportional
+            # to its local firing-rate density × _db.  Invisible at narrow zoom;
+            # fully coloured at wide zoom.  Uses the precomputed _unit_dens
+            # (n_units × _UNIT_HMAP_T) mapped to display x-columns.
+            if _db > 0.0:
+                _unit_py = np.clip(
+                    ((_unit_depths - _d_lo_px) / _d_full * ih).astype(np.int32),
+                    0, ih - 1,
+                )
+                _t_cx = lo + (np.arange(iw, dtype="float32") + 0.5) / iw * (hi - lo)
+                _t_bi = np.clip(
+                    ((_t_cx - t_lo) / (t_hi - t_lo) * _UNIT_HMAP_T).astype(np.int32),
+                    0, _UNIT_HMAP_T - 1,
+                )
+                # _dm: (n_units, iw) density × blend per column
+                _dm = _unit_dens[:, _t_bi] * _db
+                # _bg: (n_units, iw, 3) — lerp white→unit colour
+                _bg = 1.0 - _dm[:, :, np.newaxis] * (
+                    1.0 - colors[:n_units, :3][:, np.newaxis, :])
+                for _dy in range(-_half, _half + 1):
+                    _pys = np.clip(_unit_py + _dy, 0, ih - 1)
+                    buf[_pys, :, :3] = _bg
+                    buf[_pys, :, 3]  = 1.0
+
+            # Layer 2 — fixed-K tick marks, cross-fading with density layer ───
+            # _tick_vis is the square of the complement of _db so ticks fade out
+            # quickly once the density layer begins to show (rather than lingering
+            # at half-strength through the whole 1-min → 1-hr transition).
+            #   _db=0   (≤1 min)  → _tick_vis=1.0  full ticks, no density
+            #   _db=0.5 (~6 min)  → _tick_vis=0.25  mostly gone
+            #   _db=1.0 (≥1 hr)   → _tick_vis=0.0  invisible
+            _tick_vis = (1.0 - _db) ** 2
+            if _tick_vis > 0.0:
+                x, y, c = frame_points_fixed_k(per_unit, lo, hi, _k_px)
+                if len(x):
+                    px_x = np.clip(
+                        ((x - lo) / (hi - lo) * iw).astype(np.int32), 0, iw - 1)
+                    px_y = np.clip(
+                        ((y - _d_lo_px) / _d_full * ih).astype(np.int32), 0, ih - 1)
+                    _combo = px_x.astype(np.int64) * n_units + c
+                    _, _first = np.unique(_combo, return_index=True)
+                    _ux, _uy, _uc = px_x[_first], px_y[_first], c[_first]
+                    _tc = colors[_uc, :3]          # (n_ticks, 3) full unit colour
+                    for _dy in range(-_half, _half + 1):
+                        _py = np.clip(_uy + _dy, 0, ih - 1)
+                        for _dx in range(-_half_x, _half_x + 1):
+                            _px = np.clip(_ux + _dx, 0, iw - 1)
+                            # Blend: full tick colour at narrow zoom; fades to
+                            # density background colour as wide zoom approaches.
+                            buf[_py, _px, :3] = (
+                                _tick_vis * _tc
+                                + (1.0 - _tick_vis) * buf[_py, _px, :3]
+                            )
+                            buf[_py, _px, 3] = 1.0
+
+        im.set_data(buf)
+        im.set_extent([lo, hi, _d_lo_px, _d_lo_px + _d_full])
 
         ax_raster.set_xlim(lo, hi)   # propagates to ax_scale, ax_rate, ax_tod via sharex
-        # Scale bar on the dedicated strip.
-        dur, label = pick_scale_bar(width)
-        x0 = lo + 0.05 * width
-        bar_line.set_data([x0, x0 + dur], [0.35, 0.35])
-        bar_text.set_position((x0 + dur / 2.0, 0.70))
+        # Scale bar on the dedicated strip — centred in the window so the text
+        # stays stationary (in center-zoom mode x_mid = center_s = constant).
+        dur, label = pick_scale_bar(width / 2.0)   # cap bar at ½ x-axis length
+        x_mid = (lo + hi) / 2.0
+        bar_line.set_data([x_mid - dur / 2.0, x_mid + dur / 2.0], [_bar_y, _bar_y])
+        bar_text.set_position((x_mid, _bar_ty))
         bar_text.set_text(label)
         # Dynamic x-axis tick labels on the bottom (ax_tod) panel.
         scale, uname = x_axis_unit(width, _unit_thresholds)
@@ -754,63 +1414,77 @@ def make_animation(
         n_t = max(0, int(np.floor((hi - first) / step)) + 1)
         ticks = first + np.arange(n_t) * step
         ticks = ticks[(ticks >= lo - step * 1e-6) & (ticks <= hi + step * 1e-6)]
-        ax_tod.set_xticks(ticks)
-        ax_tod.set_xticklabels([f"{(tk - _tick_ref) / scale:g}" for tk in ticks])
-        if uname != _last_uname[0]:
-            ax_tod.set_xlabel(f"time ({uname})", fontsize=9)
-            _last_uname[0] = uname
-        # Adaptive-resolution population rate.
-        # Wide zoom (>= _RATE_SWITCH_S): slice the pre-computed 10 s bins and apply
-        # Gaussian smoothing scaled to the number of visible bins (so circadian patterns
-        # emerge naturally as the window grows to 100 hrs).
-        # Narrow zoom (< _RATE_SWITCH_S): histogram spikes from raw per-unit data so
-        # individual firing events are visible down to the 1 ms window.
-        if width >= _RATE_SWITCH_S:
-            _iv0 = max(0, int(np.searchsorted(_rate_t_fine, lo)) - 1)
-            _iv1 = min(len(_rate_t_fine), int(np.searchsorted(_rate_t_fine, hi)) + 1)
-            if _iv1 - _iv0 >= 2:
-                _rt = _rate_t_fine[_iv0:_iv1]
-                _rv = _rate_n_fine[_iv0:_iv1]
-                _sigma_b = max(0.5, (_iv1 - _iv0) / 25.0)
-                _rn = _gaussian_smooth(_rv, _sigma_b)
-            else:
-                _rt, _rn = np.array([lo, hi]), np.zeros(2)
+        # Always include the reference point (center_s in center mode, anchor_s
+        # otherwise) so that "0" is permanently visible in the tick labels.
+        # Remove any regular tick within 60 % of a step of _tick_ref first so
+        # the "0" label never crowds an adjacent label.
+        if lo <= _tick_ref <= hi:
+            mask = np.abs(ticks - _tick_ref) >= step * 0.6
+            ticks = np.sort(np.concatenate([ticks[mask], [_tick_ref]]))
+        # ToD panel: at full span show "0 hr" / "1332 hr" endpoints; otherwise blank.
+        _at_full_span = (hi - lo) >= window_end_s * 0.99
+        if _at_full_span:
+            ax_tod.set_xticks([0.0, window_end_s])
+            ax_tod.set_xticklabels(["0 hr", "1332 hours\n56 days"], fontsize=7)
+            ax_tod.tick_params(bottom=True, labelbottom=True, length=3, pad=2)
+            for _lbl in ax_tod.get_xticklabels():
+                _lbl.set_clip_on(False)   # let "56 days" extend below the axes edge
         else:
-            _bw = max(width / 200.0, 1e-4)   # aim for ~200 bins; floor at 0.1 ms
-            _n_bins = max(1, int(np.ceil(width / _bw)))
-            _bins_r = np.linspace(lo, hi, _n_bins + 1)
-            _cnt = np.zeros(_n_bins, dtype="float64")
-            for _pu in per_unit:
-                _i0 = int(np.searchsorted(_pu["times"], lo))
-                _i1 = int(np.searchsorted(_pu["times"], hi))
-                if _i1 > _i0:
-                    _c, _ = np.histogram(_pu["times"][_i0:_i1], bins=_bins_r)
-                    _cnt += _c.astype("float64")
-            _sigma_b = max(0.5, _n_bins / 20.0)
-            _cnt_sm  = _gaussian_smooth(_cnt, _sigma_b)
-            _rt = 0.5 * (_bins_r[:-1] + _bins_r[1:])
-            # Normalise to the same [0, 1] scale as the pre-computed fine rate:
-            # peak rate = _rate_peak counts / _FINE_BIN_S seconds;
-            # on-the-fly rate density = cnt_sm / _bw counts/s.
-            _rn = np.clip(_cnt_sm * _FINE_BIN_S / (_bw * _rate_peak), 0.0, 1.3)
-        if len(_rt) >= 2:
-            _fx = np.concatenate([[_rt[0]], _rt, [_rt[-1]]])
-            _fy = np.concatenate([[0.0], _rn, [0.0]])
-            rate_fill.set_xy(np.column_stack([_fx, _fy]))
-        # PST crossing labels: only show when the crossing is within the current window.
-        for _t_cross, _tx, _vl in _crossings:
-            _vis = lo <= _t_cross <= hi
-            _tx.set_visible(_vis)
-            _vl.set_visible(_vis)
+            ax_tod.set_xticks([])
+            ax_tod.tick_params(bottom=False, labelbottom=False)
+        # Adaptive-resolution population rate (only when show_rate is True).
+        if show_rate and rate_fill is not None:
+            # Wide zoom (>= _RATE_SWITCH_S): pre-computed 10 s bins with adaptive
+            # Gaussian smoothing.  Narrow zoom: histogram from raw per-unit data.
+            if width >= _RATE_SWITCH_S:
+                _iv0 = max(0, int(np.searchsorted(_rate_t_fine, lo)) - 1)
+                _iv1 = min(len(_rate_t_fine), int(np.searchsorted(_rate_t_fine, hi)) + 1)
+                if _iv1 - _iv0 >= 2:
+                    _rt = _rate_t_fine[_iv0:_iv1]
+                    _rv = _rate_n_fine[_iv0:_iv1]
+                    _sigma_b = max(0.5, (_iv1 - _iv0) / 25.0)
+                    _rn = _gaussian_smooth(_rv, _sigma_b)
+                else:
+                    _rt, _rn = np.array([lo, hi]), np.zeros(2)
+            else:
+                _bw = max(width / 200.0, 1e-4)
+                _n_bins = max(1, int(np.ceil(width / _bw)))
+                _bins_r = np.linspace(lo, hi, _n_bins + 1)
+                _cnt = np.zeros(_n_bins, dtype="float64")
+                for _pu in per_unit:
+                    _i0 = int(np.searchsorted(_pu["times"], lo))
+                    _i1 = int(np.searchsorted(_pu["times"], hi))
+                    if _i1 > _i0:
+                        _c, _ = np.histogram(_pu["times"][_i0:_i1], bins=_bins_r)
+                        _cnt += _c.astype("float64")
+                _sigma_b = max(0.5, _n_bins / 20.0)
+                _cnt_sm  = _gaussian_smooth(_cnt, _sigma_b)
+                _rt = 0.5 * (_bins_r[:-1] + _bins_r[1:])
+                _rn = np.clip(_cnt_sm * _FINE_BIN_S / (_bw * _rate_peak), 0.0, 1.3)
+            if len(_rt) >= 2:
+                _fx = np.concatenate([[_rt[0]], _rt, [_rt[-1]]])
+                _fy = np.concatenate([[0.0], _rn, [0.0]])
+                rate_fill.set_xy(np.column_stack([_fx, _fy]))
 
     def update(frame):
         width = widths[frame] if frame < n_zoom else window_end_s
         if zoom_mode == "center":
             lo, hi = _window_bounds(center_s, width, t_lo, t_hi)
+        elif zoom_mode == "center-right":
+            # Centred zoom until the left edge reaches t_lo, then expands right
+            # up to window_end_s (which may extend well beyond the data end).
+            lo, hi = _window_bounds_center_right(
+                center_s, width, t_lo, window_end_s)
         else:
             lo, hi = _window_bounds_left(anchor_s, width, t_lo, t_hi)
         draw(lo, hi)
-        return scat, bar_line, bar_text, rate_fill
+        im, *_ = _pxim_state[0] or (None,)
+        _artists = [bar_line, bar_text]
+        if rate_fill is not None:
+            _artists.append(rate_fill)
+        if im is not None:
+            _artists.insert(0, im)
+        return tuple(_artists)
 
     total = n_zoom + n_hold
     anim = animation.FuncAnimation(
