@@ -6,6 +6,7 @@ from pirouette_data import (
     ingestion,
     kinematics,
     processing,
+    qc,
     vis,
     visualization_gui,
 )

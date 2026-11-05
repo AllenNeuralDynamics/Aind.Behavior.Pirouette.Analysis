@@ -29,10 +29,12 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from dotenv import load_dotenv
 from matplotlib.colors import ListedColormap
 from matplotlib.patches import Patch
 
@@ -48,16 +50,19 @@ from pirouette_data.visualization_gui import (
     load_units,
 )
 
+load_dotenv()  # defaults below come from .env (CLI flags override)
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATASET = Path(
+DATASET = Path(os.getenv("UNIT_ACTIVITY_DATASET") or (
     r"C:\Users\brandon.pratt\Desktop\data\body-kinematics\datasets"
     r"\854393_2026-06-09_19-34-26_pirouette_dataset_36hr.parquet"
-)
-UNITS = Path(
+))
+UNITS = Path(os.getenv("EPHYS_DATASET") or (
     r"C:\Users\brandon.pratt\Desktop\data\body-kinematics\units"
     r"\good_units_100hrs_v2.pkl"
-)
-SPIKE_OFFSET_S = 111600.0
+))
+SPIKE_OFFSET_S = float(os.getenv("SPIKE_OFFSET_S") or 111600.0)
+PLOT_BIN_S = float(os.getenv("UNIT_ACTIVITY_PLOT_BIN_S") or 10.0)
+FIGURES_DIR = Path(os.getenv("FIGURES_DIR") or REPO_ROOT / "figures")
 FR_BIN_S = 0.05
 FR_SMOOTH_S = 0.2
 
@@ -269,13 +274,13 @@ def main() -> None:
     p.add_argument("--rate-only", action="store_true",
                    help="Plot only the firing rate (+ time-of-day strip) over the "
                         "full spike range instead of behaviour/velocity/rate.")
-    p.add_argument("--plot-bin-s", type=float, default=10.0,
+    p.add_argument("--plot-bin-s", type=float, default=PLOT_BIN_S,
                    help="Averaging bin for plotting (seconds).")
     p.add_argument("--rate-ylim", type=float, nargs=2, default=None,
                    metavar=("LO", "HI"),
                    help="Restrict the firing-rate y-axis to this range in Hz "
                         "(e.g. --rate-ylim 2.5 5.5). Default: auto, 0 to max.")
-    p.add_argument("--save-dir", type=Path, default=REPO_ROOT / "figures")
+    p.add_argument("--save-dir", type=Path, default=FIGURES_DIR)
     p.add_argument("--no-show", action="store_true")
     args = p.parse_args()
 
