@@ -78,8 +78,8 @@ def plot_num_clusters(runs: dict[str, pd.DataFrame], **kwargs) -> plt.Figure:
 
 
 def plot_find_templates_time(runs: dict[str, pd.DataFrame], **kwargs) -> plt.Figure:
-    """Find-templates capsule run duration (h) vs subsampling time."""
-    runs_h = {k: df.assign(find_templates_h=df["find_templates_s"] / 3600.0)
-              for k, df in runs.items()}
+    """Find-templates capsule run duration (min) vs subsampling time."""
+    runs_min = {k: df.assign(find_templates_min=df["find_templates_s"] / 60.0)
+                for k, df in runs.items()}
     return plot_metric_vs_subsampling(
-        runs_h, "find_templates_h", "find template run duration (h)", **kwargs)
+        runs_min, "find_templates_min", "find template run duration (min)", **kwargs)

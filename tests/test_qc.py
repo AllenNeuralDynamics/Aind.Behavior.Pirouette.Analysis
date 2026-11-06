@@ -110,4 +110,4 @@ def test_find_templates_plot_ylabel(root):
     with pytest.warns(UserWarning):
         runs = load_runs(root)
     fig = plot_find_templates_time(runs)
-    assert fig.axes[0].get_ylabel() == "find template run duration (h)"
+    assert fig.axes[0].get_ylabel() == "find template run duration (min)"
