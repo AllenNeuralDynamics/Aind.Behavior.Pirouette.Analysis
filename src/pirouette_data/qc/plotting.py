@@ -77,7 +77,7 @@ def plot_num_clusters(runs: dict[str, pd.DataFrame], **kwargs) -> plt.Figure:
         runs, "num_units", "Number of clusters (#)", **kwargs)
 
 
-def plot_run_time(runs: dict[str, pd.DataFrame], **kwargs) -> plt.Figure:
-    """Total run time (``fit_time_min``) vs subsampling time."""
+def plot_find_templates_time(runs: dict[str, pd.DataFrame], **kwargs) -> plt.Figure:
+    """Find-templates capsule run duration (s) vs subsampling time."""
     return plot_metric_vs_subsampling(
-        runs, "fit_time_min", "Run time (min)", **kwargs)
+        runs, "find_templates_s", "find templates run durations (s)", **kwargs)

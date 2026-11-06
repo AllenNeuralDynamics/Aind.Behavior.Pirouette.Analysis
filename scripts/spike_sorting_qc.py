@@ -5,7 +5,7 @@ draws two figures, with all datasets overlaid and the legend keyed by the folder
 name (underscores removed):
 
 1. number of clusters vs subsampling time,
-2. run time vs subsampling time.
+2. find templates capsule run duration (s) vs subsampling time.
 
 The x axis is log2 (subsampling times double each step); pass ``--linear-x`` for
 a linear axis.
@@ -25,7 +25,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 
-from pirouette_data.qc import load_runs, plot_num_clusters, plot_run_time
+from pirouette_data.qc import load_runs, plot_num_clusters, plot_find_templates_time
 
 load_dotenv()  # defaults below come from .env (CLI flags override)
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -58,7 +58,7 @@ def main() -> None:
     log_x = not args.linear_x
     figs = {
         "spike_sorting_qc_num_clusters": plot_num_clusters(runs, log_x=log_x),
-        "spike_sorting_qc_run_time": plot_run_time(runs, log_x=log_x),
+        "spike_sorting_qc_find_templates_time": plot_find_templates_time(runs, log_x=log_x),
     }
     args.save_dir.mkdir(parents=True, exist_ok=True)
     for name, fig in figs.items():
