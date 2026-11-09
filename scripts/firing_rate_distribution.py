@@ -17,18 +17,22 @@ Usage
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from dotenv import load_dotenv
 
 from pirouette_data.visualization_gui import load_units
 
+load_dotenv()  # defaults below come from .env (CLI flags override)
 REPO_ROOT = Path(__file__).resolve().parent.parent
-UNITS = Path(
+UNITS = Path(os.getenv("EPHYS_DATASET") or (
     r"C:\Users\brandon.pratt\Desktop\data\body-kinematics\units"
     r"\good_units_100hrs_v2.pkl"
-)
+))
+FIGURES_DIR = Path(os.getenv("FIGURES_DIR") or REPO_ROOT / "figures")
 
 # Figure style (matches the other plots): Arial, thick offset spines.
 LABEL_FS = 22
@@ -86,7 +90,7 @@ def main() -> None:
     p.add_argument("--bins", type=int, default=30)
     p.add_argument("--linear", action="store_true",
                    help="Linear bins and x axis instead of log.")
-    p.add_argument("--save-dir", type=Path, default=REPO_ROOT / "figures")
+    p.add_argument("--save-dir", type=Path, default=FIGURES_DIR)
     p.add_argument("--no-show", action="store_true")
     args = p.parse_args()
 
