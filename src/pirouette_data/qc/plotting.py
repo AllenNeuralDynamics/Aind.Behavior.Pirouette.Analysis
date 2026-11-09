@@ -15,6 +15,22 @@ SPINE_LW = 2.5
 SPINE_OFFSET = 10  # points
 
 
+MARKERS = ("o", "s", "^", "D", "v", "P", "X", "*")
+
+
+def _style_for(i: int, n: int) -> tuple:
+    """(color, marker) for line *i* of *n*: distinct colors, then distinct markers.
+
+    Uses tab10 up to 10 runs, then the 20-color tab20 set (saturated colors
+    first); beyond 20 runs the marker shape also changes so no pair repeats.
+    """
+    if n <= 10:
+        return plt.get_cmap("tab10")(i), "o"
+    tab20 = plt.get_cmap("tab20")
+    order = list(range(0, 20, 2)) + list(range(1, 20, 2))
+    return tab20(order[i % 20]), MARKERS[(i // 20) % len(MARKERS)]
+
+
 def apply_qc_style() -> None:
     """Set the Arial / editable-PDF-text rcParams."""
     plt.rcParams.update({
@@ -29,7 +45,7 @@ def plot_metric_vs_subsampling(
     y_col: str,
     ylabel: str,
     log_x: bool = True,
-    figsize: tuple[float, float] = (9, 7),
+    figsize: tuple[float, float] = (12, 7),
 ) -> plt.Figure:
     """One line per dataset: *y_col* against ``subsampling_minutes``.
 
@@ -45,10 +61,11 @@ def plot_metric_vs_subsampling(
     """
     apply_qc_style()
     fig, ax = plt.subplots(figsize=figsize)
-    cmap = plt.get_cmap("tab10")
+    n = len(runs)
     for i, (label, df) in enumerate(runs.items()):
-        ax.plot(df["subsampling_minutes"], df[y_col], marker="o", markersize=8,
-                linewidth=2.5, color=cmap(i % 10), label=label)
+        color, marker = _style_for(i, n)
+        ax.plot(df["subsampling_minutes"], df[y_col], marker=marker, markersize=8,
+                linewidth=2.5, color=color, label=label)
 
     if log_x:
         ticks = np.unique(np.concatenate(
@@ -66,7 +83,9 @@ def plot_metric_vs_subsampling(
         ax.spines[side].set_linewidth(SPINE_LW)
         ax.spines[side].set_position(("outward", SPINE_OFFSET))
     ax.tick_params(width=SPINE_LW, length=7, labelsize=TICK_FS)
-    ax.legend(frameon=False, fontsize=LEGEND_FS, loc="best")
+    # Legend outside the axes (right) so it never covers the data.
+    ax.legend(frameon=False, fontsize=LEGEND_FS, loc="center left",
+              bbox_to_anchor=(1.02, 0.5), borderaxespad=0)
     fig.tight_layout()
     return fig
 

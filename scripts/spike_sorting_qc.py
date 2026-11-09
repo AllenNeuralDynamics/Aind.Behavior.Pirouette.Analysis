@@ -64,7 +64,7 @@ def main() -> None:
     for name, fig in figs.items():
         for ext in ("png", "pdf"):
             out = (args.save_dir / f"{name}.{ext}").resolve()
-            fig.savefig(out, dpi=200)
+            fig.savefig(out, dpi=200, bbox_inches="tight")
             print(f"Saved {out}")
     if not args.no_show:
         plt.show()
