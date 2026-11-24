@@ -23,6 +23,9 @@ heading is interpolated onto the camera timestamps with
 from __future__ import annotations
 
 import io
+import re
+from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -892,3 +895,398 @@ def append_commutator_heading(
     out = df.copy()
     out[column] = interpolator(out["harp_time"].to_numpy())
     return out
+
+
+# ---------------------------------------------------------------------------
+# Head-mounted BNO055 acceleration
+# ---------------------------------------------------------------------------
+#: CSV filename prefix of the hourly BNO055 IMU files (``OnixBNO055Data_<ts>.csv``).
+BNO_FILE_PREFIX = "OnixBNO055Data"
+
+#: Unit of the BNO055 acceleration columns. The sensor's ``UNIT_SEL`` register
+#: defaults to m/s^2 (alternative: mg); recorded values here (rest magnitude
+#: ~0.2, gravity reported separately) are consistent with the m/s^2 default.
+ACCEL_UNIT = "m/s$^2$"
+
+#: Column positions of ``Seconds`` and ``Value.Acceleration.{X,Y,Z}`` in the BNO csv.
+#: Selected by position because the trailing ``Value.Calibration`` flag enum is
+#: written unquoted with a variable number of comma-separated entries, so rows have
+#: a ragged length and the named columns after it cannot be parsed by header.
+_BNO_SECONDS_IDX = 0
+_BNO_ACCEL_IDX = (9, 10, 11)
+_BNO_MAX_FIELDS = 26  # >= the longest row (header has 19 fields, rows up to ~22)
+
+_BNO_FILE_RE = re.compile(
+    rf"{BNO_FILE_PREFIX}_(\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}-\d{{2}}-\d{{2}})\.csv$"
+)
+
+#: Acceleration channels: the 3D magnitude (collapsed to 1D) followed by the axes.
+ACCEL_CHANNELS = ("magnitude", "x", "y", "z")
+
+SECONDS_PER_HOUR = 3600.0
+
+
+def _bno_chunk_time(name: str) -> datetime | None:
+    """Parse the hour-chunk timestamp from a BNO csv filename (``None`` if no match)."""
+    match = _BNO_FILE_RE.search(name)
+    if match is None:
+        return None
+    return datetime.strptime(match.group(1), "%Y-%m-%dT%H-%M-%S")
+
+
+def list_bno_chunks(
+    dataset_path: str | Path,
+    s3_client: "S3Client | None" = None,
+) -> list[tuple[str, datetime]]:
+    """List the hourly BNO055 csv files in a dataset directory, in time order.
+
+    Parameters
+    ----------
+    dataset_path:
+        Directory (or ``s3://bucket/prefix`` URI) containing the
+        ``OnixBNO055Data_<timestamp>.csv`` files.
+    s3_client:
+        Optional pre-built S3 client (only used for ``s3://`` paths). Defaults to an
+        anonymous client from :func:`pirouette_data.ingestion.get_s3_client`.
+
+    Returns
+    -------
+    list[tuple[str, datetime]]
+        ``(source, chunk_start)`` pairs sorted by ``chunk_start``, where *source*
+        is a local path or a full ``s3://`` URI and *chunk_start* is the hour
+        timestamp encoded in the filename.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no BNO055 csv files are found.
+    """
+    dataset_path = str(dataset_path)
+    found: list[tuple[str, datetime]] = []
+    if dataset_path.startswith("s3://"):
+        bucket, prefix = _parse_s3_uri(dataset_path)
+        client = s3_client if s3_client is not None else get_s3_client()
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=bucket, Prefix=f"{prefix}/{BNO_FILE_PREFIX}_" if prefix else f"{BNO_FILE_PREFIX}_"
+        ):
+            for obj in page.get("Contents", []):
+                stamp = _bno_chunk_time(obj["Key"])
+                if stamp is not None:
+                    found.append((f"s3://{bucket}/{obj['Key']}", stamp))
+    else:
+        for path in Path(dataset_path).glob(f"{BNO_FILE_PREFIX}_*.csv"):
+            stamp = _bno_chunk_time(path.name)
+            if stamp is not None:
+                found.append((str(path), stamp))
+
+    if not found:
+        raise FileNotFoundError(f"No {BNO_FILE_PREFIX}_*.csv files found in {dataset_path!r}")
+    return sorted(found, key=lambda item: item[1])
+
+
+def _read_bno_bytes(
+    source: str,
+    s3_client: "S3Client | None" = None,
+    max_bytes: int | None = None,
+) -> bytes:
+    """Read a BNO csv (optionally only its first *max_bytes*) from disk or S3."""
+    if source.startswith("s3://"):
+        bucket, key = _parse_s3_uri(source)
+        client = s3_client if s3_client is not None else get_s3_client()
+        kwargs = {"Range": f"bytes=0-{max_bytes - 1}"} if max_bytes else {}
+        return client.get_object(Bucket=bucket, Key=key, **kwargs)["Body"].read()
+    with open(source, "rb") as handle:
+        return handle.read(max_bytes) if max_bytes else handle.read()
+
+
+def read_bno_acceleration(
+    source: str | Path,
+    s3_client: "S3Client | None" = None,
+) -> pd.DataFrame:
+    """Load Harp time and X/Y/Z acceleration from one BNO055 csv.
+
+    Parameters
+    ----------
+    source:
+        Local path or ``s3://`` URI of one ``OnixBNO055Data_<timestamp>.csv``.
+    s3_client:
+        Optional pre-built S3 client (only used for ``s3://`` sources).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Columns ``seconds`` (Harp time, float64), ``x``, ``y``, ``z``
+        (acceleration as recorded by the sensor, m/s^2 by default - see
+        :data:`ACCEL_UNIT`). Rows with unparsable values are dropped.
+    """
+    return parse_bno_acceleration(_read_bno_bytes(str(source), s3_client))
+
+
+def parse_bno_acceleration(raw: bytes) -> pd.DataFrame:
+    """Parse the raw bytes of one BNO055 csv (see :func:`read_bno_acceleration`)."""
+    # Pad to a fixed width so ragged rows (variable-length calibration flags) parse.
+    table = pd.read_csv(
+        io.BytesIO(raw),
+        header=None,
+        skiprows=1,
+        names=range(_BNO_MAX_FIELDS),
+        low_memory=False,
+    )
+    out = table[[_BNO_SECONDS_IDX, *_BNO_ACCEL_IDX]].apply(pd.to_numeric, errors="coerce")
+    out.columns = ["seconds", "x", "y", "z"]
+    return out.dropna().reset_index(drop=True)
+
+
+def first_bno_seconds(
+    source: str | Path,
+    s3_client: "S3Client | None" = None,
+) -> float:
+    """Harp time (seconds) of the first sample in a BNO csv, reading only its head."""
+    head = _read_bno_bytes(str(source), s3_client, max_bytes=8192).decode(errors="replace")
+    lines = head.split("\n")
+    if len(lines) < 3:  # header + one complete data line
+        raise ValueError(f"Could not find a data row at the start of {source!s}")
+    return float(lines[1].split(",")[_BNO_SECONDS_IDX])
+
+
+def acceleration_magnitude(
+    x: np.ndarray | pd.Series,
+    y: np.ndarray | pd.Series,
+    z: np.ndarray | pd.Series,
+) -> np.ndarray:
+    """Collapse 3D acceleration to 1D: ``sqrt(x**2 + y**2 + z**2)``."""
+    x, y, z = (np.asarray(v, dtype="float64") for v in (x, y, z))
+    return np.sqrt(x * x + y * y + z * z)
+
+
+def bin_acceleration_chunk(
+    acc: pd.DataFrame,
+    origin_seconds: float,
+    bin_size_s: float,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> pd.DataFrame:
+    """Accumulate per-bin sums for one chunk of acceleration samples.
+
+    Samples are cropped to ``[start_seconds, end_seconds)`` and assigned to bins of
+    width *bin_size_s* anchored at *origin_seconds*. Because the result holds sums
+    and counts rather than averages, partial results from consecutive files can be
+    combined exactly with :func:`combine_binned_acceleration`, even when a bin
+    straddles a file boundary.
+
+    Parameters
+    ----------
+    acc:
+        Output of :func:`read_bno_acceleration` (``seconds``, ``x``, ``y``, ``z``).
+    origin_seconds:
+        Harp time that defines the start of bin 0 (and ``t = 0`` h on the plot).
+    bin_size_s:
+        Bin width in seconds.
+    start_seconds, end_seconds:
+        Optional Harp-time crop bounds (end exclusive).
+
+    Returns
+    -------
+    pandas.DataFrame
+        Indexed by integer bin number, with ``count`` plus, for each channel in
+        :data:`ACCEL_CHANNELS`, ``<channel>_sum`` and ``<channel>_abs_sum``.
+    """
+    if bin_size_s <= 0:
+        raise ValueError(f"bin_size_s must be positive, got {bin_size_s}")
+
+    seconds = acc["seconds"].to_numpy()
+    keep = np.ones(len(acc), dtype=bool)
+    if start_seconds is not None:
+        keep &= seconds >= start_seconds
+    if end_seconds is not None:
+        keep &= seconds < end_seconds
+    acc = acc.loc[keep]
+
+    values = {
+        "magnitude": acceleration_magnitude(acc["x"], acc["y"], acc["z"]),
+        "x": acc["x"].to_numpy(),
+        "y": acc["y"].to_numpy(),
+        "z": acc["z"].to_numpy(),
+    }
+    bins = np.floor((acc["seconds"].to_numpy() - origin_seconds) / bin_size_s).astype("int64")
+    frame = pd.DataFrame({"bin": bins})
+    for channel in ACCEL_CHANNELS:
+        frame[f"{channel}_sum"] = values[channel]
+        frame[f"{channel}_abs_sum"] = np.abs(values[channel])
+    frame["count"] = 1
+    return frame.groupby("bin").sum()
+
+
+def combine_binned_acceleration(parts: list[pd.DataFrame]) -> pd.DataFrame:
+    """Merge per-chunk results of :func:`bin_acceleration_chunk` into one table."""
+    parts = [p for p in parts if len(p)]
+    if not parts:
+        raise ValueError("No acceleration samples fall inside the requested timespan.")
+    return pd.concat(parts).groupby(level=0).sum().sort_index()
+
+
+def finalize_binned_acceleration(
+    binned: pd.DataFrame,
+    bin_size_s: float,
+    stat: str = "abs_mean",
+) -> pd.DataFrame:
+    """Turn accumulated bin sums into a time series for plotting.
+
+    Parameters
+    ----------
+    binned:
+        Output of :func:`combine_binned_acceleration`.
+    bin_size_s:
+        Bin width in seconds (same value used for binning).
+    stat:
+        Per-bin summary of each channel. ``"abs_mean"`` (default) is the mean of
+        ``|a|``, a movement-intensity measure that does not cancel to ~0 for the
+        signed axes (identical to ``"mean"`` for the non-negative magnitude).
+        ``"mean"`` is the signed mean.
+
+    Returns
+    -------
+    pandas.DataFrame
+        ``time_h`` (bin start in hours since the origin) and one column per channel
+        in :data:`ACCEL_CHANNELS`. Bins with no samples (recording gaps) are present
+        with NaN so plots show a break instead of interpolating across the gap.
+    """
+    if stat not in {"abs_mean", "mean"}:
+        raise ValueError(f"stat must be 'abs_mean' or 'mean', got {stat!r}")
+    suffix = "abs_sum" if stat == "abs_mean" else "sum"
+
+    full = binned.reindex(np.arange(binned.index.min(), binned.index.max() + 1))
+    count = full["count"].replace(0, np.nan)
+    out = pd.DataFrame({"time_h": full.index.to_numpy() * bin_size_s / SECONDS_PER_HOUR})
+    for channel in ACCEL_CHANNELS:
+        out[channel] = (full[f"{channel}_{suffix}"] / count).to_numpy()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fast whole-dataset loading: 1 s base bins, on-disk cache, parallel read
+# ---------------------------------------------------------------------------
+#: Width (s) of the base bins every file is reduced to. Base bins are anchored to
+#: absolute Harp seconds (not the recording start), so a file's reduced result does
+#: not depend on the requested timespan or bin size and can be cached once.
+BASE_BIN_S = 1.0
+
+
+def bin_bno_bytes(raw: bytes) -> pd.DataFrame:
+    """Parse one BNO csv (raw bytes) and reduce it to 1 s base bins.
+
+    Module-level and picklable so it can run in a worker process. The result is
+    indexed by absolute Harp second (see :func:`bin_acceleration_chunk`).
+    """
+    return bin_acceleration_chunk(parse_bno_acceleration(raw), 0.0, BASE_BIN_S)
+
+
+def rebin_acceleration(
+    base: pd.DataFrame,
+    origin_seconds: float,
+    bin_size_s: float,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> pd.DataFrame:
+    """Re-bin 1 s base bins into bins of *bin_size_s* anchored at *origin_seconds*.
+
+    Parameters
+    ----------
+    base:
+        Combined 1 s base bins (:func:`combine_binned_acceleration` of
+        :func:`bin_bno_bytes` results).
+    origin_seconds:
+        Harp time of ``t = 0``.
+    bin_size_s:
+        New bin width in seconds (>= :data:`BASE_BIN_S`).
+    start_seconds, end_seconds:
+        Optional Harp-time crop bounds (end exclusive), accurate to one base bin.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Same layout as :func:`bin_acceleration_chunk`, indexed by bin number.
+    """
+    if bin_size_s < BASE_BIN_S:
+        raise ValueError(f"bin size must be at least {BASE_BIN_S:g} s, got {bin_size_s:g} s")
+    seconds = base.index.to_numpy().astype("float64")
+    keep = np.ones(len(base), dtype=bool)
+    if start_seconds is not None:
+        keep &= seconds >= np.floor(start_seconds)
+    if end_seconds is not None:
+        keep &= seconds < np.ceil(end_seconds)
+    # Use each base bin's centre; clamp the partial second at the origin to bin 0.
+    new_bin = np.floor((seconds[keep] + BASE_BIN_S / 2 - origin_seconds) / bin_size_s)
+    new_bin = np.maximum(new_bin, 0).astype("int64")
+    return base[keep].groupby(new_bin).sum()
+
+
+def bin_bno_chunks(
+    sources: list[str],
+    s3_client: "S3Client | None" = None,
+    cache_dir: str | Path | None = None,
+    workers: int = 8,
+    progress=None,
+) -> pd.DataFrame:
+    """Reduce many hourly BNO files to combined 1 s base bins, as fast as possible.
+
+    Each file is downloaded by a pool of *workers* threads (the S3 transfer is
+    I/O-bound) and parsed in separate processes (CSV parsing holds the GIL), so
+    parsing overlaps with downloading. When *cache_dir* is given, each file's 1 s
+    result is stored there as parquet and reused on later runs, which skips the
+    download and parse entirely.
+
+    Parameters
+    ----------
+    sources:
+        Local paths or ``s3://`` URIs from :func:`list_bno_chunks`.
+    s3_client:
+        Optional S3 client. Its connection pool should allow >= *workers*
+        connections (the boto3 default of 10 is fine for the default workers).
+    cache_dir:
+        Directory for the per-file cache (created if missing); ``None`` disables it.
+    workers:
+        Concurrent downloads; also bounds how many raw files are held in memory.
+    progress:
+        Optional wrapper for an iterable, e.g. ``functools.partial(tqdm, desc="files")``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Combined 1 s base bins, indexed by absolute Harp second.
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    cache = Path(cache_dir) if cache_dir is not None else None
+    if cache is not None:
+        cache.mkdir(parents=True, exist_ok=True)
+
+    def cache_path(source: str) -> Path | None:
+        if cache is None:
+            return None
+        return cache / (Path(source).name.removesuffix(".csv") + ".parquet")
+
+    with ProcessPoolExecutor(max_workers=max(1, (os.cpu_count() or 2) - 1)) as procs:
+
+        def load(source: str) -> pd.DataFrame:
+            target = cache_path(source)
+            if target is not None and target.exists():
+                try:
+                    return pd.read_parquet(target)
+                except Exception:  # corrupt cache entry: recompute
+                    pass
+            raw = _read_bno_bytes(source, s3_client)
+            part = procs.submit(bin_bno_bytes, raw).result()
+            del raw
+            if target is not None:
+                tmp = target.with_suffix(".tmp")
+                part.to_parquet(tmp)
+                tmp.replace(target)
+            return part
+
+        with ThreadPoolExecutor(max_workers=workers) as threads:
+            results = threads.map(load, sources)
+            parts = list(progress(results) if progress is not None else results)
+    return combine_binned_acceleration(parts)
